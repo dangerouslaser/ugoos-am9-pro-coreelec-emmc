@@ -123,12 +123,12 @@ parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^27:" || \
     die "Partition 27 not found — unexpected layout. Has this already been modified?"
 parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^28:" || \
     die "Partition 28 not found — unexpected layout."
-parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^29:" || \
-    die "Partition 29 not found — unexpected layout."
-
-# Abort if CE_FLASH already exists
-if blkid /dev/mmcblk0p27 2>/dev/null | grep -q "CE_FLASH"; then
-    die "CE_FLASH already found on eMMC — CoreELEC appears to already be installed."
+if ! parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^29:"; then
+    if blkid /dev/mmcblk0p27 2>/dev/null | grep -q "CE_FLASH"; then
+        die "CoreELEC is already installed on this eMMC (CE_FLASH found on p27, no p29).\n        To reinstall, restore the device to its Android partition layout first."
+    else
+        die "Partition 29 not found — unexpected layout. Has this already been modified?"
+    fi
 fi
 
 log "Partition layout: 29-partition Android layout confirmed"
