@@ -45,7 +45,7 @@ Offsets from dmesg, all 29 partitions confirmed:
 | p13 | dtbo_b | 0x15b00000 | 2 MB | unknown |
 | p14 | cri_data | 0x15e00000 | 8 MB | unknown |
 | p15 | param | 0x16700000 | 16 MB | unknown |
-| p16 | odm_ext_a | 0x17800000 | 16 MB | unknown |
+| p16 | odm_ext_a | 0x17800000 | 16 MB | empty (also zeroed in factory image) |
 | p17 | odm_ext_b | 0x18900000 | 16 MB | unknown |
 | p18 | boot_a | 0x19a00000 | 64 MB | zeroed |
 | p19 | boot_b | 0x1db00000 | 64 MB | zeroed |
@@ -299,9 +299,42 @@ Device boots CoreELEC successfully from eMMC with SD card removed. First boot in
 
 ## Android Restore Path
 
-Ugoos distributes a full factory firmware image (`AM9PRO_2.0.9.img`) which can be flashed via the Amlogic USB Burning Tool v3. The image was inspected and confirmed to contain all partitions: `super`, `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the DTB.
+Ugoos distributes a full factory firmware image (`AM9PRO_2.0.9.img`) which can be flashed via the Amlogic USB Burning Tool v3.
 
-Because `boot0` is hardware write-protected, the BL2 is always intact and the device can always be put into USB burn mode by holding the reset/ADB button during power-on. A full USB Burning Tool flash wipes and rewrites every partition, fully restoring the original 29-partition Android layout regardless of what was done to the partition table.
+### Image format
+
+The image uses the Amlogic USB Burning Tool format: magic `0x6cf66ed9`, version 2, 30 items. Item table starts at offset `0x40`; each item is `0x240` bytes with the type string at `+0x20`, name at `+0x120`, offset at `+0x10`, and size at `+0x18`.
+
+The 30 items break down as 14 `PARTITION` entries, 14 matching `VERIFY` (hash) entries, plus USB-mode firmware (`DDR`, `UBOOT`), a GPT table entry (`bin/gpt`), a DTB (`dtb/meson1`), platform config, and a USB flow blob.
+
+### Verified partition contents
+
+`AM9PRO_2.0.9.img` was fully parsed and each partition payload inspected:
+
+| Partition | Size in image | Content |
+|-----------|--------------|---------|
+| `bootloader` / `bootloader_a` | 3.91 MB each | Same binary, Amlogic `@ML` header — identical to what's on the device |
+| `boot_a` | 51.0 MB | `ANDROID!` magic — real Android boot image |
+| `dtbo_a` | 438 bytes | FDT magic `d7b7ab1e` — tiny DTB overlay, real content |
+| `init_boot_a` | 2.62 MB | `ANDROID!` magic |
+| `logo` | 1.65 MB | Amlogic logo partition |
+| `odm_ext_a` | 16 MB | **All zeros** — empty in the factory image |
+| `super` | 1507 MB | LP metadata magic `0x3aff26ed` at byte 0 — Android Logical Partition metadata + system/vendor images |
+| `vendor_boot_a` | 50.86 MB | `VNDRBOOT` magic |
+| GPT (`bin/gpt`) | 0.03 MB | Full GPT table — restores the original 29-partition layout |
+| DTB (`dtb/meson1`) | 0.08 MB | Amlogic SoC DTB |
+
+The `super` partition contains real Android system data (LP metadata at offset 0 followed by compressed system and vendor images). This confirms: on devices that shipped with a working Android install, `super` has content and deleting it will break TEE loading as documented.
+
+`odm_ext_a` being zeroed in the factory image is consistent with what was observed on the device — this partition appears to be unused in this firmware version.
+
+### Provisioning state of the inspected device
+
+The device examined in this research had `boot_a`, `vendor_boot_a`, `init_boot_a`, and `super` all appearing empty or zeroed, despite the factory image having real content for those partitions. The U-Boot environment contained `androidboot.firstboot=1`, suggesting the device had not completed its first Android boot. Ugoos may ship units in a partially provisioned state where the Android userspace images are not yet written to the eMMC.
+
+### Restore procedure
+
+Because `boot0` is hardware write-protected, the BL2 is always intact and the device can always be put into USB burn mode by holding the reset/ADB button during power-on. A full USB Burning Tool flash wipes and rewrites every partition (including the GPT itself), fully restoring the original 29-partition Android layout regardless of what was done to the partition table.
 
 This means the "no restore path" concern is not accurate — Android can be restored, it just requires a Windows PC, a USB-A to USB-A cable, and the factory image.
 

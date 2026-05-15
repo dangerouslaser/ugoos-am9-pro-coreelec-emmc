@@ -126,7 +126,7 @@ The AM9 Pro can be fully restored to stock Android using the Amlogic USB Burning
 4. Load the factory `.img` file and click Start
 5. USB Burning Tool will wipe and rewrite every partition, fully restoring Android
 
-The official firmware image (`AM9PRO_2.0.9.img`) was inspected and confirmed to contain all required partitions: `super`, `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the DTB. A full flash will restore the original 29-partition Android layout.
+The official firmware image (`AM9PRO_2.0.9.img`) was fully parsed and confirmed to contain all required partitions: `super` (1507 MB, LP metadata + Android system images), `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the SoC DTB. The image also includes the GPT table itself, so a full flash restores the original 29-partition Android layout exactly.
 
 ---
 
