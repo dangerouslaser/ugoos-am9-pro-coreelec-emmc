@@ -1,33 +1,43 @@
 # CoreELEC eMMC Installer — Ugoos AM9 Pro
 
-A manual installer for CoreELEC to the internal eMMC of the Ugoos AM9 Pro, until the official `ceemmc` tool adds support for the `s6_s905x5_ugoos_am9_pro` board.
+A manual installer for CoreELEC to the internal eMMC of the Ugoos AM9 Pro, documented here for reference while `ceemmc` does not yet support this board.
 
 ---
 
-> **⚠️ WARNING: THIS PROCESS IS DESTRUCTIVE AND PERMANENT ⚠️**
->
-> **Once you run this script, Android is gone. There is currently no known way to restore the original Android installation on the Ugoos AM9 Pro after the eMMC partitions are modified. The `userdata` partition is encrypted and unrecoverable. You will not be able to boot back into Android.**
->
-> **Only proceed if you have no need for Android on this device.**
+## ⚠️ READ BEFORE PROCEEDING ⚠️
+
+**This installation method is not supported by CoreELEC. Any support request, bug report, or forum post related to a CoreELEC install performed this way will be rejected, closed, or removed by the CoreELEC team. Do not ask for help on the CoreELEC forums if something goes wrong.**
+
+**This was tested on one specific device running one specific firmware build (22.0-Piers_nightly_20260514). A different device revision or a newer firmware version may fail to boot or permanently break media playback. There is no way to know in advance.**
+
+**This process permanently removes Android and destroys any path back to it. There is no restore procedure. The original eMMC partition layout cannot be recovered without a full factory image, which is not publicly available for this device.**
+
+Specifically:
+
+- **Android is gone permanently.** The userdata partition is encrypted and unrecoverable. You will not be able to boot Android again.
+- **Media playback may break.** CoreELEC uses the `super` partition to load TEE firmware for DRM-protected content (Widevine, etc.). Removing `super` may break playback of DRM-protected streams depending on your firmware. The script checks whether `super` is empty before proceeding, but this behaviour may change across firmware versions.
+- **Future firmware may prevent booting entirely.** This method bypasses normal eMMC install tooling. There is no guarantee it will work with any build other than the one it was tested on.
+- **No CoreELEC support.** This is explicitly unsupported. Do not file issues or ask for help on CoreELEC forums or Discord.
+
+If you are not comfortable with all of the above, run CoreELEC from the SD card instead.
 
 ---
 
 ## Background
 
-The Ugoos AM9 Pro runs an Amlogic S905X5 (S6) SoC. CoreELEC supports the hardware and includes the correct DTB (`s6_s905x5_ugoos_am9_pro.dtb`), but as of the May 2026 nightly the automated `ceemmc` install tool does not yet list this board as supported.
+The Ugoos AM9 Pro runs an Amlogic S905X5 (S6) SoC. CoreELEC supports the hardware and includes the correct DTB (`s6_s905x5_ugoos_am9_pro.dtb`), but as of the May 2026 nightly the automated `ceemmc` install tool does not list this board as supported.
 
-The eMMC is fully writable from a CoreELEC SD card boot, and all the necessary boot files are already present. This script does what `ceemmc` would do once support is added.
+This script documents what was done to get a working eMMC install on one specific unit. It is published as a technical reference, not a recommendation.
 
-See [`emmc-research.md`](emmc-research.md) for the full technical research and reasoning behind every step.
+See [`emmc-research.md`](emmc-research.md) for the full research notes.
 
 ---
 
 ## Requirements
 
 - Ugoos AM9 Pro booted into CoreELEC from an SD card
-- CoreELEC nightly build (tested on 22.0-Piers_nightly_20260514)
+- CoreELEC nightly build (tested on 22.0-Piers_nightly_20260514 only)
 - SSH access or direct terminal access to the device
-- No requirement for Android — **this process is one-way**
 
 ---
 
@@ -35,10 +45,10 @@ See [`emmc-research.md`](emmc-research.md) for the full technical research and r
 
 1. Verifies you're on the right board and booting from SD
 2. Backs up the U-Boot `env` and `bootloader_a` partitions to `/storage`
-3. Checks whether `super` (p27) is safe to delete — CoreELEC's `tee-loader.sh` uses `/dev/super` to load TEE firmware on some devices; the script reads the first 512 bytes and warns you if the partition has content before proceeding
+3. Checks whether `super` (p27) contains data and warns you before deleting it
 4. Deletes three Android partitions from the end of the GPT:
-   - `super` (p27, 3.1 GB) — tested on a unit where this was empty; yours may differ (see above)
-   - `rsv` (p28, 64 MB) — reserved, empty
+   - `super` (p27, 3.1 GB) — was empty on the tested unit; may contain TEE firmware on others
+   - `rsv` (p28, 64 MB) — reserved, was empty
    - `userdata` (p29, 54.4 GB) — encrypted, unrecoverable
 5. Creates two new partitions in their place:
    - `CE_FLASH` (p27, 512 MB, FAT32) — boot partition
@@ -91,7 +101,7 @@ With `cfgload` unmodified, the kernel cmdline still contains `disk=FOLDER=/dev/C
 
 ### Brick risk
 
-Very low. `boot0`/`boot1` are hardware write-protected — the SoC's first-stage bootloader cannot be overwritten from Linux. U-Boot always tries the SD card first, so inserting an SD card always gives you a recovery path. Worst case (corrupted GPT): Amlogic devices can be recovered via USB Burning Tool from a PC.
+Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's first-stage bootloader cannot be overwritten from Linux. U-Boot tries the SD card first, so a working SD card always provides a recovery path. Worst case (corrupted GPT): Amlogic devices can be recovered via USB Burning Tool from a PC. However, broken media playback or boot failures on future firmware are a real possibility with no known fix.
 
 ---
 
