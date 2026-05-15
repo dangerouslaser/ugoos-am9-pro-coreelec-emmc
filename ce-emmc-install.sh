@@ -6,12 +6,13 @@
 #
 # What this does:
 #   1. Backs up env (p2) and bootloader_a (p7) to /storage
-#   2. Deletes unused Android partitions: super (p27), rsv (p28), userdata (p29)
-#   3. Creates CE_FLASH (512 MB FAT32) and CE_STORAGE (remaining ~57.9 GB ext4)
-#   4. Copies all boot files from the SD card's /flash to CE_FLASH
-#   5. Installs mount-storage.sh hook (bypasses broken FOLDER= device node mechanism)
-#   6. Adds nofsck to config.ini (avoids 10s boot delay from phantom fsck)
-#   7. Optionally migrates your current /storage to CE_STORAGE
+#   2. Checks whether super (p27) is safe to delete (may contain TEE firmware)
+#   3. Deletes Android partitions: super (p27), rsv (p28), userdata (p29)
+#   4. Creates CE_FLASH (512 MB FAT32) and CE_STORAGE (remaining ~57.9 GB ext4)
+#   5. Copies all boot files from the SD card's /flash to CE_FLASH
+#   6. Installs mount-storage.sh hook (bypasses broken FOLDER= device node mechanism)
+#   7. Adds nofsck to config.ini (avoids 10s boot delay from phantom fsck)
+#   8. Optionally migrates your current /storage to CE_STORAGE
 
 set -euo pipefail
 
@@ -31,11 +32,48 @@ warn()   { echo -e "${YELLOW}[!]${NC} $*"; }
 die()    { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}--- $* ---${NC}"; }
 
+# Create /dev nodes for eMMC partitions the kernel already knows about,
+# reading major:minor from sysfs rather than assuming sequential numbering.
+make_emmc_nodes() {
+    for sysfs_dev in /sys/block/mmcblk0/mmcblk0p*/dev; do
+        [[ -f "$sysfs_dev" ]] || continue
+        local partname
+        partname=$(basename "$(dirname "$sysfs_dev")")
+        local devnum maj min
+        read -r devnum < "$sysfs_dev"
+        maj="${devnum%%:*}"
+        min="${devnum##*:}"
+        mknod "/dev/${partname}" b "$maj" "$min" 2>/dev/null || true
+    done
+}
+
+# After repartitioning, ask the kernel to re-read the partition table and
+# create /dev nodes for the new partitions using sysfs-reported major:minor.
+reread_and_make_nodes() {
+    local parts=("$@")
+    blockdev --rereadpt "$EMMC" 2>/dev/null || true
+    sleep 2  # give the kernel time to update sysfs
+
+    for part in "${parts[@]}"; do
+        local sysfs_dev="/sys/block/mmcblk0/mmcblk0p${part}/dev"
+        if [[ -f "$sysfs_dev" ]]; then
+            local devnum maj min
+            read -r devnum < "$sysfs_dev"
+            maj="${devnum%%:*}"
+            min="${devnum##*:}"
+            rm -f "/dev/mmcblk0p${part}" 2>/dev/null || true
+            mknod "/dev/mmcblk0p${part}" b "$maj" "$min"
+            log "Device node: /dev/mmcblk0p${part} (${maj}:${min})"
+        else
+            die "Kernel did not register mmcblk0p${part} — try rebooting and rerunning the script"
+        fi
+    done
+}
+
 # ── Preflight ────────────────────────────────────────────────────────────────
 
 header "Preflight checks"
 
-# Must run as root
 [[ "$(id -u)" == "0" ]] || die "Must be run as root"
 
 # Board check — verify the AM9 Pro DTB exists and is the active DTB
@@ -59,22 +97,18 @@ FLASH_SOURCE=$(findmnt -n -o SOURCE "$SD_FLASH" 2>/dev/null || true)
 
 log "Boot source: SD card ($FLASH_SOURCE)"
 
-# eMMC must be present
 [[ -b "$EMMC" ]] || die "eMMC not found at $EMMC"
 log "eMMC: $EMMC present"
 
-# Required tools
-for tool in parted mkfs.fat mkfs.ext4 rsync dd blkid mknod findmnt; do
+for tool in parted mkfs.fat mkfs.ext4 rsync dd blkid mknod findmnt blockdev; do
     command -v "$tool" >/dev/null 2>&1 || die "Required tool not found: $tool"
 done
 log "Required tools: all present"
 
-# Create device nodes so we can inspect the current partition layout
-for i in $(seq 1 29); do
-    mknod "/dev/mmcblk0p${i}" b 179 "$i" 2>/dev/null || true
-done
+# Create device nodes from sysfs for partitions the kernel already knows about
+make_emmc_nodes
 
-# Check for expected Android partition layout (p27=super, p28=rsv, p29=userdata)
+# Check for expected Android partition layout
 parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^27:" || \
     die "Partition 27 not found — unexpected layout. Has this already been modified?"
 parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^28:" || \
@@ -89,6 +123,35 @@ fi
 
 log "Partition layout: 29-partition Android layout confirmed"
 
+# ── super partition content check ─────────────────────────────────────────────
+#
+# CoreELEC's tee-loader.sh uses /dev/super to load TEE firmware when booting
+# on some devices. If super has content (Android dynamic partition metadata +
+# system/vendor images), deleting it will break TEE loading.
+#
+# On units that shipped without a full Android install (super is zeroed),
+# this is safe. The script checks the first 512 bytes for any non-zero data.
+
+header "Checking super partition"
+
+SUPER_HAS_DATA=$(dd if=/dev/mmcblk0p27 bs=512 count=1 2>/dev/null | tr -d '\0' | wc -c)
+
+if [[ "$SUPER_HAS_DATA" -gt 0 ]]; then
+    echo ""
+    warn "The super partition (p27) contains data."
+    warn "CoreELEC uses /dev/super to load TEE firmware on some devices."
+    warn "Deleting it may break TEE-dependent functionality."
+    warn "This was tested on a unit where super was empty. Your unit may differ."
+    echo ""
+    warn "Proceeding may leave your device in an untested state."
+    echo ""
+    read -rp "  Type YES to delete super anyway: " super_confirm
+    echo ""
+    [[ "$super_confirm" == "YES" ]] || { echo "Aborted."; exit 0; }
+else
+    log "super partition is empty — safe to delete"
+fi
+
 # ── Confirm ──────────────────────────────────────────────────────────────────
 
 echo ""
@@ -98,9 +161,9 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 echo "  The following changes will be made to the eMMC:"
 echo ""
-echo "    DELETE  p27  super      3.1 GB   (Android system — empty)"
-echo "    DELETE  p28  rsv         64 MB   (reserved — empty)"
-echo "    DELETE  p29  userdata   54.4 GB  (encrypted remnant)"
+echo "    DELETE  p27  super      3.1 GB"
+echo "    DELETE  p28  rsv         64 MB"
+echo "    DELETE  p29  userdata   54.4 GB  (encrypted — unrecoverable)"
 echo ""
 echo "    CREATE  p27  CE_FLASH   512 MB   FAT32  (boot partition)"
 echo "    CREATE  p28  CE_STORAGE ~57.9 GB ext4   (storage)"
@@ -108,8 +171,7 @@ echo ""
 echo "  Partitions p1–p26 are NOT touched."
 echo "  boot0/boot1 are hardware write-protected and are safe."
 echo ""
-warn "This cannot be undone. The userdata partition is encrypted"
-warn "and its contents cannot be recovered regardless."
+warn "This cannot be undone. Android cannot be restored after this."
 echo ""
 read -rp "  Type YES to proceed: " confirm
 echo ""
@@ -147,15 +209,9 @@ parted -s "$EMMC" mkpart CE_FLASH fat32 "${SUPER_START_MIB}MiB" "${CE_FLASH_END_
 log "Creating CE_STORAGE (${CE_FLASH_END_MIB}MiB – 100%)..."
 parted -s "$EMMC" mkpart CE_STORAGE ext4 "${CE_FLASH_END_MIB}MiB" "100%"
 
-sleep 1
-
-# Recreate device nodes with correct minor numbers
-rm -f /dev/mmcblk0p27 /dev/mmcblk0p28 /dev/mmcblk0p29 2>/dev/null || true
-mknod /dev/mmcblk0p27 b 179 27
-mknod /dev/mmcblk0p28 b 179 28
-
-# Verify labels were set correctly
-blkid /dev/mmcblk0p27 >/dev/null 2>&1 || true  # blkid may exit non-zero before format
+# Ask the kernel to re-read the partition table, then create device nodes
+# using sysfs-reported major:minor numbers (not assumed sequential values)
+reread_and_make_nodes 27 28
 
 # ── Format ───────────────────────────────────────────────────────────────────
 
@@ -175,14 +231,13 @@ mkdir -p "$MNT_FLASH"
 mount /dev/mmcblk0p27 "$MNT_FLASH"
 
 log "Copying files from ${SD_FLASH}..."
-# Exclude fs-resize.log (SD-specific) and any stale mount-storage.sh
 cp -a "${SD_FLASH}/." "${MNT_FLASH}/"
 rm -f "${MNT_FLASH}/fs-resize.log"
 
 # Install mount-storage.sh hook.
-# The initrd sources this file instead of the normal mount_part() logic,
-# bypassing the FOLDER=/dev/CE_STORAGE mechanism which requires a device node
-# that the initrd never creates (no udev rules in CoreELEC initrd).
+# The initrd sources this file instead of running the normal mount_part() logic,
+# bypassing the FOLDER=/dev/CE_STORAGE mechanism. That mechanism requires a
+# /dev/CE_STORAGE device node which the initrd never creates (no udev rules).
 log "Installing mount-storage.sh hook..."
 cat > "${MNT_FLASH}/mount-storage.sh" << 'EOF'
 mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
@@ -195,7 +250,6 @@ EOF
 # nofsck skips this entirely.
 log "Updating config.ini (adding nofsck)..."
 if grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
-    # Add nofsck to existing coreelec line if not already there
     if ! grep -q "nofsck" "${MNT_FLASH}/config.ini"; then
         sed -i "s/coreelec='\(.*\)'/coreelec='\1 nofsck'/" "${MNT_FLASH}/config.ini"
     fi

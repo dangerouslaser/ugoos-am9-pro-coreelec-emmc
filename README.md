@@ -35,17 +35,18 @@ See [`emmc-research.md`](emmc-research.md) for the full technical research and r
 
 1. Verifies you're on the right board and booting from SD
 2. Backs up the U-Boot `env` and `bootloader_a` partitions to `/storage`
-3. Deletes three unused Android partitions from the end of the GPT:
-   - `super` (p27, 3.1 GB) — Android system images, was empty
-   - `rsv` (p28, 64 MB) — reserved, was empty
+3. Checks whether `super` (p27) is safe to delete — CoreELEC's `tee-loader.sh` uses `/dev/super` to load TEE firmware on some devices; the script reads the first 512 bytes and warns you if the partition has content before proceeding
+4. Deletes three Android partitions from the end of the GPT:
+   - `super` (p27, 3.1 GB) — tested on a unit where this was empty; yours may differ (see above)
+   - `rsv` (p28, 64 MB) — reserved, empty
    - `userdata` (p29, 54.4 GB) — encrypted, unrecoverable
-4. Creates two new partitions in their place:
+5. Creates two new partitions in their place:
    - `CE_FLASH` (p27, 512 MB, FAT32) — boot partition
    - `CE_STORAGE` (p28, ~57.9 GB, ext4) — CoreELEC storage
-5. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
-6. Installs a `mount-storage.sh` hook that fixes a device node issue in the CoreELEC initrd
-7. Adds `nofsck` to `config.ini` to avoid a 10-second boot delay
-8. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`
+6. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
+7. Installs a `mount-storage.sh` hook that fixes a device node issue in the CoreELEC initrd
+8. Adds `nofsck` to `config.ini` to avoid a 10-second boot delay
+9. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`
 
 Partitions p1–p26, `boot0`, and `boot1` are not touched. `boot0`/`boot1` are hardware write-protected and cannot be modified by anything running in Linux.
 
