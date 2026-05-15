@@ -57,7 +57,7 @@ make_emmc_nodes() {
 # create /dev nodes for the new partitions using sysfs-reported major:minor.
 reread_and_make_nodes() {
     local parts=("$@")
-    blockdev --rereadpt "$EMMC" 2>/dev/null || true
+    partprobe "$EMMC" 2>/dev/null || true
 
     for part in "${parts[@]}"; do
         local sysfs_dev="/sys/block/mmcblk0/mmcblk0p${part}/dev"
@@ -101,7 +101,7 @@ HASH_ACTIVE=$(md5sum "$DTB_ACTIVE"  | awk '{print $1}')
 log "Board: Ugoos AM9 Pro (s6_s905x5_ugoos_am9_pro)"
 
 # Must be booting from SD card
-FLASH_SOURCE=$(findmnt -n -o SOURCE "$SD_FLASH" 2>/dev/null || true)
+FLASH_SOURCE=$(awk '$2 == "/flash" {print $1}' /proc/mounts 2>/dev/null || true)
 [[ "$FLASH_SOURCE" == *"mmcblk1"* ]] || \
     die "Not booting from SD card — /flash is on '${FLASH_SOURCE:-unknown}'. Insert SD card and reboot."
 
@@ -110,7 +110,7 @@ log "Boot source: SD card ($FLASH_SOURCE)"
 [[ -b "$EMMC" ]] || die "eMMC not found at $EMMC"
 log "eMMC: $EMMC present"
 
-for tool in parted mkfs.fat mkfs.ext4 rsync dd blkid mknod findmnt blockdev; do
+for tool in parted mkfs.fat mkfs.ext4 rsync dd blkid mknod partprobe mountpoint; do
     command -v "$tool" >/dev/null 2>&1 || die "Required tool not found: $tool"
 done
 log "Required tools: all present"
