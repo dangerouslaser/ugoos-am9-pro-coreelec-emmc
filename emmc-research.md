@@ -83,7 +83,7 @@ Key type fscrypt-provisioning registered
 
 The `userdata` partition contains clearly encrypted data (high entropy, no discernible structure). This is Android's file-based encryption.
 
-However, the `metadata` partition — which is where Android stores FBE key descriptors — is completely zeroed. This suggests FBE was never fully initialized. The device may have had Android encryption set up at the storage level but never completed a first boot where the keys get written. The `androidboot.firstboot=1` flag in the kernel command line supports this.
+The `metadata` partition holds encryption-related data as part of Android's FBE implementation — it is not simply empty. The earlier characterization of it as "completely zeroed" was based on a surface-level read and the conclusion that FBE was never initialized was incorrect. The `androidboot.firstboot=1` flag in the kernel cmdline indicates the device hadn't completed its first Android boot, but the metadata partition may still have had content written during factory provisioning.
 
 ### RPMB
 
@@ -250,12 +250,14 @@ The cfgload file is a compiled U-Boot script in mkimage format — it has a bina
 
 ### The mount-storage.sh hook
 
-The initrd has a clean escape hatch: if `/flash/mount-storage.sh` exists, it sources that file instead of running the normal `mount_part "$disk"` logic. This lets us bypass the broken `FOLDER=/dev/CE_STORAGE` mechanism entirely without touching cfgload.
+The initrd sources `/flash/mount-storage.sh` if it exists, instead of running the normal `mount_part "$disk"` logic. This was used to sidestep the `FOLDER=/dev/CE_STORAGE` path entirely.
 
 `/flash/mount-storage.sh` on CE_FLASH:
 ```sh
 mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
 ```
+
+**Note:** This is a workaround, not a proper solution. The right approach is to recompile cfgload with `mkimage` so it uses `disk=LABEL=CE_STORAGE` directly — which is exactly what ceemmc would do if it supported this board. The FOLDER= mechanism isn't "broken"; it's the dual-boot path designed for when CoreELEC storage lives as a subfolder inside Android's userdata. For a standalone CoreELEC install, cfgload should simply be rebuilt with the correct `LABEL=` argument. The mount-storage.sh hook achieves the same end result but bypasses the intended boot mechanism in a way that the CoreELEC team would not consider correct.
 
 ### nofsck in config.ini
 
