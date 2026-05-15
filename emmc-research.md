@@ -295,13 +295,23 @@ Device boots CoreELEC successfully from eMMC with SD card removed. First boot in
 
 ---
 
+## Android Restore Path
+
+Ugoos distributes a full factory firmware image (`AM9PRO_2.0.9.img`) which can be flashed via the Amlogic USB Burning Tool v3. The image was inspected and confirmed to contain all partitions: `super`, `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the DTB.
+
+Because `boot0` is hardware write-protected, the BL2 is always intact and the device can always be put into USB burn mode by holding the reset/ADB button during power-on. A full USB Burning Tool flash wipes and rewrites every partition, fully restoring the original 29-partition Android layout regardless of what was done to the partition table.
+
+This means the "no restore path" concern is not accurate — Android can be restored, it just requires a Windows PC, a USB-A to USB-A cable, and the factory image.
+
+---
+
 ## Brick Risk Assessment
 
-Realistically very low, for a few reasons:
+Low. Specifically:
 
-- **boot0/boot1 are hardware write-protected** — the lowest-level bootloader that wakes the SoC cannot be overwritten by anything running in Linux. The device can always get into U-Boot.
+- **boot0/boot1 are hardware write-protected** — the lowest-level bootloader that wakes the SoC cannot be overwritten by anything running in Linux. The device can always enter USB burn mode.
 - **SD card boots first** — as long as the SD card is in, U-Boot tries it before anything else. A broken eMMC state is irrelevant.
-- **Worst case recovery** — if the eMMC partition table got mangled, Amlogic devices can be recovered via USB Burning Tool from a PC. Not a brick, just annoying.
+- **Full factory restore is possible** — using the official Ugoos firmware image and USB Burning Tool v3, the entire eMMC can be wiped and rewritten to stock Android. See the restore section above.
 
 ---
 

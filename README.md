@@ -10,11 +10,11 @@ A manual installer for CoreELEC to the internal eMMC of the Ugoos AM9 Pro, docum
 
 **This was tested on one specific device running one specific firmware build (22.0-Piers_nightly_20260514). A different device revision or a newer firmware version may fail to boot or permanently break media playback. There is no way to know in advance.**
 
-**This process permanently removes Android and destroys any path back to it. There is no restore procedure. The original eMMC partition layout cannot be recovered without a full factory image, which is not publicly available for this device.**
+**This process removes Android. It can be restored, but only via the Amlogic USB Burning Tool on a Windows PC using the official factory image — it is not a simple undo. See [Restoring Android](#restoring-android) below.**
 
 Specifically:
 
-- **Android is gone permanently.** The userdata partition is encrypted and unrecoverable. You will not be able to boot Android again.
+- **Android is removed.** The userdata partition is encrypted and unrecoverable on its own, but a full factory restore via USB Burning Tool will wipe and rewrite everything including userdata.
 - **Media playback may break.** CoreELEC uses the `super` partition to load TEE firmware for DRM-protected content (Widevine, etc.). Removing `super` may break playback of DRM-protected streams depending on your firmware. The script checks whether `super` is empty before proceeding, but this behaviour may change across firmware versions.
 - **Future firmware may prevent booting entirely.** This method bypasses normal eMMC install tooling. There is no guarantee it will work with any build other than the one it was tested on.
 - **No CoreELEC support.** This is explicitly unsupported. Do not file issues or ask for help on CoreELEC forums or Discord.
@@ -102,6 +102,31 @@ With `cfgload` unmodified, the kernel cmdline still contains `disk=FOLDER=/dev/C
 ### Brick risk
 
 Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's first-stage bootloader cannot be overwritten from Linux. U-Boot tries the SD card first, so a working SD card always provides a recovery path. Worst case (corrupted GPT): Amlogic devices can be recovered via USB Burning Tool from a PC. However, broken media playback or boot failures on future firmware are a real possibility with no known fix.
+
+---
+
+---
+
+## Restoring Android
+
+The AM9 Pro can be fully restored to stock Android using the Amlogic USB Burning Tool, even after this script has run. This works because `boot0` (the BL2 first-stage bootloader) is hardware write-protected and cannot be touched by anything running in Linux — the device can always enter USB burn mode.
+
+**What you need:**
+
+- A Windows PC
+- USB Burning Tool v3 (available from Ugoos)
+- The official factory firmware image (`AM9PRO_2.0.9.img` or newer)
+- A USB-A to USB-A cable
+
+**Process:**
+
+1. Power off the device
+2. Hold the recessed reset/ADB button while connecting the USB-A cable to the PC
+3. The device will appear in USB Burning Tool in burn mode
+4. Load the factory `.img` file and click Start
+5. USB Burning Tool will wipe and rewrite every partition, fully restoring Android
+
+The official firmware image (`AM9PRO_2.0.9.img`) was inspected and confirmed to contain all required partitions: `super`, `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the DTB. A full flash will restore the original 29-partition Android layout.
 
 ---
 
