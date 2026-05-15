@@ -2,7 +2,7 @@
 
 **Date:** May 14, 2026  
 **Device:** Ugoos AM9 Pro  
-**SoC:** Amlogic A311D2 (identified as `s6_s905x5_ugoos_am9_pro`)  
+**SoC:** Amlogic S905X5 (S6 family, CoreELEC board ID `s6_s905x5_ugoos_am9_pro`)  
 **CoreELEC:** 22.0-Piers_nightly_20260514  
 **Kernel:** 5.15.196  
 
@@ -51,7 +51,7 @@ Offsets from dmesg, all 29 partitions confirmed:
 | p19 | boot_b | 0x1db00000 | 64 MB | zeroed |
 | p20 | init_boot_a | 0x21c00000 | 8 MB | zeroed |
 | p21 | init_boot_b | 0x22500000 | 8 MB | zeroed |
-| p22 | metadata | 0x22e00000 | 64 MB | **zeroed** |
+| p22 | metadata | 0x22e00000 | 64 MB | unknown |
 | p23 | vbmeta_a | 0x26f00000 | 2 MB | **zeroed** |
 | p24 | vbmeta_b | 0x27200000 | 2 MB | **zeroed** |
 | p25 | vbmeta_system_a | 0x27500000 | 2 MB | **zeroed** |
@@ -59,7 +59,7 @@ Offsets from dmesg, all 29 partitions confirmed:
 | p27 | CE_FLASH | 0x27b00000 | 512 MB | **active** — FAT32, CoreELEC boot files |
 | p28 | CE_STORAGE | — | 57.9 GB | **active** — ext4, CoreELEC storage |
 
-The original Android layout had 29 partitions. Most were zeroed or unused — `super`, `boot_a/b`, `metadata`, `vbmeta_a/b`, and `TEE` were all empty. Only `bootloader_a` and `env` had live data. `userdata` was encrypted (Android FBE remnant, not recoverable).
+The original Android layout had 29 partitions. Of those inspected: `boot_a/b`, `vbmeta_a/b`, `vendor_boot_a/b`, `init_boot_a/b`, `tee`, and `super` appeared empty on this unit. `bootloader_a` and `env` had live data. `userdata` was encrypted. The `metadata` partition holds FBE-related data and was not fully characterized.
 
 For the CoreELEC install, `super` (p27), `rsv` (p28), and `userdata` (p29) were deleted to free GPT slots, and `CE_FLASH` and `CE_STORAGE` were created in their place. The GPT was originally allocated for exactly 29 entries — adding partitions beyond that limit requires freeing existing slots first.
 
@@ -198,10 +198,10 @@ mount_folder() {
 
 What this does: mount the block device at `/dev/CE_STORAGE`, then bind-mount a **subfolder called `coreelec_storage`** from inside it as `/storage`. The factory-reset script even comments this directly: *"storage is just subfolder on Android data partition"*.
 
-This design was built for ceemmc's dual-boot mode where CoreELEC's storage lives as a folder inside Android's userdata partition. It is **not suitable for a clean dedicated install** for two reasons:
+This design was built for ceemmc's dual-boot mode where CoreELEC's storage lives as a folder inside Android's userdata partition. In our environment (standalone install, no ceemmc), this path did not work cleanly for two reasons:
 
-1. `/dev/CE_STORAGE` needs to exist as a device node in `/dev/`. The initrd has no udev rules and no `platform_init` script — nothing creates this symlink. The mount would fail.
-2. Even if the mount succeeded, it would expect a `coreelec_storage/` subdirectory inside the partition, not the partition root as storage.
+1. `/dev/CE_STORAGE` needs to exist as a device node. In our environment no device node was created for it during boot, so the mount failed. Whether ceemmc-managed installs handle this differently was not verified.
+2. The mechanism bind-mounts a `coreelec_storage/` subdirectory from inside the mounted partition as `/storage` — not the partition root — which is not what a standalone install wants.
 
 ### The correct approach for a dedicated install
 
@@ -214,7 +214,7 @@ disk=LABEL=STORAGE    → mounts the ext4 partition by label as /storage
 
 This uses standard `LABEL=` resolution via blkid — no device nodes required. The initrd handles `LABEL=*` paths natively.
 
-For a dedicated eMMC install, the same mechanism works with different labels. The cfgload on the eMMC `CE_FLASH` partition just needs one line changed from the default:
+For a dedicated eMMC install, the same mechanism works with different labels. The cfgload on the eMMC `CE_FLASH` partition needs the FOLDER= path replaced with a LABEL= path:
 
 ```
 # change this:
@@ -223,7 +223,7 @@ disk=FOLDER=/dev/CE_STORAGE
 disk=LABEL=CE_STORAGE
 ```
 
-That's the only modification needed. Everything else — the kernel, the DTB, the boot sequence — works as-is.
+However, cfgload is a compiled U-Boot script in mkimage format — it cannot be edited with a text editor. The change requires decompiling, editing, and recompiling with `mkimage`. See the CRC trap section below. This is what ceemmc would do correctly if it supported this board.
 
 ---
 
@@ -233,8 +233,8 @@ The GPT partition table was created by Ugoos with exactly 29 entries — no room
 
 ### Partition changes made
 
-Deleted (all were zeroed/unused):
-- `super` (p27, 3.1 GB) — Android system images, never written
+Deleted:
+- `super` (p27, 3.1 GB) — appeared empty on this unit; contains Android system images on a fully provisioned device and is used by CoreELEC's `tee-loader.sh`
 - `rsv` (p28, 64 MB) — unknown reserved partition, empty
 - `userdata` (p29, 54.4 GB) — encrypted remnant, not recoverable
 
@@ -321,11 +321,14 @@ Low. Specifically:
 
 After confirming eMMC boot works, the SD card is reinserted (device boots from SD). CE_STORAGE is mounted manually and `/storage` is rsynced across.
 
-Since CoreELEC's udev doesn't create device nodes for eMMC partitions, they have to be created manually each time. The correct minor numbers come from `/proc/partitions` — mmcblk0p27 = 179:27, mmcblk0p28 = 179:28 (sequential, no offset):
+Since CoreELEC's udev doesn't create device nodes for eMMC partitions, they have to be created manually. Read the major:minor numbers from sysfs rather than assuming them — the sequential numbering assumption is not reliable:
 
 ```sh
-mknod /dev/mmcblk0p27 b 179 27
-mknod /dev/mmcblk0p28 b 179 28
+# Read actual major:minor from kernel
+for part in 27 28; do
+    read -r devnum < /sys/block/mmcblk0/mmcblk0p${part}/dev
+    mknod /dev/mmcblk0p${part} b "${devnum%%:*}" "${devnum##*:}"
+done
 mkdir -p /var/ce_storage
 mount -t ext4 -o rw,noatime /dev/mmcblk0p28 /var/ce_storage
 rsync -ax /storage/ /var/ce_storage/

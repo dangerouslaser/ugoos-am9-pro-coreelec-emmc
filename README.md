@@ -54,7 +54,7 @@ See [`emmc-research.md`](emmc-research.md) for the full research notes.
    - `CE_FLASH` (p27, 512 MB, FAT32) — boot partition
    - `CE_STORAGE` (p28, ~57.9 GB, ext4) — CoreELEC storage
 6. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
-7. Installs a `mount-storage.sh` hook that fixes a device node issue in the CoreELEC initrd
+7. Installs a `mount-storage.sh` hook as a workaround for the cfgload FOLDER= path (see technical notes)
 8. Adds `nofsck` to `config.ini` to avoid a 10-second boot delay
 9. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`
 
@@ -93,17 +93,17 @@ ssh-keygen -R <device-ip>
 
 ### Why not just edit cfgload?
 
-`cfgload` is a compiled U-Boot script in mkimage format with a CRC in the binary header. Editing it with a text editor or `sed` changes the content but not the CRC — U-Boot verifies the CRC on load and silently rejects a mismatched script. The `mount-storage.sh` hook sidesteps this entirely.
+`cfgload` is a compiled U-Boot script in mkimage format with a CRC in the binary header. Editing it with a text editor or `sed` changes the content but not the CRC — U-Boot verifies the CRC on load and silently rejects a mismatched script, failing silently with no obvious error.
+
+The correct approach is to decompile, edit, and recompile cfgload with `mkimage` so it uses `disk=LABEL=CE_STORAGE` directly — which is what ceemmc would do if it supported this board. The `mount-storage.sh` hook was used here as a workaround to avoid that recompilation step, but it is not the intended mechanism.
 
 ### Why nofsck?
 
-With `cfgload` unmodified, the kernel cmdline still contains `disk=FOLDER=/dev/CE_STORAGE`. The CoreELEC initrd adds `/dev/CE_STORAGE` to its fsck checklist, then retries 20 times at 0.5 seconds each when the device node never appears (the initrd has no udev rules). `nofsck` skips this check.
+Because cfgload was left unmodified, the kernel cmdline still contains `disk=FOLDER=/dev/CE_STORAGE`. The CoreELEC initrd adds `/dev/CE_STORAGE` to its fsck checklist, then retries 20 times at 0.5 seconds each when the device node is not found. `nofsck` skips this check. If cfgload were properly recompiled to use `LABEL=`, this workaround would not be needed.
 
 ### Brick risk
 
 Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's first-stage bootloader cannot be overwritten from Linux. U-Boot tries the SD card first, so a working SD card always provides a recovery path. Worst case (corrupted GPT): Amlogic devices can be recovered via USB Burning Tool from a PC. However, broken media playback or boot failures on future firmware are a real possibility with no known fix.
-
----
 
 ---
 
