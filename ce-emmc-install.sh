@@ -10,7 +10,7 @@
 #   3. Deletes Android partitions: super (p27), rsv (p28), userdata (p29)
 #   4. Creates CE_FLASH (512 MB FAT32) and CE_STORAGE (remaining ~57.9 GB ext4)
 #   5. Copies all boot files from the SD card's /flash to CE_FLASH
-#   6. Installs mount-storage.sh hook (bypasses broken FOLDER= device node mechanism)
+#   6. Installs mount-storage.sh hook (workaround for cfgload's dual-boot FOLDER= path)
 #   7. Adds nofsck to config.ini (avoids 10s boot delay from phantom fsck)
 #   8. Optionally migrates your current /storage to CE_STORAGE
 
@@ -20,6 +20,12 @@ EMMC="/dev/mmcblk0"
 SD_FLASH="/flash"
 MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
+
+cleanup() {
+    mountpoint -q "$MNT_FLASH"   2>/dev/null && umount "$MNT_FLASH"   || true
+    mountpoint -q "$MNT_STORAGE" 2>/dev/null && umount "$MNT_STORAGE" || true
+}
+trap cleanup EXIT
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -52,10 +58,14 @@ make_emmc_nodes() {
 reread_and_make_nodes() {
     local parts=("$@")
     blockdev --rereadpt "$EMMC" 2>/dev/null || true
-    sleep 2  # give the kernel time to update sysfs
 
     for part in "${parts[@]}"; do
         local sysfs_dev="/sys/block/mmcblk0/mmcblk0p${part}/dev"
+        local waited=0
+        while [[ ! -f "$sysfs_dev" ]] && (( waited < 10 )); do
+            sleep 1
+            (( waited++ )) || true
+        done
         if [[ -f "$sysfs_dev" ]]; then
             local devnum maj min
             read -r devnum < "$sysfs_dev"
@@ -171,7 +181,8 @@ echo ""
 echo "  Partitions p1–p26 are NOT touched."
 echo "  boot0/boot1 are hardware write-protected and are safe."
 echo ""
-warn "This cannot be undone. Android cannot be restored after this."
+warn "Android will be removed. It can be restored only via the Amlogic USB Burning Tool"
+warn "on a Windows PC using the official Ugoos factory image — not a simple undo."
 echo ""
 read -rp "  Type YES to proceed: " confirm
 echo ""
@@ -235,9 +246,12 @@ cp -a "${SD_FLASH}/." "${MNT_FLASH}/"
 rm -f "${MNT_FLASH}/fs-resize.log"
 
 # Install mount-storage.sh hook.
-# The initrd sources this file instead of running the normal mount_part() logic,
-# bypassing the FOLDER=/dev/CE_STORAGE mechanism. That mechanism requires a
-# /dev/CE_STORAGE device node which the initrd never creates (no udev rules).
+# The initrd sources this file instead of running the normal mount_part() logic.
+# This sidesteps cfgload's disk=FOLDER=/dev/CE_STORAGE path, which is a dual-boot
+# mechanism designed for CoreELEC storage living inside Android's userdata — not
+# applicable to a standalone install. The correct fix is recompiling cfgload with
+# mkimage to use disk=LABEL=CE_STORAGE, but that requires mkimage and adds
+# complexity. This hook achieves the same result without touching cfgload.
 log "Installing mount-storage.sh hook..."
 cat > "${MNT_FLASH}/mount-storage.sh" << 'EOF'
 mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
