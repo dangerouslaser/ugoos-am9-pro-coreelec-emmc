@@ -5,10 +5,10 @@
 # Must be run from CoreELEC booted off an SD card.
 #
 # What this does:
-#   1. Backs up env (p2) and bootloader_a (p7) to /storage
-#   2. Checks whether super (p27) is safe to delete (may contain TEE firmware)
-#   3. Deletes Android partitions: super (p27), rsv (p28), userdata (p29)
-#   4. Creates CE_FLASH (512 MB FAT32) and CE_STORAGE (remaining ~57.9 GB ext4)
+#   1. Backs up partition layout, rsv (p28), env (p2), and bootloader_a (p7) to /storage
+#   2. Keeps super (p27) — Android system images intact for potential restore
+#   3. Deletes rsv (p28) and userdata (p29)
+#   4. Creates CE_FLASH (512 MB FAT32) at p28 and CE_STORAGE (remaining space ext4) at p29
 #   5. Copies all boot files from the SD card's /flash to CE_FLASH
 #   6. Installs mount-storage.sh hook (workaround for cfgload's dual-boot FOLDER= path)
 #   7. Adds nofsck to config.ini (avoids 10s boot delay from phantom fsck)
@@ -16,16 +16,41 @@
 
 set -euo pipefail
 
+# ── Flags ─────────────────────────────────────────────────────────────────────
+
+DRY_RUN=false
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        --help)
+            echo "Usage: ce-emmc-install.sh [--dry-run] [--help]"
+            echo ""
+            echo "  --dry-run  Show all commands without executing destructive operations."
+            echo "             Non-destructive reads (parted print, blkid, dd reads) still run."
+            echo "  --help     Show this help and exit."
+            exit 0
+            ;;
+    esac
+done
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
 EMMC="/dev/mmcblk0"
 SD_FLASH="/flash"
 MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
+BACKUP_DIR="/storage"
+
+# ── Cleanup trap ──────────────────────────────────────────────────────────────
 
 cleanup() {
     mountpoint -q "$MNT_FLASH"   2>/dev/null && umount "$MNT_FLASH"   || true
     mountpoint -q "$MNT_STORAGE" 2>/dev/null && umount "$MNT_STORAGE" || true
 }
 trap cleanup EXIT
+
+# ── Colors and output helpers ─────────────────────────────────────────────────
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,6 +62,56 @@ log()    { echo -e "${GREEN}[+]${NC} $*"; }
 warn()   { echo -e "${YELLOW}[!]${NC} $*"; }
 die()    { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}--- $* ---${NC}"; }
+
+# ── Dry-run wrapper ───────────────────────────────────────────────────────────
+
+run() {
+    if $DRY_RUN; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} $*"
+    else
+        "$@"
+    fi
+}
+
+$DRY_RUN && warn "DRY-RUN mode — no changes will be made"
+
+# ── TUI detection ─────────────────────────────────────────────────────────────
+
+USE_TUI=false
+if command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
+    _cols=$(tput cols 2>/dev/null || echo 0)
+    _rows=$(tput lines 2>/dev/null || echo 0)
+    [[ $_cols -ge 60 && $_rows -ge 20 ]] && USE_TUI=true
+fi
+
+# tui_confirm_destructive — main confirm dialog (requires typing YES in text mode)
+tui_confirm_destructive() {
+    local title="$1" msg="$2"
+    if $USE_TUI; then
+        whiptail --title "$title" --yesno "$msg" 22 72 3>&1 1>&2 2>&3
+    else
+        echo -e "$msg"
+        echo ""
+        read -rp "  Type YES to proceed: " _c
+        echo ""
+        [[ "$_c" == "YES" ]]
+    fi
+}
+
+# tui_yesno — secondary prompt (default No)
+tui_yesno() {
+    local title="$1" msg="$2"
+    if $USE_TUI; then
+        whiptail --title "$title" --defaultno --yesno "$msg" 15 72 3>&1 1>&2 2>&3
+    else
+        echo -e "$msg"
+        read -rp "  Migrate? [y/N]: " _a
+        _a="${_a,,}"
+        [[ "$_a" == "y" || "$_a" == "yes" ]]
+    fi
+}
+
+# ── eMMC node helpers ─────────────────────────────────────────────────────────
 
 # Create /dev nodes for eMMC partitions the kernel already knows about,
 # reading major:minor from sysfs rather than assuming sequential numbering.
@@ -80,7 +155,16 @@ reread_and_make_nodes() {
     done
 }
 
-# ── Preflight ────────────────────────────────────────────────────────────────
+# ── Size helpers ──────────────────────────────────────────────────────────────
+
+part_size_mib() {
+    parted -sm "$EMMC" unit MiB print 2>/dev/null \
+        | awk -F: -v p="$1" '$1==p{gsub(/MiB/,"",$4); printf "%.0f",$4}'
+}
+
+human_mib() { awk -v m="$1" 'BEGIN{if(m>=1024)printf "%.1f GB",m/1024; else printf "%d MB",m}'; }
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
 
 header "Preflight checks"
 
@@ -118,132 +202,141 @@ log "Required tools: all present"
 # Create device nodes from sysfs for partitions the kernel already knows about
 make_emmc_nodes
 
+# Check for an existing CoreELEC install before inspecting the Android layout
+if blkid "${EMMC}p28" 2>/dev/null | grep -q "CE_FLASH"; then
+    die "CoreELEC is already installed (CE_FLASH on p28). Run ce-emmc-restore.sh to restore Android first."
+fi
+# Also catch old-style install (CE_FLASH was on p27 in v1)
+if blkid "${EMMC}p27" 2>/dev/null | grep -q "CE_FLASH"; then
+    die "Old-style CoreELEC install detected on p27. Restore Android via USB Burning Tool first."
+fi
+
 # Check for expected Android partition layout
 parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^27:" || \
-    die "Partition 27 not found — unexpected layout. Has this already been modified?"
+    die "Partition 27 (super) not found — unexpected layout. Has this already been modified?"
 parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^28:" || \
-    die "Partition 28 not found — unexpected layout."
-if ! parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^29:"; then
-    if blkid /dev/mmcblk0p27 2>/dev/null | grep -q "CE_FLASH"; then
-        die "CoreELEC is already installed on this eMMC (CE_FLASH found on p27, no p29).\n        To reinstall, restore the device to its Android partition layout first."
-    else
-        die "Partition 29 not found — unexpected layout. Has this already been modified?"
-    fi
-fi
+    die "Partition 28 (rsv) not found — unexpected layout."
+parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^29:" || \
+    die "Partition 29 (userdata) not found — unexpected layout."
 
 log "Partition layout: 29-partition Android layout confirmed"
 
-# ── super partition content check ─────────────────────────────────────────────
+# ── Read dynamic partition sizes ──────────────────────────────────────────────
+
+SUPER_SIZE_MIB=$(part_size_mib 27)
+RSV_SIZE_MIB=$(part_size_mib 28)
+USERDATA_SIZE_MIB=$(part_size_mib 29)
+CE_STORAGE_SIZE_MIB=$(( RSV_SIZE_MIB + USERDATA_SIZE_MIB - 512 ))
+
+SUPER_HUMAN=$(human_mib "$SUPER_SIZE_MIB")
+RSV_HUMAN=$(human_mib "$RSV_SIZE_MIB")
+USERDATA_HUMAN=$(human_mib "$USERDATA_SIZE_MIB")
+CE_STORAGE_HUMAN=$(human_mib "$CE_STORAGE_SIZE_MIB")
+
+# ── rsv content check ─────────────────────────────────────────────────────────
 #
-# CoreELEC's tee-loader.sh uses /dev/super to load TEE firmware when booting
-# on some devices. If super has content (Android dynamic partition metadata +
-# system/vendor images), deleting it will break TEE loading.
-#
-# On units that shipped without a full Android install (super is zeroed),
-# this is safe. The script checks the first 512 bytes for any non-zero data.
+# Read rsv before the confirm screen so the result can be included in the
+# confirm message. The backup happens after the user confirms.
 
-header "Checking super partition"
+RSV_HAS_DATA=$(dd if="${EMMC}p28" bs=512 count=1 2>/dev/null | tr -d '\0' | wc -c)
 
-SUPER_HAS_DATA=$(dd if=/dev/mmcblk0p27 bs=512 count=1 2>/dev/null | tr -d '\0' | wc -c)
+# ── Confirm ───────────────────────────────────────────────────────────────────
 
-if [[ "$SUPER_HAS_DATA" -gt 0 ]]; then
-    echo ""
-    warn "The super partition (p27) contains data."
-    warn "CoreELEC uses /dev/super to load TEE firmware on some devices."
-    warn "Deleting it may break TEE-dependent functionality."
-    warn "This was tested on a unit where super was empty. Your unit may differ."
-    echo ""
-    warn "Proceeding may leave your device in an untested state."
-    echo ""
-    read -rp "  Type YES to delete super anyway: " super_confirm
-    echo ""
-    [[ "$super_confirm" == "YES" ]] || { echo "Aborted."; exit 0; }
-else
-    log "super partition is empty — safe to delete"
+RSV_NOTE=""
+if [[ "$RSV_HAS_DATA" -gt 0 ]]; then
+    RSV_NOTE="  [contains data — will be backed up]"
 fi
 
-# ── Confirm ──────────────────────────────────────────────────────────────────
+CONFIRM_MSG="\
+CoreELEC eMMC Installer — Ugoos AM9 Pro
 
-echo ""
-echo -e "${BOLD}════════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}  CoreELEC eMMC Installer — Ugoos AM9 Pro${NC}"
-echo -e "${BOLD}════════════════════════════════════════════════════${NC}"
-echo ""
-echo "  The following changes will be made to the eMMC:"
-echo ""
-echo "    DELETE  p27  super      3.1 GB"
-echo "    DELETE  p28  rsv         64 MB"
-echo "    DELETE  p29  userdata   54.4 GB  (encrypted — unrecoverable)"
-echo ""
-echo "    CREATE  p27  CE_FLASH   512 MB   FAT32  (boot partition)"
-echo "    CREATE  p28  CE_STORAGE ~57.9 GB ext4   (storage)"
-echo ""
-echo "  Partitions p1–p26 are NOT touched."
-echo "  boot0/boot1 are hardware write-protected and are safe."
-echo ""
-warn "Android will be removed. It can be restored only via the Amlogic USB Burning Tool"
-warn "on a Windows PC using the official Ugoos factory image — not a simple undo."
-echo ""
-read -rp "  Type YES to proceed: " confirm
-echo ""
-[[ "$confirm" == "YES" ]] || { echo "Aborted."; exit 0; }
+  KEEP    p27  super       ${SUPER_HUMAN}  (Android system — untouched)
 
-# ── Backups ──────────────────────────────────────────────────────────────────
+  DELETE  p28  rsv         ${RSV_HUMAN}${RSV_NOTE}
+  DELETE  p29  userdata    ${USERDATA_HUMAN}  (encrypted — unrecoverable)
+
+  CREATE  p28  CE_FLASH    512 MB  FAT32  (CoreELEC boot)
+  CREATE  p29  CE_STORAGE  ${CE_STORAGE_HUMAN}  ext4   (CoreELEC storage)
+
+Partitions p1–p26 and super (p27) are NOT touched.
+boot0/boot1 are hardware write-protected and safe.
+
+Android restore requires Amlogic USB Burning Tool on Windows via the
+USB-C OTG port using the official Ugoos factory image."
+
+tui_confirm_destructive "CoreELEC eMMC Installer — Ugoos AM9 Pro" "$CONFIRM_MSG" \
+    || { echo "Aborted."; exit 0; }
+
+# ── Backups ───────────────────────────────────────────────────────────────────
 
 header "Backing up critical partitions"
 
-dd if=/dev/mmcblk0p2 of=/storage/env_backup.bin bs=1M status=none
-log "env (p2) → /storage/env_backup.bin"
+# Save the current partition layout — required by ce-emmc-restore.sh to
+# reconstruct the original p28/p29 boundaries exactly.
+if ! $DRY_RUN; then
+    parted -sm "$EMMC" unit B print > "${BACKUP_DIR}/partition_layout.txt"
+    log "Partition layout → ${BACKUP_DIR}/partition_layout.txt"
+else
+    echo -e "${YELLOW}[DRY-RUN]${NC} parted -sm $EMMC unit B print > ${BACKUP_DIR}/partition_layout.txt"
+fi
 
-dd if=/dev/mmcblk0p7 of=/storage/bootloader_a_backup.bin bs=1M status=none
-log "bootloader_a (p7) → /storage/bootloader_a_backup.bin"
+run dd if="${EMMC}p28" of="${BACKUP_DIR}/rsv_backup.bin" bs=1M status=none
+log "rsv (p28) → ${BACKUP_DIR}/rsv_backup.bin"
 
-# ── Repartition ──────────────────────────────────────────────────────────────
+run dd if="${EMMC}p2" of="${BACKUP_DIR}/env_backup.bin" bs=1M status=none
+log "env (p2) → ${BACKUP_DIR}/env_backup.bin"
+
+run dd if="${EMMC}p7" of="${BACKUP_DIR}/bootloader_a_backup.bin" bs=1M status=none
+log "bootloader_a (p7) → ${BACKUP_DIR}/bootloader_a_backup.bin"
+
+# ── Repartition ───────────────────────────────────────────────────────────────
 
 header "Repartitioning eMMC"
 
-# Find where p27 (super) starts — CE_FLASH will start at the same position
-SUPER_START_B=$(parted -sm "$EMMC" unit B print 2>/dev/null \
-    | awk -F: '/^27:/{gsub(/B/,""); print $2}')
-[[ -n "$SUPER_START_B" ]] || die "Could not determine start position of partition 27"
+# Find where p28 (rsv) starts — CE_FLASH will occupy the same starting position
+RSV_START_B=$(parted -sm "$EMMC" unit B print 2>/dev/null \
+    | awk -F: '/^28:/{gsub(/B/,""); print $2}')
+[[ -n "$RSV_START_B" ]] || die "Could not determine start position of partition 28"
 
 # Work in MiB — Android aligns to MiB boundaries
-SUPER_START_MIB=$((SUPER_START_B / 1024 / 1024))
-CE_FLASH_END_MIB=$((SUPER_START_MIB + 512))
+RSV_START_MIB=$((RSV_START_B / 1024 / 1024))
+CE_FLASH_END_MIB=$((RSV_START_MIB + 512))
 
-log "Deleting partitions 27 (super), 28 (rsv), 29 (userdata)..."
-parted -s "$EMMC" rm 29 rm 28 rm 27
+log "Deleting partitions 28 (rsv) and 29 (userdata)..."
+run parted -s "$EMMC" rm 29 rm 28
 
-log "Creating CE_FLASH (${SUPER_START_MIB}MiB – ${CE_FLASH_END_MIB}MiB)..."
-parted -s "$EMMC" mkpart CE_FLASH fat32 "${SUPER_START_MIB}MiB" "${CE_FLASH_END_MIB}MiB"
+log "Creating CE_FLASH (${RSV_START_MIB}MiB – ${CE_FLASH_END_MIB}MiB)..."
+run parted -s "$EMMC" mkpart CE_FLASH fat32 "${RSV_START_MIB}MiB" "${CE_FLASH_END_MIB}MiB"
 
 log "Creating CE_STORAGE (${CE_FLASH_END_MIB}MiB – 100%)..."
-parted -s "$EMMC" mkpart CE_STORAGE ext4 "${CE_FLASH_END_MIB}MiB" "100%"
+run parted -s "$EMMC" mkpart CE_STORAGE ext4 "${CE_FLASH_END_MIB}MiB" "100%"
 
 # Ask the kernel to re-read the partition table, then create device nodes
 # using sysfs-reported major:minor numbers (not assumed sequential values)
-reread_and_make_nodes 27 28
+if ! $DRY_RUN; then
+    reread_and_make_nodes 28 29
+fi
 
-# ── Format ───────────────────────────────────────────────────────────────────
+# ── Format ────────────────────────────────────────────────────────────────────
 
 header "Formatting partitions"
 
 log "Formatting CE_FLASH as FAT32..."
-mkfs.fat -F 32 -n CE_FLASH /dev/mmcblk0p27
+run mkfs.fat -F 32 -n CE_FLASH "${EMMC}p28"
 
 log "Formatting CE_STORAGE as ext4..."
-mkfs.ext4 -q -L CE_STORAGE /dev/mmcblk0p28
+run mkfs.ext4 -q -L CE_STORAGE "${EMMC}p29"
 
-# ── Install boot files ───────────────────────────────────────────────────────
+# ── Install boot files ────────────────────────────────────────────────────────
 
 header "Installing boot files"
 
-mkdir -p "$MNT_FLASH"
-mount /dev/mmcblk0p27 "$MNT_FLASH"
+run mkdir -p "$MNT_FLASH"
+run mount "${EMMC}p28" "$MNT_FLASH"
 
 log "Copying files from ${SD_FLASH}..."
-cp -a "${SD_FLASH}/." "${MNT_FLASH}/"
-rm -f "${MNT_FLASH}/fs-resize.log"
+run cp -a "${SD_FLASH}/." "${MNT_FLASH}/"
+run rm -f "${MNT_FLASH}/fs-resize.log"
 
 # Install mount-storage.sh hook.
 # The initrd sources this file instead of running the normal mount_part() logic.
@@ -253,9 +346,13 @@ rm -f "${MNT_FLASH}/fs-resize.log"
 # mkimage to use disk=LABEL=CE_STORAGE, but that requires mkimage and adds
 # complexity. This hook achieves the same result without touching cfgload.
 log "Installing mount-storage.sh hook..."
-cat > "${MNT_FLASH}/mount-storage.sh" << 'EOF'
+if ! $DRY_RUN; then
+    cat > "${MNT_FLASH}/mount-storage.sh" << 'EOF'
 mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
 EOF
+else
+    echo -e "${YELLOW}[DRY-RUN]${NC} write ${MNT_FLASH}/mount-storage.sh"
+fi
 
 # Add nofsck to config.ini.
 # With cfgload unmodified, the kernel cmdline still contains
@@ -263,43 +360,60 @@ EOF
 # list, then retries 20 times at 0.5s each when the device node never appears.
 # nofsck skips this entirely.
 log "Updating config.ini (adding nofsck)..."
-if grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
-    if ! grep -q "nofsck" "${MNT_FLASH}/config.ini"; then
-        sed -i "s/coreelec='\(.*\)'/coreelec='\1 nofsck'/" "${MNT_FLASH}/config.ini"
+if ! $DRY_RUN; then
+    if grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
+        if ! grep -q "nofsck" "${MNT_FLASH}/config.ini"; then
+            sed -i "s/coreelec='\(.*\)'/coreelec='\1 nofsck'/" "${MNT_FLASH}/config.ini"
+        fi
+    else
+        echo "coreelec='quiet nofsck'" >> "${MNT_FLASH}/config.ini"
     fi
 else
-    echo "coreelec='quiet nofsck'" >> "${MNT_FLASH}/config.ini"
+    echo -e "${YELLOW}[DRY-RUN]${NC} update ${MNT_FLASH}/config.ini — add nofsck"
 fi
 
-umount "$MNT_FLASH"
+run umount "$MNT_FLASH"
 log "CE_FLASH ready"
 
-# ── Optional storage migration ────────────────────────────────────────────────
+# ── Optional storage migration ─────────────────────────────────────────────────
 
-echo ""
-echo "  The eMMC install is ready. CE_STORAGE is currently empty —"
-echo "  first eMMC boot will initialize it as a fresh install."
-echo ""
-echo "  You can optionally migrate your current /storage (settings,"
-echo "  addons, media metadata) to CE_STORAGE now."
-echo ""
-read -rp "  Migrate /storage to CE_STORAGE? [YES/no]: " migrate_ans
-echo ""
+MIGRATE_MSG="  The eMMC install is ready. CE_STORAGE is currently empty —
+  first eMMC boot will initialize it as a fresh install.
 
-if [[ "${migrate_ans}" == "YES" ]]; then
+  You can optionally migrate your current /storage (settings,
+  addons, media metadata) to CE_STORAGE now."
+
+if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
     header "Migrating /storage to CE_STORAGE"
 
-    mkdir -p "$MNT_STORAGE"
-    mount -t ext4 -o rw,noatime /dev/mmcblk0p28 "$MNT_STORAGE"
+    run mkdir -p "$MNT_STORAGE"
+    run mount -t ext4 -o rw,noatime "${EMMC}p29" "$MNT_STORAGE"
 
-    log "Rsyncing /storage → CE_STORAGE (this may take a few minutes)..."
-    rsync -ax --info=progress2 /storage/ "$MNT_STORAGE/"
+    # Check available space before migrating
+    STORAGE_USED=$(du -sb /storage 2>/dev/null | awk '{print $1}')
+    CE_FREE=$(df -B1 "$MNT_STORAGE" 2>/dev/null | awk 'NR==2{print $4}')
+    if (( STORAGE_USED > CE_FREE )); then
+        warn "Not enough space: /storage uses $(( STORAGE_USED/1024/1024 )) MB, CE_STORAGE has $(( CE_FREE/1024/1024 )) MB free"
+        run umount "$MNT_STORAGE"
+        warn "Migration skipped — CE_STORAGE will be initialized fresh on first eMMC boot"
+    else
+        log "Rsyncing /storage → CE_STORAGE (this may take a few minutes)..."
+        run rsync -ax --info=progress2 /storage/ "$MNT_STORAGE/"
 
-    umount "$MNT_STORAGE"
-    log "Migration complete"
+        run umount "$MNT_STORAGE"
+        log "Migration complete"
+    fi
 fi
 
-# ── Done ─────────────────────────────────────────────────────────────────────
+# ── Post-install partition layout ─────────────────────────────────────────────
+
+header "Final eMMC partition layout"
+if ! $DRY_RUN; then
+    parted -sm "$EMMC" unit MiB print 2>/dev/null \
+        | awk -F: 'NR>2 && /^[0-9]/{gsub(/MiB/,"",$4); printf "  p%-3s %-20s %5.0f MiB\n",$1,$6,$4}'
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""
 echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════${NC}"
@@ -313,3 +427,10 @@ echo "  On first eMMC boot, SSH host keys are regenerated."
 echo "  Clear your old entry before reconnecting:"
 echo "    ssh-keygen -R <device-ip>"
 echo ""
+echo "  Backups saved to ${BACKUP_DIR}:"
+echo "    partition_layout.txt  (needed by ce-emmc-restore.sh)"
+echo "    rsv_backup.bin"
+echo "    env_backup.bin"
+echo "    bootloader_a_backup.bin"
+echo ""
+$DRY_RUN && warn "DRY-RUN complete — no changes were made"

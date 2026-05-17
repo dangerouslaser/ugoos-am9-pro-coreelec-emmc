@@ -10,7 +10,7 @@
 
 ## Final Setup
 
-CoreELEC boots from internal eMMC (`mmcblk0`, 58.2 GB Samsung A31M8C). `CE_FLASH` (p27, 512 MB FAT32) holds the boot files; `CE_STORAGE` (p28, 57.9 GB ext4) holds settings and addons. SD card is no longer needed and can be removed.
+CoreELEC boots from internal eMMC (`mmcblk0`, 58.2 GB Samsung A31M8C). `CE_FLASH` (p28, 512 MB FAT32) holds the boot files; `CE_STORAGE` (p29, ~53.9 GB ext4) holds settings and addons. `super` (p27) is preserved untouched — Android system images remain on the eMMC. SD card is no longer needed and can be removed.
 
 ---
 
@@ -56,12 +56,13 @@ Offsets from dmesg, all 29 partitions confirmed:
 | p24 | vbmeta_b | 0x27200000 | 2 MB | **zeroed** |
 | p25 | vbmeta_system_a | 0x27500000 | 2 MB | **zeroed** |
 | p26 | vbmeta_system_b | 0x27800000 | 2 MB | **zeroed** |
-| p27 | CE_FLASH | 0x27b00000 | 512 MB | **active** — FAT32, CoreELEC boot files |
-| p28 | CE_STORAGE | — | 57.9 GB | **active** — ext4, CoreELEC storage |
+| p27 | super | 0x27b00000 | ~3.1 GB | **preserved** — Android dynamic partition (LP metadata + system/vendor images) |
+| p28 | CE_FLASH | — | 512 MB | **active** — FAT32, CoreELEC boot files |
+| p29 | CE_STORAGE | — | ~53.9 GB | **active** — ext4, CoreELEC storage |
 
 The original Android layout had 29 partitions. Of those inspected: `boot_a/b`, `vbmeta_a/b`, `vendor_boot_a/b`, `init_boot_a/b`, `tee`, and `super` appeared empty on this unit. `bootloader_a` and `env` had live data. `userdata` was encrypted. The `metadata` partition holds FBE-related data and was not fully characterized.
 
-For the CoreELEC install, `super` (p27), `rsv` (p28), and `userdata` (p29) were deleted to free GPT slots, and `CE_FLASH` and `CE_STORAGE` were created in their place. The GPT was originally allocated for exactly 29 entries — adding partitions beyond that limit requires freeing existing slots first.
+For the CoreELEC install, `rsv` (p28) and `userdata` (p29) were deleted to free GPT slots, and `CE_FLASH` and `CE_STORAGE` were created in their place. `super` (p27) was preserved. The GPT was originally allocated for exactly 29 entries — deleting 2 and creating 2 keeps the total at 29.
 
 ---
 
@@ -233,14 +234,16 @@ The GPT partition table was created by Ugoos with exactly 29 entries — no room
 
 ### Partition changes made
 
+Preserved:
+- `super` (p27, ~3.1 GB) — kept intact; contains Android system images and is used by CoreELEC's `tee-loader.sh` for TEE firmware on some devices. Preserving it keeps the Android restore path simpler and avoids disrupting tee-loader.sh on devices where super contains TEE data.
+
 Deleted:
-- `super` (p27, 3.1 GB) — appeared empty on this unit; contains Android system images on a fully provisioned device and is used by CoreELEC's `tee-loader.sh`
-- `rsv` (p28, 64 MB) — unknown reserved partition, empty
-- `userdata` (p29, 54.4 GB) — encrypted remnant, not recoverable
+- `rsv` (p28, 64 MB) — unknown reserved partition; not present in the Ugoos factory restore image. Backed up to `/storage/rsv_backup.bin` before deletion. Content on this unit was not verified prior to deletion — the script now checks and reports non-zero content before proceeding.
+- `userdata` (p29, 54.4 GB) — encrypted with hardware-bound FBE keys, not recoverable
 
 Created:
-- `CE_FLASH` (p27, 512 MB, FAT32) — boot partition, holds kernel/DTB/cfgload
-- `CE_STORAGE` (p28, 57.9 GB, ext4) — CoreELEC storage
+- `CE_FLASH` (p28, 512 MB, FAT32) — boot partition, holds kernel/DTB/cfgload. U-Boot's `cfgloademmc` scans partitions 1–31 for a FAT filesystem containing cfgload — it finds CE_FLASH at p28 by content, not by partition number.
+- `CE_STORAGE` (p29, ~53.9 GB, ext4) — CoreELEC storage
 
 ### cfgload CRC trap
 
@@ -270,7 +273,7 @@ coreelec='quiet nofsck'
 
 This passes `nofsck` as a kernel argument, which the initrd parses to skip fsck entirely.
 
-### Final working file layout on CE_FLASH
+### Final working file layout on CE_FLASH (p28)
 
 ```
 CE_FLASH/
@@ -298,6 +301,21 @@ Device boots CoreELEC successfully from eMMC with SD card removed. First boot in
 ---
 
 ## Android Restore Path
+
+There are two restore paths.
+
+### Restore script (primary path)
+
+`ce-emmc-restore.sh` restores the original Android partition layout from the backups created by `ce-emmc-install.sh`. It reads `partition_layout.txt` to reconstruct the exact original p28/p29 boundaries, then:
+- Deletes CE_FLASH (p28) and CE_STORAGE (p29)
+- Recreates `rsv` (p28) and `userdata` (p29) at their original byte offsets
+- Restores rsv content from `rsv_backup.bin`
+- Restores env and bootloader_a from their backups
+- Leaves super (p27) untouched
+
+Android's userdata is recreated empty. Android reinitializes it on first boot from the system images already in `super`. No Windows PC or USB cable required.
+
+### USB Burning Tool (fallback)
 
 Ugoos distributes a full factory firmware image (`AM9PRO_2.0.9.img`) which can be flashed via the Amlogic USB Burning Tool v3.
 
@@ -332,11 +350,22 @@ The `super` partition contains real Android system data (LP metadata at offset 0
 
 The device examined in this research had `boot_a`, `vendor_boot_a`, `init_boot_a`, and `super` all appearing empty or zeroed, despite the factory image having real content for those partitions. The U-Boot environment contained `androidboot.firstboot=1`, suggesting the device had not completed its first Android boot. Ugoos may ship units in a partially provisioned state where the Android userspace images are not yet written to the eMMC.
 
-### Restore procedure
+### Factory image findings
+
+The factory image was fully parsed. Notable findings:
+
+- **`super` (1507 MB)** — present in the image; contains LP metadata and Android system/vendor images. Confirmed real content at offset 0.
+- **`tee` partition** — not present in the factory image. TEE firmware is not distributed via USB Burning Tool; it is provisioned at the factory separately. The `tee` partition was zeroed on the examined unit, and `androidboot.firstboot=1` indicates Android had never completed first boot on this device.
+- **`rsv` partition** — not present in the factory image. Ugoos does not write anything to this partition during a factory restore.
+- **Magisk** — confirmed present in `init_boot_a` via the magic markers `.magisk`, `KEEPVERITY=true`, `FORCEENCRYPT`, `RECOVERYMODE=false`. The factory image ships with Magisk pre-installed. The bootloader is unlocked (`verifiedbootstate=orange`, `avb2=0`).
+- **Widevine** — the device is Android certified and Widevine is functional. The mechanism by which Widevine L1 operates alongside an unlocked bootloader is not fully characterized. The Widevine device certificate (keybox) is stored in the `factory` partition (p4), which is not included in the factory restore image and is not touched by the CoreELEC install scripts. Whether Widevine L1 continues to function correctly after a USB Burning Tool restore is uncertain.
+- **USB-C OTG port** — burn mode connects via the dedicated USB-C OTG port (labelled OTG on the device). The three USB-A ports are host-only and cannot be used for burn mode. Cable required: USB-C to USB-A.
+
+### USB Burning Tool restore procedure
 
 Because `boot0` is hardware write-protected, the BL2 is always intact and the device can always be put into USB burn mode by holding the reset/ADB button during power-on. A full USB Burning Tool flash wipes and rewrites every partition (including the GPT itself), fully restoring the original 29-partition Android layout regardless of what was done to the partition table.
 
-This means the "no restore path" concern is not accurate — Android can be restored, it just requires a Windows PC, a USB-A to USB-A cable, and the factory image.
+This means a full restore is always possible, but it requires a Windows PC, a USB-C to USB-A cable, and the factory image. The restored Android will be in the Ugoos-shipped state — pre-rooted via Magisk with an unlocked bootloader.
 
 ---
 
