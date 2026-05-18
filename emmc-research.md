@@ -2,7 +2,10 @@
 
 **Date:** May 14, 2026  
 **Device:** Ugoos AM9 Pro  
-**SoC:** Amlogic S905X5 (S6 family, CoreELEC board ID `s6_s905x5_ugoos_am9_pro`)  
+**SoC:** Amlogic S905X5-J (S6 family per CoreELEC board ID `s6_s905x5_ugoos_am9_pro`; serial `0x3e` in Amlogic's internal numbering, referred to as "S5" in tee-loader.sh; the -J suffix denotes Dolby Vision licensing)  
+**CPU:** Quad-core ARMv9.0 Cortex-A510  
+**GPU:** Mali G310 V5  
+**RAM:** 4 GB LPDDR5  
 **CoreELEC:** 22.0-Piers_nightly_20260514  
 **Kernel:** 5.15.196  
 
@@ -30,7 +33,7 @@ Offsets from dmesg, all 29 partitions confirmed:
 
 | # | Name | Offset | Size | Status |
 |---|------|--------|------|--------|
-| p1 | reserved | 0x2400000 | 64 MB | unknown |
+| p1 | reserved | 0x2400000 | 64 MB | zeroed — confirmed all-null; not in factory image |
 | p2 | env | 0x6c00000 | 8 MB | **active** — U-Boot env |
 | p3 | frp | 0x8400000 | 2 MB | unknown |
 | p4 | factory | 0x8e00000 | 8 MB | unknown |
@@ -88,7 +91,7 @@ The `metadata` partition holds encryption-related data as part of Android's FBE 
 
 ### RPMB
 
-RPMB is provisioned (a key has been burned in). RPMB is used by Android's Keymaster/TEE to store hardware-bound key material. Since the TEE partition is also zeroed, Keymaster was never actually run on this device. The RPMB key is there but nothing ever used it.
+RPMB is provisioned (a key has been burned in). RPMB is used by Android's Keymaster/TEE to store hardware-bound key material. The device is Widevine L3 (software-only), so RPMB is not required for DRM. The `tee` eMMC partition (p9) is zeroed — TEE firmware (BL32) is embedded in `bootloader_a`, not stored in the `tee` partition on this device. The RPMB key was burned at the factory but Keymaster may never have run given `androidboot.firstboot=1`.
 
 ### Verified Boot
 
@@ -235,7 +238,7 @@ The GPT partition table was created by Ugoos with exactly 29 entries — no room
 ### Partition changes made
 
 Preserved:
-- `super` (p27, ~3.1 GB) — kept intact; contains Android system images and is used by CoreELEC's `tee-loader.sh` for TEE firmware on some devices. Preserving it keeps the Android restore path simpler and avoids disrupting tee-loader.sh on devices where super contains TEE data.
+- `super` (p27, ~3.1 GB) — kept intact; preserves the Android restore path and avoids disrupting `tee-loader.sh` on SoCs where the Android TEE path is still used. On the AM9 Pro (S905X5-J, S5 serial), `tee-loader.sh` unconditionally uses CoreELEC's own TEE implementation and never reads from `super` — so `super` is not required for CoreELEC operation on this device and could be deleted in a CoreELEC-only install.
 
 Deleted:
 - `rsv` (p28, 64 MB) — unknown reserved partition; not present in the Ugoos factory restore image. Backed up to `/storage/rsv_backup.bin` before deletion. Content on this unit was not verified prior to deletion — the script now checks and reports non-zero content before proceeding.
@@ -288,7 +291,7 @@ CE_FLASH/
 ├── resolution.ini
 ├── aml_autoscript
 ├── cfgload_env
-├── dovi.ko
+├── dovi.ko          (Dolby Vision kernel module — present because S905X5-J is DV-licensed)
 ├── recovery.img
 └── device_trees/
     └── s6_s905x5_ugoos_am9_pro.dtb  (and all other DTBs)
@@ -342,7 +345,7 @@ The 30 items break down as 14 `PARTITION` entries, 14 matching `VERIFY` (hash) e
 | GPT (`bin/gpt`) | 0.03 MB | Full GPT table — restores the original 29-partition layout |
 | DTB (`dtb/meson1`) | 0.08 MB | Amlogic SoC DTB |
 
-The `super` partition contains real Android system data (LP metadata at offset 0 followed by compressed system and vendor images). This confirms: on devices that shipped with a working Android install, `super` has content and deleting it will break TEE loading as documented.
+The `super` partition contains real Android system data (LP metadata at offset 0 followed by compressed system and vendor images). On SoCs where `tee-loader.sh` uses the Android TEE path (older SC2-era devices without CoreELEC-native TAs), deleting `super` would break TEE loading and video playback. On the AM9 Pro (S905X5-J), `tee-loader.sh` always uses CoreELEC's own TEE — `super` is not required for CoreELEC operation.
 
 `odm_ext_a` being zeroed in the factory image is consistent with what was observed on the device — this partition appears to be unused in this firmware version.
 
@@ -358,7 +361,7 @@ The factory image was fully parsed. Notable findings:
 - **`tee` partition** — not present in the factory image. TEE firmware is not distributed via USB Burning Tool; it is provisioned at the factory separately. The `tee` partition was zeroed on the examined unit, and `androidboot.firstboot=1` indicates Android had never completed first boot on this device.
 - **`rsv` partition** — not present in the factory image. Ugoos does not write anything to this partition during a factory restore.
 - **Magisk** — confirmed present in `init_boot_a` via the magic markers `.magisk`, `KEEPVERITY=true`, `FORCEENCRYPT`, `RECOVERYMODE=false`. The factory image ships with Magisk pre-installed. The bootloader is unlocked (`verifiedbootstate=orange`, `avb2=0`).
-- **Widevine** — the device is Android certified and Widevine is functional. The mechanism by which Widevine L1 operates alongside an unlocked bootloader is not fully characterized. The Widevine device certificate (keybox) is stored in the `factory` partition (p4), which is not included in the factory restore image and is not touched by the CoreELEC install scripts. Whether Widevine L1 continues to function correctly after a USB Burning Tool restore is uncertain.
+- **Widevine** — the device is certified at **Widevine L3** (confirmed by Ugoos official specs). L3 is software-only key handling and requires no TEE involvement for DRM — this is the expected level for a device with an unlocked bootloader, since L1 requires an intact verified boot trust chain. The Widevine device certificate (keybox) is stored in the `factory` partition (p4), which is not included in the factory restore image and is not touched by the CoreELEC install scripts. Whether L3 certification survives a USB Burning Tool restore is uncertain since the keybox in p4 is not rewritten by the factory image.
 - **USB-C OTG port** — burn mode connects via the dedicated USB-C OTG port (labelled OTG on the device). The three USB-A ports are host-only and cannot be used for burn mode. Cable required: USB-C to USB-A.
 
 ### USB Burning Tool restore procedure
