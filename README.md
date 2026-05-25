@@ -151,7 +151,7 @@ The AM9 Pro can be fully restored to stock Android using the Amlogic USB Burning
 
 The official firmware image (`AM9PRO_2.0.9.img`) was fully parsed and confirmed to contain all required partitions: `super` (1507 MB, LP metadata + Android system images), `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the SoC DTB. The image also includes the GPT table itself, so a full flash restores the original 29-partition Android layout exactly.
 
-**Important:** The factory image restores Android to the state Ugoos shipped it — which includes **Magisk pre-installed** (root access). The device ships with an unlocked bootloader and Magisk patched into `init_boot_a`. Whether Widevine DRM (L1) will function correctly after a factory restore is uncertain: the Ugoos factory image does not include the `tee` partition, and the relationship between the pre-installed Magisk root, the unlocked bootloader state, and Widevine L1 attestation is not fully characterized. Do not assume DRM-protected content will work at the same level it did before.
+**Important:** The factory image restores Android to the state Ugoos shipped it — which includes **Magisk pre-installed** (root access). The device ships with an unlocked bootloader and Magisk patched into `init_boot_a`. The device is certified at Widevine L3 only (no L1 attestation path with an unlocked bootloader), and the per-device identity (MAC, serial) lives in RPMB and the Broadcom chip's OTP — not on the eMMC — so identity is preserved across any restore path. See [`factory-investigation.md`](factory-investigation.md) for the underlying analysis.
 
 ---
 
@@ -186,3 +186,4 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 | `ce-emmc-install.sh` | CoreELEC eMMC installer |
 | `ce-emmc-restore.sh` | Android partition restore script |
 | `emmc-research.md` | Full technical research notes |
+| `factory-investigation.md` | Pre-first-boot investigation into where MAC/serial actually live |

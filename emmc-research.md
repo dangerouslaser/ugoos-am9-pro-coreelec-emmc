@@ -35,8 +35,8 @@ Offsets from dmesg, all 29 partitions confirmed:
 |---|------|--------|------|--------|
 | p1 | reserved | 0x2400000 | 64 MB | zeroed — confirmed all-null; not in factory image |
 | p2 | env | 0x6c00000 | 8 MB | **active** — U-Boot env |
-| p3 | frp | 0x8400000 | 2 MB | unknown |
-| p4 | factory | 0x8e00000 | 8 MB | unknown |
+| p3 | frp | 0x8400000 | 2 MB | 36 bytes of unit-unique data at offset 0; rest zero |
+| p4 | factory | 0x8e00000 | 8 MB | empty FAT12 placeholder labeled "KEYBOX PART" — no keybox content |
 | p5 | vendor_boot_a | 0x9700000 | 64 MB | zeroed |
 | p6 | vendor_boot_b | 0xd800000 | 64 MB | zeroed |
 | p7 | bootloader_a | 0x11900000 | 8 MB | **active** — Amlogic `@ML` header |
@@ -46,7 +46,7 @@ Offsets from dmesg, all 29 partitions confirmed:
 | p11 | misc | 0x15500000 | 2 MB | unknown |
 | p12 | dtbo_a | 0x15800000 | 2 MB | unknown |
 | p13 | dtbo_b | 0x15b00000 | 2 MB | unknown |
-| p14 | cri_data | 0x15e00000 | 8 MB | unknown |
+| p14 | cri_data | 0x15e00000 | 8 MB | all zero — unused on this unit |
 | p15 | param | 0x16700000 | 16 MB | unknown |
 | p16 | odm_ext_a | 0x17800000 | 16 MB | empty (also zeroed in factory image) |
 | p17 | odm_ext_b | 0x18900000 | 16 MB | unknown |
@@ -102,6 +102,60 @@ RPMB is provisioned (a key has been burned in). RPMB is used by Android's Keymas
 ### Bootloader Write Protection
 
 `mmcblk0boot0` and `mmcblk0boot1` both report `force_ro=1` — they are hardware write-protected. This is the first-stage bootloader (BL2). Nothing running in Linux can overwrite it. The U-Boot environment also has `bootloader_wp=1` and `write_boot=0` confirming this is intentional.
+
+---
+
+## Per-Device Identity Provenance
+
+Where the working ETH MAC, WLAN/BT MACs, and serial actually come from — verified on a pre-first-boot unit where the `factory` (p4) partition is empty:
+
+| Identity | Value (example) | Source |
+|---|---|---|
+| ETH MAC | `90:0E:B3:FD:F8:55` | U-Boot `cmdline_keys` script calls `keyman read mac` and sets the kernel cmdline `mac=`. The env partition also stores `ethaddr=` as a redundant copy. Both resolve to **RPMB** as the underlying secure storage. |
+| WLAN MAC | `40:D9:5A:FC:E2:88` | BCM4389 chip OTP. dmesg: `[dhd] use firmware generated mac_address`. Not stored on the eMMC at all. |
+| BT MAC | `40:D9:5A:FC:E2:89` | BCM4389 OTP (WLAN MAC + 1, Broadcom convention). |
+| Serial | `AM9PRO26010005693` | `keyman read usid` → RPMB-backed Amlogic Unified Key Store. |
+
+### What is NOT used for identity on this unit
+
+- **Amlogic eFuses are all zero.** `/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` all read as zero bytes. The eFuse path is not the storage backend on the AM9 Pro S905X5-J.
+- **The `factory` (p4) partition is empty.** It is preformatted as FAT12 with label "KEYBOX PART" but contains no keybox data. The Widevine L3 state does not depend on any on-eMMC blob.
+- **The `cri_data` (p14) partition is empty.** All-zero across the full 8 MB.
+- **`mmcblk0boot0` / `mmcblk0boot1` are nearly all zero.** No clear-text keys live in the boot partitions.
+
+### The `cmdline_keys` flow
+
+The U-Boot env partition (p2) defines a script variable that runs late in `storeargs`:
+
+```sh
+if keyman init 0x1234; then
+  if keyman read usid ${loadaddr} str; then
+    setenv bootconfig ${bootconfig} androidboot.serialno=${usid}
+    setenv serial ${usid}
+  ...
+  fi
+  if keyman read mac ${loadaddr} str; then
+    setenv bootargs ${bootargs} mac=${mac}
+    setenv bootconfig ${bootconfig} androidboot.mac=${mac}
+  fi
+  if keyman read deviceid ...
+  if keyman read factory_flag ...
+fi
+... factory_provision init;
+```
+
+`keyman` is Amlogic's Unified Key Store interface; `0x1234` selects the secure key device. With eFuses empty and p4 empty, **RPMB** is the remaining backing store consistent with the data being readable. RPMB is provisioned on this unit (`rpmb_state=0x1`). The trailing `factory_provision init` is an Amlogic command that runs on first boot and is expected to write to `factory` (p4) when stock Android first comes up — that path has not been observed on this unit since Android has never completed first boot.
+
+### Implications for backup, install, and restore
+
+- **No eMMC-level operation can lose the per-device identity.** Wiping the GPT, deleting partitions, or running a full USB Burning Tool restore does not touch RPMB or the BCM4389 OTP. The unit retains its MAC and serial across any flow short of physical chip replacement.
+- **The CoreELEC install scripts do not need to back up `factory` (p4)** — there is nothing in it to preserve on this unit.
+- **The Widevine L3 certification does not depend on the eMMC.** L3 is software-only key handling; no L1 keybox blob is provisioned on p4.
+- **The `frp` (p3) partition does contain 36 bytes of unit-unique data** at offset 0 (anti-rollback / FRP signing material, most likely). If you ever wipe p3 destructively, you may want to back it up first; the CoreELEC install does not touch this partition.
+
+### `fw_printenv` quirk
+
+`fw_printenv` is shipped on CoreELEC but the bundled `/etc/fw_env.config` points at `/dev/env` and `/dev/nand_env`, neither of which exist as device nodes by default. Reading the env partition with `dd if=/dev/mmcblk0p2` and grepping for variable names is the working path on this system. Alternatively, `mknod /dev/env b 179 2` or rewriting `fw_env.config` to point at `/dev/mmcblk0p2` would make `fw_printenv` work.
 
 ---
 
@@ -353,6 +407,8 @@ The `super` partition contains real Android system data (LP metadata at offset 0
 
 The device examined in this research had `boot_a`, `vendor_boot_a`, `init_boot_a`, and `super` all appearing empty or zeroed, despite the factory image having real content for those partitions. The U-Boot environment contained `androidboot.firstboot=1`, suggesting the device had not completed its first Android boot. Ugoos may ship units in a partially provisioned state where the Android userspace images are not yet written to the eMMC.
 
+Per-device identity (MAC, serial) is independent of this state — see [Per-Device Identity Provenance](#per-device-identity-provenance) above. The empty `factory` (p4) partition is consistent with the device never having run the `factory_provision init` step that runs on Android first boot; it is not a sign of broken provisioning. The unit boots and operates normally with `factory` empty because identity comes from RPMB and the BCM4389 chip, not from this partition.
+
 ### Factory image findings
 
 The factory image was fully parsed. Notable findings:
@@ -361,7 +417,7 @@ The factory image was fully parsed. Notable findings:
 - **`tee` partition** — not present in the factory image. TEE firmware is not distributed via USB Burning Tool; it is provisioned at the factory separately. The `tee` partition was zeroed on the examined unit, and `androidboot.firstboot=1` indicates Android had never completed first boot on this device.
 - **`rsv` partition** — not present in the factory image. Ugoos does not write anything to this partition during a factory restore.
 - **Magisk** — confirmed present in `init_boot_a` via the magic markers `.magisk`, `KEEPVERITY=true`, `FORCEENCRYPT`, `RECOVERYMODE=false`. The factory image ships with Magisk pre-installed. The bootloader is unlocked (`verifiedbootstate=orange`, `avb2=0`).
-- **Widevine** — the device is certified at **Widevine L3** (confirmed by Ugoos official specs). L3 is software-only key handling and requires no TEE involvement for DRM — this is the expected level for a device with an unlocked bootloader, since L1 requires an intact verified boot trust chain. The Widevine device certificate (keybox) is stored in the `factory` partition (p4), which is not included in the factory restore image and is not touched by the CoreELEC install scripts. Whether L3 certification survives a USB Burning Tool restore is uncertain since the keybox in p4 is not rewritten by the factory image.
+- **Widevine** — the device is certified at **Widevine L3** (confirmed by Ugoos official specs). L3 is software-only key handling and requires no TEE involvement for DRM — this is the expected level for a device with an unlocked bootloader, since L1 requires an intact verified boot trust chain. Earlier notes assumed the Widevine keybox lived in `factory` (p4); on inspection p4 is an empty FAT12 placeholder labeled "KEYBOX PART" with no keybox content. L3 does not require an on-eMMC keybox blob, and no per-device DRM material is at risk from a USB Burning Tool restore or CoreELEC install.
 - **USB-C OTG port** — burn mode connects via the dedicated USB-C OTG port (labelled OTG on the device). The three USB-A ports are host-only and cannot be used for burn mode. Cable required: USB-C to USB-A.
 
 ### USB Burning Tool restore procedure
