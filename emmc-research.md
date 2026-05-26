@@ -11,6 +11,55 @@
 
 ---
 
+## Claims Provenance — Device Truth vs CoreELEC Observation
+
+This document was assembled by observing the device while running CoreELEC, which means it's easy to accidentally describe "what CoreELEC happens to see" as if it were "what the hardware is." The DTB section is the obvious example — the CoreELEC DTB declares the CPU as A55 (a kernel-compatibility shim), but the hardware register `MIDR_EL1` says A510. Two different answers; the hardware register wins.
+
+To make the audit explicit:
+
+**Device-truth claims** — verifiable independently of the OS, by reading hardware registers, raw eMMC bytes, or chip IDs:
+
+| Claim | How to verify | OS-independent? |
+|---|---|---|
+| CPU is Cortex-A510 (ARMv9.0a) | `cat /sys/devices/system/cpu/cpu0/regs/identification/midr_el1` → `0x411fd463` → part `0xd46` = A510. Also `/proc/cpuinfo` advertises SVE2/MTE/BF16/i8mm (ARMv9). | Yes — hardware register read |
+| GPU is Mali Valhall | dmesg from the Mali driver: `mali fd000000.valhall: ... GPU identified as 0x4 arch 10.12.7`. Driver probes the GPU's own ID register. | Yes — driver-reported, would be identical on any kernel with Mali support |
+| eMMC chip is Samsung A31M8C | `/sys/class/mmc_host/mmc0/mmc0:0001/{cid,name,manfid,oemid,serial}` — manfid 0xec = Samsung. | Yes — eMMC CID is a chip property |
+| eMMC is ~58.2 GiB | `cat /sys/block/mmcblk0/size` × 512 | Yes |
+| boot0/boot1 are HW write-protected | `cat /sys/block/mmcblk0boot{0,1}/force_ro` → `1` | Yes — reflects eMMC hardware WP state |
+| RAM is ~4 GB | `/proc/meminfo` shows ~3.62 GiB usable | Yes |
+| Wi-Fi chip is BCM4389 family | PCI enum: `/sys/bus/pci/devices/0000:01:00.0/{vendor,device,subsystem_device}` → `0x14E4 / 0x449D / 0xAAE8` | Yes — PCIe enumeration is bus-level |
+| Partition layout (29 entries, sizes, offsets) | `parted -sm /dev/mmcblk0 unit B print` reads the GPT | Yes — GPT is a structure on the eMMC |
+| Per-partition raw bytes (`AMLNORMAL` at p1 offset 0x4000; empty FAT12 at p4; etc.) | `dd if=/dev/<partition> ...` | Yes — raw bytes are the same regardless of OS |
+| eFuses are zero | `/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` via Amlogic's driver | Yes — eFuse values are hardware-burned |
+| Wi-Fi/BT MAC is from BCM chip OTP | dmesg from bcmdhd reports `firmware generated mac_address` — the BCM firmware reads its own OTP and reports the MAC | Yes — would be reported the same by any bcmdhd or brcmfmac driver |
+| MAC `40:D9:5A:FC:E2:88` | Same path. The OUI `40:D9:5A` is registered to Broadcom. | Yes |
+| ETH MAC `90:0E:B3:FD:F8:55` is in the p1 keystore | Direct read: `python3 -c 'print(open("/dev/mmcblk0p1","rb").read().find(b"90:0e:b3:fd:f8:55"))'` returns 17596 = 0x44bc | Yes |
+| Bootloader is encrypted | Entropy of every section ≥7.6 bits/byte; no plaintext U-Boot/BL31/BL32 strings | Yes — pure byte-level |
+| Factory image (`AM9PRO_2.0.9.img`) content | Parse the Amlogic packer format directly | Yes — file format |
+
+**CoreELEC observations** — what CoreELEC happens to do with the device. May differ on Android, LibreELEC, or a custom build:
+
+| Observation | Note |
+|---|---|
+| Active DTB `/flash/dtb.img` declares CPU as A55, GPU as Valhall | This is the **CoreELEC variant** of the DTB (has `coreelec;` and `coreelec-dt-id` properties). The factory Ugoos DTB (extracted from `AM9PRO_2.0.9.img` as `dtb/meson1`) also declares A55 — for kernel-binding compatibility, not because the silicon is A55 — but misidentifies the GPU as Mali Midgard. See [Active DTB](#active-dtb--flashdtbimg-coreelec-variant). |
+| `/sys/class/aml_wifi/`, `/sys/class/efuse/` exist | Amlogic-vendor kernel modules. Present in CoreELEC because they bundle Amlogic's drivers; would be missing on a mainline Linux kernel. Underlying values (eFuse contents, Wi-Fi platform state) are still hardware truth — just exposed differently. |
+| `wlan0`/`eth0` interface names | systemd/udev choice; could differ |
+| Kernel cmdline ends with `disk=LABEL=CE_STORAGE quiet` | Set by our rebuilt `cfgload`; on a fresh Android boot the cmdline tail would be different (no `disk=`, no `quiet`) |
+| `/dev/mmcblk0p*` device nodes only exist for actively-mounted partitions | CoreELEC's udev policy; other Linux distros may create all of them automatically |
+| `fw_printenv` doesn't work out of the box | CoreELEC's `/etc/fw_env.config` references a `/dev/env` node that udev never creates |
+
+**Joint claims** — true of the device but with state that the OS or U-Boot may have written:
+
+| Claim | Note |
+|---|---|
+| U-Boot env content (`bootcmd`, `ce_on_emmc=no`, `firstboot=1`, etc.) | The env partition (p2) is writable. Most of what we see appears to be factory state on this unit (`firstboot=1`, `ce_on_emmc=no`), but the partition has been written to at least once (env A/B slots show different `firstboot` values). Specific values like `ethaddr` and `cmdline_keys` are Amlogic-factory U-Boot defaults; the `bootcmd` chain is also factory. |
+| RPMB `rpmb_state=0x1` | Set at factory; this is "provisioned" state. Hardware fact. |
+| AMLNORMAL keystore content | Written at factory by Ugoos's provisioning tool. The `keycnt=2` field and the populated slots are factory state; further slots may be added if Android first-boot ever runs. |
+
+If you're auditing this document or extending the install scripts, **the rule is: claims about silicon or partition contents should be backed by a hardware register or raw byte read, not by what CoreELEC's userspace says.** When in doubt, the verification commands in the table above are the source of truth.
+
+---
+
 ## Final Setup
 
 CoreELEC boots from internal eMMC (`mmcblk0`, 58.2 GB Samsung A31M8C). `CE_FLASH` (p28, 512 MB FAT32) holds the boot files; `CE_STORAGE` (p29, ~53.9 GB ext4) holds settings and addons. `super` (p27) is preserved untouched — Android system images remain on the eMMC. SD card is no longer needed and can be removed.
@@ -63,7 +112,7 @@ Offsets from dmesg, all 29 partitions confirmed:
 | p28 | CE_FLASH | — | 512 MB | **active** — FAT32, CoreELEC boot files |
 | p29 | CE_STORAGE | — | ~53.9 GB | **active** — ext4, CoreELEC storage |
 
-The original Android layout had 29 partitions. Of those inspected: `boot_a/b`, `vbmeta_a/b`, `vendor_boot_a/b`, `init_boot_a/b`, `tee`, and `super` appeared empty on this unit. `bootloader_a`, `env`, `param`, `metadata`, `frp`, `misc`, `logo`, and `dtbo_a` had live data. `userdata` was encrypted. `factory` (p4) is an empty FAT12 placeholder; `cri_data` (p14) is all zero; eFuses for MAC/USID are all zero — per-device identity comes from RPMB and the Wi-Fi chip OTP, not the eMMC. See [Per-Device Identity Provenance](#per-device-identity-provenance) below.
+The original Android layout had 29 partitions. Of those inspected: `boot_a/b`, `vbmeta_a/b`, `vendor_boot_a/b`, `init_boot_a/b`, `tee`, and `super` appeared empty on this unit. `bootloader_a`, `env`, `param`, `metadata`, `frp`, `misc`, `logo`, `dtbo_a`, and **`reserved` (p1, the AMLNORMAL keystore)** had live data. `userdata` was encrypted. `factory` (p4) is an empty FAT12 placeholder; `cri_data` (p14) is all zero; eFuses for MAC/USID are all zero — per-device identity (ETH MAC + serial) is stored as plaintext in p1's AMLNORMAL keystore; WLAN/BT MAC comes from the Wi-Fi chip's OTP. See [Per-Device Identity Provenance](#per-device-identity-provenance) below.
 
 For the CoreELEC install, `rsv` (p28) and `userdata` (p29) were deleted to free GPT slots, and `CE_FLASH` and `CE_STORAGE` were created in their place. `super` (p27) was preserved. The GPT was originally allocated for exactly 29 entries — deleting 2 and creating 2 keeps the total at 29.
 
@@ -149,11 +198,11 @@ fi
 
 ### Keystore structure observed in p1
 
-The `reserved` partition (p1) contains a duplicated Amlogic UKS bank starting at offset 0x4000 and again at offset 0x44000 (a 256 KB stride). Each bank starts with an `AMLNORMAL` magic, a version word (`0x02`), a count word, and ~80 bytes of high-entropy hash/HMAC material — followed deeper in the partition by a slot catalog and the slot key/value pairs. Confirmed-populated slots on this unit: `usid`, `mac`. Slot names present but values empty (or not yet provisioned): `$widevinekeybox`, `$PlayReadykeybox25`, `$netflix_mgkid`, `$attestationkeybox`, `$prprivkeybox`, `$prpubkeybox`, `$hdcp22_fw_private`, `$hdcp2_rx`, `$hdcp2_tx`, `$mac_wifi`, `$deviceid`, `$region_code`, `$secure_boot_set`.
+The `reserved` partition (p1) contains a duplicated Amlogic UKS bank starting at offset 0x4000 and again at offset 0x44000 (a 256 KB stride). Each bank starts with an `AMLNORMAL` magic, a version word, a count word, and **two 32-byte SHA-256 hashes** (one for the header, one for the data region — verified against the [public `storage_block_raw_head` struct](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/drivers/amlogic/storagekey/normal_key.c)). Then a slot catalog and the slot key/value pairs. Confirmed-populated slots on this unit: `usid`, `mac`. Slot names present but values empty (or not yet provisioned): `$widevinekeybox`, `$PlayReadykeybox25`, `$netflix_mgkid`, `$attestationkeybox`, `$prprivkeybox`, `$prpubkeybox`, `$hdcp22_fw_private`, `$hdcp2_rx`, `$hdcp2_tx`, `$mac_wifi`, `$deviceid`, `$region_code`, `$secure_boot_set`.
 
 ### Implications for backup, install, and restore
 
-- **`reserved` (p1) is the eMMC-resident copy of per-device identity** and IS at risk if you wipe it. The ETH MAC and serial are stored as plaintext slots in p1's UKS keystore. RPMB likely holds only the HMAC authentication key, not the values themselves. **Wiping or rewriting p1 would lose the eMMC keystore — and the factory image does not include p1, so USB Burning Tool restore would NOT bring it back.** WLAN/BT MACs from the BCM4389 OTP would survive, but ETH MAC, serial, and the (empty-on-this-unit) keybox slots would be gone.
+- **`reserved` (p1) is the eMMC-resident copy of per-device identity** and IS at risk if you wipe it. The ETH MAC and serial are stored as plaintext slots in p1's UKS keystore. Integrity is plain SHA-256 (no HMAC, no secret key — verified against the [CoreELEC/u-boot `storage_block_raw_head`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/drivers/amlogic/storagekey/normal_key.c) struct). RPMB is provisioned but is **not** on the keyman read path — see [Bootloader Partition](#bootloader-partition-p7--amlogic-amlboot-container). **Wiping or rewriting p1 would lose the eMMC keystore — and the factory image does not include p1, so USB Burning Tool restore would NOT bring it back.** WLAN/BT MACs from the BCM4389 OTP would survive, but ETH MAC, serial, and the (empty-on-this-unit) keybox slots would be gone.
 - **The CoreELEC install scripts do not touch p1.** Confirmed safe — the install only operates on p28 and p29. Still, a backup of p1 is a cheap precaution before any partition-table edits.
 - **The CoreELEC install scripts do not need to back up `factory` (p4)** — there is nothing in it to preserve on this unit.
 - **The Widevine L3 certification does not depend on the eMMC.** L3 is software-only key handling; no L1 keybox blob is provisioned in p1 either on this unit (slot exists, value empty).
@@ -399,7 +448,7 @@ The `super` partition contains real Android system data (LP metadata at offset 0
 
 The device examined in this research had `boot_a`, `vendor_boot_a`, `init_boot_a`, and `super` all appearing empty or zeroed, despite the factory image having real content for those partitions. The U-Boot environment contained `androidboot.firstboot=1`, suggesting the device had not completed its first Android boot. Ugoos may ship units in a partially provisioned state where the Android userspace images are not yet written to the eMMC.
 
-Per-device identity (MAC, serial) is independent of this state — see [Per-Device Identity Provenance](#per-device-identity-provenance) above. The empty `factory` (p4) partition is consistent with the device never having run the `factory_provision init` step that runs on Android first boot; it is not a sign of broken provisioning. The unit boots and operates normally with `factory` empty because identity comes from RPMB and the BCM4389 chip, not from this partition.
+Per-device identity (MAC, serial) is independent of this state — see [Per-Device Identity Provenance](#per-device-identity-provenance) above. The empty `factory` (p4) partition is consistent with the device never having run the `factory_provision init` step that runs on Android first boot; it is not a sign of broken provisioning. The unit boots and operates normally with `factory` empty because identity comes from the AMLNORMAL keystore in `reserved` (p1) — populated at factory time — and the BCM4389 chip's OTP, not from `factory` (p4).
 
 ### Factory image findings
 

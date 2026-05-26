@@ -4,7 +4,13 @@
 **Device:** 192.168.1.139, CoreELEC 22.0-Piers_nightly_20260525
 **Question:** On a pre-first-boot unit with empty `factory` (p4), where do the working MACs, serial, and other per-unit data actually live?
 
-> **Revision note (2026-05-26):** The initial investigation concluded RPMB held the identity values directly. A subsequent read of p1 `reserved` found the **Amlogic UKS keystore in plaintext on the eMMC** at offset 0x4000, with the serial and ETH MAC stored as named slots. RPMB most likely holds the HMAC integrity key, not the values. The conclusions below have been updated to reflect this. Implication: p1 IS load-bearing for eMMC-stored identity, and the original "no eMMC operation can lose identity" claim was wrong.
+> **Revision history:**
+>
+> - **2026-05-25:** Initial investigation. Concluded RPMB held the identity values directly (this turned out to be wrong).
+> - **2026-05-26:** A direct read of p1 `reserved` found the **Amlogic UKS keystore in plaintext on the eMMC** at offset 0x4000, with the serial and ETH MAC stored as named slots. RPMB is provisioned but is not on the keyman read path.
+> - **2026-05-26 (later):** Public BSP correlation against [`CoreELEC/u-boot`](https://github.com/CoreELEC/u-boot) `bl33/v2023/drivers/amlogic/storagekey/normal_key.c` confirmed the on-disk struct: keystore integrity is **plain SHA-256** (covering the header and the data region separately), not HMAC. The earlier "RPMB holds the HMAC key" hypothesis was wrong — no secret key is involved in the integrity check at all. RPMB is provisioned for Android's Keymaster/TEE post-boot, not for U-Boot keyman.
+>
+> Net effect: p1 IS load-bearing for eMMC-stored identity, and the original "no eMMC operation can lose identity" claim was wrong. The conclusions below have been updated.
 
 ---
 
@@ -12,7 +18,7 @@
 
 | Identity | Value on this unit | Source (verified) |
 |---|---|---|
-| Ethernet MAC | `90:0E:B3:FD:F8:55` | Plaintext in the Amlogic UKS keystore on **p1 `reserved`** at offset 0x4000 (redundant copy at 0x44000). U-Boot's `cmdline_keys` script reads via `keyman read mac` and sets the kernel cmdline `mac=`. The env partition also stores `ethaddr=` as a redundant copy. RPMB most likely holds the HMAC key that authenticates the keystore on read. |
+| Ethernet MAC | `90:0E:B3:FD:F8:55` | Plaintext in the Amlogic UKS keystore on **p1 `reserved`** at offset 0x4000 (redundant copy at 0x44000). U-Boot's `cmdline_keys` script reads via `keyman read mac` and sets the kernel cmdline `mac=`. The env partition also stores `ethaddr=` as a redundant copy. Integrity is plain SHA-256 (no HMAC; no secret key) — verified against [`CoreELEC/u-boot`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/drivers/amlogic/storagekey/normal_key.c) source. |
 | WLAN MAC | `40:D9:5A:FC:E2:88` | **BCM4389 chip OTP.** dmesg: `[dhd] use firmware generated mac_address 40:d9:5a:fc:e2:88` |
 | BT MAC | `40:D9:5A:FC:E2:89` | Same BCM4389 OTP (WLAN MAC + 1) |
 | Serial | `AM9PRO26010005693` | Plaintext in the p1 UKS keystore (slot `usid`); read at boot via `keyman read usid`. |
@@ -100,7 +106,7 @@ $ python3 -c 'import re; d=open("/dev/reserved","rb").read(); \
 ['0x44bc', '0x444bc']
 ```
 
-The keystore is duplicated (offsets 0x4000 and 0x44000 — a 256 KB stride for redundancy). Each bank has an `AMLNORMAL` magic header, a version word, ~80 bytes of high-entropy hash/HMAC material, and a slot table containing both the **slot names** (e.g. `usid`, `mac`, `$widevinekeybox`, `$attestationkeybox`, `$netflix_mgkid`, `$PlayReadykeybox25`, `$hdcp22_fw_private`, `$mac_wifi`, `$deviceid`, `$region_code`, `$secure_boot_set`) and their values. On this unit only `usid` and `mac` are populated; the other slot names exist but the values are empty — consistent with `androidboot.firstboot=1` (factory provisioning ran far enough to set identity, not far enough to run `factory_provision init` and populate the DRM keyboxes).
+The keystore is duplicated (offsets 0x4000 and 0x44000 — a 256 KB stride for redundancy). Each bank has an `AMLNORMAL` magic header, a version word, and two 32-byte SHA-256 hashes (one over the header, one over the data region) — verified against the public CoreELEC/u-boot `storage_block_raw_head` struct. Then a slot table containing both the **slot names** (e.g. `usid`, `mac`, `$widevinekeybox`, `$attestationkeybox`, `$netflix_mgkid`, `$PlayReadykeybox25`, `$hdcp22_fw_private`, `$mac_wifi`, `$deviceid`, `$region_code`, `$secure_boot_set`) and their values. On this unit only `usid` and `mac` are populated; the other slot names exist but the values are empty — consistent with `androidboot.firstboot=1` (factory provisioning ran far enough to set identity, not far enough to run `factory_provision init` and populate the DRM keyboxes).
 
 The other candidates were ruled out by direct observation:
 
@@ -108,7 +114,7 @@ The other candidates were ruled out by direct observation:
 - **factory partition (p4)** — empty FAT12.
 - **mmcblk0boot0 / mmcblk0boot1** — nearly all zero (one-byte header each, identical md5).
 
-**RPMB** is provisioned on this unit (`rpmb_state=0x1`). Since the keystore values themselves are visible in plaintext on the user area, RPMB most likely holds the HMAC integrity key used to authenticate reads of the on-eMMC keystore, rather than the values directly.
+**RPMB** is provisioned on this unit (`rpmb_state=0x1`) but is **not on the keyman read path**. The CoreELEC/u-boot source reads the keystore from the `"key"` sub-region of the reserved partition via `store_rsv_read("key", ...)` and verifies integrity with plain SHA-256 over the data — no HMAC, no secret key. RPMB exists for Android Keymaster / TEE hardware-backed key storage post-boot, not for U-Boot keyman.
 
 The U-Boot env partition (p2) also stores `ethaddr=90:0e:b3:fd:f8:55` as a legacy variable, providing a secondary path to the ETH MAC if the keystore read fails. WLAN/BT MACs come from the BCM4389 chip OTP entirely independently.
 
@@ -166,27 +172,27 @@ For completeness, I ran a quick scan across all small partitions to identify wha
 
 | Part | Size | Status | Notes |
 |---|---|---|---|
-| p1 reserved | 64 MB | mostly zero, some non-zero data starting ~1 KB from offset 4 MB | Per prior notes "all-null" — there is some data deeper but unclear what |
+| p1 reserved | 64 MB | **Amlogic UKS keystore** (`AMLNORMAL` magic at 0x4000, redundant copy at 0x44000) | **Load-bearing for per-device identity.** Holds the ETH MAC and serial as plaintext slots, plus a catalog of empty slot names for DRM/attestation. Confirmed via direct read + CoreELEC/u-boot source. |
 | p3 frp | 2 MB | **non-zero**: 36 bytes of random-looking data at offset 0, then zeros | Likely a per-device FRP/anti-rollback signing nonce. **Worth backing up.** |
 | p4 factory | 8 MB | empty FAT12 (this report) | Empty — no risk |
-| p9 tee | 32 MB | mostly zero, data starts ~256 KB in | Per prior notes characterized as zeroed; revisit |
-| p10 logo | 8 MB | `AML_RES!` magic — Amlogic logo pack | Generic per firmware build, not per-device |
-| p11 misc | 2 MB | data starts deep in partition | Standard Android `misc` partition (BCB/wipe args), not unit-specific |
-| p12 dtbo_a | 2 MB | FDT magic `d7 b7 ab 1e` | DTB overlay; per-board not per-unit |
+| p9 tee | 32 MB | mostly zero, data starts ~256 KB in | TEE firmware lives inside `bootloader_a`, not this partition. The non-zero region appears to be uninitialized state, not unit-specific data |
+| p10 logo | 8 MB | `AML_RES!` magic — Amlogic logo pack | Generic per firmware build, not per-device. Decoded — see `aml-logo-tool.py` |
+| p11 misc | 2 MB | Android A/B slot metadata (`BCAB` magic at offset 0x800) | Currently selecting slot `_a`. Not unit-specific |
+| p12 dtbo_a | 2 MB | FDT magic `d7 b7 ab 1e` — DTB overlay (438-byte payload) | Per-board not per-unit |
 | p13 dtbo_b | 2 MB | all zero | empty B slot |
 | p14 cri_data | 8 MB | all zero (this report) | Empty — no risk |
-| p15 param | 16 MB | data deep in partition | Amlogic param/calibration — could be unit-specific (display tuning, etc.); worth investigating |
-| p16 odm_ext_a | 16 MB | data deep in partition | ODM extensions; check |
+| p15 param | 16 MB | ext4 filesystem (`/mnt/vendor/param` in Android) | TV picture-quality DB (`pq.db`, `pq_ext.db`). May contain per-device display calibration — worth backing up |
+| p16 odm_ext_a | 16 MB | data deep in partition | ODM extensions; not characterized |
 | p17 odm_ext_b | 16 MB | all zero | empty B slot |
-| p22 metadata | 64 MB | data deep in partition | Per prior research: Android FBE-related, not unit-key-critical given firstboot=1 |
+| p22 metadata | 64 MB | ext4 filesystem for Android FBE | vold encryption keys, password_slots, bootstat, OTA snapshots — Android-runtime state, not unit identity |
 | p23–p26 vbmeta* | 2 MB each | all zero | AVB disabled (avb2=0) |
 
-Candidates that **might** carry unit-unique data and aren't yet backed up:
-- **p3 frp** (2 MB) — has device-unique bytes
-- **p15 param** (16 MB) — likely calibration data
-- **p1 reserved** (64 MB) — content unidentified
+Candidates that carry unit-unique data and aren't fully captured by the standard CoreELEC install backup:
+- **p1 reserved** (64 MB) — **critical** for ETH MAC + serial. The install script now backs this up by default to `/storage/reserved_backup.bin`.
+- **p3 frp** (2 MB) — has 36 bytes of device-unique bytes at offset 0. Not in current backup.
+- **p15 param** (16 MB) — likely TV calibration data. Not in current backup.
 
-Not blocking for this investigation, but worth a separate backup pass if doing a destructive operation on the eMMC.
+The CoreELEC install does not touch any of p1, p3, or p15. The first is backed up defensively; the others would only be at risk during a manual partition rebuild.
 
 ---
 
@@ -199,7 +205,7 @@ Suggested additions / corrections to the existing notes file:
    - **p1 `reserved` IS load-bearing for ETH MAC and serial** — wiping or rewriting it would lose them, and USB Burning Tool restore would NOT bring them back because the factory image does not include p1.
    - USB Burning Tool restore IS safe for identity as long as p1 itself is left untouched, which the burn tool does (the `reserved` partition is not in the image manifest).
 
-2. **eFuses are all zero on this unit.** `/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` all read as zero bytes. The Amlogic eFuse path is NOT used for per-device identity on the AM9 Pro S905X5-J — the on-eMMC UKS keystore in p1 (with RPMB-backed integrity) is the storage backend.
+2. **eFuses are all zero on this unit.** `/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` all read as zero bytes. The Amlogic eFuse path is NOT used for per-device identity on the AM9 Pro S905X5-J — the on-eMMC UKS keystore in p1 (with plain SHA-256 integrity, no HMAC) is the storage backend.
 
 3. **`cri_data` (p14) is unused.** Currently listed as "unknown" in the partition table — now confirmed all-zero. Not worth special-casing in install/restore scripts.
 
