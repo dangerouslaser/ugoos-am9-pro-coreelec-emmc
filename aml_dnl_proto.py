@@ -82,9 +82,17 @@ class AmlogicDevice:
 
     @classmethod
     def _open(cls, dev: usb.core.Device, pid: int) -> "AmlogicDevice":
-        # On macOS the kernel doesn't claim Amlogic DNL devices, so no
-        # detach_kernel_driver call is needed. On Linux libusb does this
-        # automatically when LIBUSB_OPTION_NO_DEVICE_DISCOVERY is unset.
+        # On Linux, the kernel sometimes auto-claims new USB devices (or
+        # has stale grabs from a previous detach). libusb refuses
+        # set_configuration() if anyone else holds the interface, so
+        # detach proactively.
+        try:
+            if dev.is_kernel_driver_active(0):
+                dev.detach_kernel_driver(0)
+        except (NotImplementedError, usb.core.USBError):
+            # macOS doesn't implement is_kernel_driver_active; that's fine
+            # because macOS doesn't auto-claim these devices either.
+            pass
         try:
             dev.set_configuration()
         except usb.core.USBError as e:
@@ -133,9 +141,26 @@ class AmlogicDevice:
 
     # ── low-level transport ───────────────────────────────────────────────
 
+    # Linux libusb sync bulk_transfer silently caps URBs at ~240 KB and
+    # reports success on the partial transfer. Larger payloads must be
+    # split into multiple pyusb.write() calls (each one URB) below the
+    # cap. The Amlogic device counts cumulative bytes per `download:`
+    # command, so multiple URBs that sum to the announced size work.
+    _WRITE_MAX_URB = 64 * 1024
+
     def _write(self, data: bytes, timeout_ms: int = 5000) -> int:
-        n = self._dev.write(self._eps.out, data, timeout=timeout_ms)
-        return int(n)
+        total = 0
+        view = memoryview(data)
+        while total < len(data):
+            end = min(total + self._WRITE_MAX_URB, len(data))
+            chunk = view[total:end].tobytes()
+            n = self._dev.write(self._eps.out, chunk, timeout=timeout_ms)
+            if n == 0:
+                raise AmlogicError(
+                    f"bulk OUT stalled at {total} of {len(data)} bytes"
+                )
+            total += int(n)
+        return total
 
     def _read(self, size: int, timeout_ms: int = 5000) -> bytes:
         return bytes(self._dev.read(self._eps.in_, size, timeout=timeout_ms))
@@ -207,14 +232,22 @@ class AmlogicDevice:
             raise AmlogicError(
                 f"device acked {ack_size:#x} bytes but host asked for {n:#x}"
             )
-        # Stream the bytes — libusb-1.0 handles fragmentation into
-        # max-packet USB transfers internally.
-        view = memoryview(data)
-        offset = 0
-        while offset < n:
-            end = min(offset + chunk_size, n)
-            self._write(bytes(view[offset:end]), timeout_ms=timeout_ms)
-            offset = end
+        # Stream the bytes. libusb-1.0 on Linux caps each URB at ~240KB
+        # and pyusb's sync write doesn't expose async batching, so our
+        # _write() chunks below the cap. The Amlogic device accepts
+        # multiple URBs as long as they sum to the announced size.
+        del chunk_size
+        self._write(bytes(data), timeout_ms=timeout_ms)
+        # If the total transfer size is a multiple of the endpoint's
+        # max-packet, USB 2.0 requires a zero-length packet to signal
+        # end-of-transfer. Without it some bulk peers (including the
+        # Amlogic BootROM here) keep waiting and the subsequent ACK
+        # comes back but the device doesn't actually consume the data.
+        if len(data) % self._eps.max_packet_out == 0:
+            try:
+                self._dev.write(self._eps.out, b"", timeout=timeout_ms)
+            except usb.core.USBError:
+                pass
         # Final OKAY.
         final = self._read(64, timeout_ms=timeout_ms)
         if len(final) < 4:

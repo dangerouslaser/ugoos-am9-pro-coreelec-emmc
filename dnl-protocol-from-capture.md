@@ -152,6 +152,53 @@ capture). Sequence:
   Windows tool always issues it. If we skip it, a flash may still succeed
   but we lose end-to-end integrity verification.
 
+## Open issue — `boot` after stage-15 `download:0x42800` fails to transition
+
+Status as of 2026-05-26 session-2: **bisected to USB transport, not protocol.**
+
+Reproduced on both macOS (libusb-1.0.29) and Linux (libusb-1.0.27). The
+device acks `boot` with `OKAY` but never transitions to stage 16 (no
+re-enumeration, `cbw` stays unavailable).
+
+Confirmed via usbmon side-by-side with the Windows-via-VFIO capture:
+
+1. **Byte content matches.** Our `firstsect` 1024-byte upload and the
+   `download:0x42800` 272384-byte upload are byte-identical to what the
+   Windows tool sends (verified by extracting payloads from both pcaps).
+
+2. **URB structure differs.** Windows sends the 272384-byte download as
+   ONE USB Request Block. Linux libusb on our side delivers it as
+   multiple URBs — the cap is empirically ~245760 bytes (15 × 16384) per
+   sync `libusb_bulk_transfer`, even though pyusb reports the full byte
+   count as transferred. Various chunk-size strategies fail:
+
+   - 16 KB chunks (round 1): all 272384 bytes hit the wire across 17 URBs
+   - single big transfer (round 2/3): only 245760 bytes hit the wire,
+     pyusb falsely reports success
+   - 64 KB chunks (round 4): all bytes delivered across 5 URBs
+   - ZLP after a full-payload transfer: also no transition
+
+   In all cases `boot` returns `OKAY` but the device doesn't execute the
+   uploaded DDR init code.
+
+**Likely root cause:** the Amlogic BootROM treats the `download:SIZE`
+data exchange as a single atomic transfer; arrival of the same byte
+count split across multiple URBs leaves the device in a "got the bytes
+but the validating state machine never closed" state, and `boot` runs
+against a half-committed buffer.
+
+**Paths forward:**
+
+- Use libusb's async API directly (via `ctypes` or `python-libusb1`) to
+  submit one URB of the full size. Linux 6.x supports much larger URBs
+  than libusb's sync default; the cap is in libusb, not the kernel.
+- Or: write a small C helper that uses `usbfs` ioctls directly and call
+  it via subprocess. Avoids the libusb abstraction entirely.
+- Or: bypass userspace and write a tiny kernel module — overkill.
+
+The wire captures from this session (`captures/round{1,2,3,4}.pcap`) are
+saved for direct comparison against the working Windows pcap.
+
 ## Open questions for follow-up captures
 
 - What does `getvar:cbw` actually return? (Issued repeatedly during U-Boot
