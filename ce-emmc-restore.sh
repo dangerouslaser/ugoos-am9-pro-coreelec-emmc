@@ -247,6 +247,24 @@ log "env (p2) restored"
 run dd if="${BACKUP_DIR}/bootloader_a_backup.bin" of="${EMMC}p7"  bs=1M status=none
 log "bootloader_a (p7) restored"
 
+# Optionally restore frp (p3) and param (p15) if the install script backed
+# them up. These partitions weren't touched by the install (so this is a
+# defensive write of the same content the device already has), but the
+# symmetry is correct: if a backup exists, write it back.
+if [[ -f "${BACKUP_DIR}/frp_backup.bin" ]]; then
+    run dd if="${BACKUP_DIR}/frp_backup.bin" of="${EMMC}p3" bs=1M status=none
+    log "frp (p3) restored from backup"
+else
+    warn "frp_backup.bin not present (older install) — skipping p3 restore"
+fi
+
+if [[ -f "${BACKUP_DIR}/param_backup.bin" ]]; then
+    run dd if="${BACKUP_DIR}/param_backup.bin" of="${EMMC}p15" bs=1M status=none
+    log "param (p15) restored from backup"
+else
+    warn "param_backup.bin not present (older install) — skipping p15 restore"
+fi
+
 # ── Post-restore partition layout ─────────────────────────────────────────────
 
 header "Final eMMC partition layout"

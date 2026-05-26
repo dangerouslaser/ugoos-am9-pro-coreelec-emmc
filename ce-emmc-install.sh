@@ -5,19 +5,39 @@
 # Must be run from CoreELEC booted off an SD card.
 #
 # What this does:
-#   1. Backs up partition layout, rsv (p28), env (p2), bootloader_a (p7), and
-#      reserved (p1, holds the Amlogic UKS keystore with the device's MAC and
-#      serial) to /storage
-#   2. Keeps super (p27) — Android system images intact for potential restore
-#   3. Deletes rsv (p28) and userdata (p29)
-#   4. Creates CE_FLASH (512 MB FAT32) at p28 and CE_STORAGE (remaining space ext4) at p29
-#   5. Copies all boot files from the SD card's /flash to CE_FLASH
-#   6. Rebuilds cfgload to use disk=LABEL=CE_STORAGE (replaces the dual-boot
+#   1. Verifies device identity by cross-checking the running cmdline's
+#      `androidboot.serialno` and `mac=` against the AMLNORMAL keystore on
+#      `reserved` (p1) using aml-keystore-tool.py — aborts if they disagree
+#   2. Backs up partition layout, rsv (p28), env (p2), bootloader_a (p7),
+#      reserved (p1, the AMLNORMAL keystore with MAC/serial), frp (p3, anti-
+#      rollback nonce), and param (p15, TV picture-quality DB) to /storage
+#   3. After backup, verifies the p1 backup is a valid AMLNORMAL keystore
+#      (correct magic + at least 2 populated slots) — aborts on failure
+#   4. Keeps super (p27) — Android system images intact for potential restore
+#   5. Deletes rsv (p28) and userdata (p29)
+#   6. Creates CE_FLASH (512 MB FAT32) at p28 and CE_STORAGE (remaining space ext4) at p29
+#   7. Copies all boot files from the SD card's /flash to CE_FLASH
+#   8. Rebuilds cfgload to use disk=LABEL=CE_STORAGE (replaces the dual-boot
 #      ceemmc disk=FOLDER=/dev/CE_STORAGE path with standalone label resolution).
 #      Pass --no-cfgload-rebuild to install the legacy mount-storage.sh hook +
 #      nofsck workarounds instead, as a fallback if the rebuild step doesn't
 #      handle a future cfgload format.
-#   7. Optionally migrates your current /storage to CE_STORAGE
+#   9. Optionally writes a custom boot logo to p10 (--restore-logo PATH)
+#  10. Optionally migrates your current /storage to CE_STORAGE
+#
+# Flags:
+#   --info              Read-only diagnostic mode — print everything we know
+#                       about the device (partition state, keystore, bootloader
+#                       version, install state) and exit. Safe to run any time.
+#   --dry-run           Show all commands without executing destructive ops.
+#   --no-cfgload-rebuild  Skip cfgload rebuild, install legacy workarounds.
+#   --restore-logo PATH Write a custom boot logo to p10 during the install.
+#                       PATH may be either a packed AML_RES .bin file, or a
+#                       directory of NN_name.bmp files produced by
+#                       `aml-logo-tool.py unpack`. The packed bin is
+#                       validated to start with the AML_RES! magic before
+#                       writing to the device.
+#   --help              Show help and exit.
 
 set -euo pipefail
 
@@ -25,22 +45,41 @@ set -euo pipefail
 
 DRY_RUN=false
 REBUILD_CFGLOAD=true
+INFO_MODE=false
+LOGO_PATH=""
 
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=true ;;
-        --no-cfgload-rebuild) REBUILD_CFGLOAD=false ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --info)                INFO_MODE=true; shift ;;
+        --dry-run)             DRY_RUN=true; shift ;;
+        --no-cfgload-rebuild)  REBUILD_CFGLOAD=false; shift ;;
+        --restore-logo)        LOGO_PATH="$2"; shift 2 ;;
+        --restore-logo=*)      LOGO_PATH="${1#--restore-logo=}"; shift ;;
         --help)
-            echo "Usage: ce-emmc-install.sh [--dry-run] [--no-cfgload-rebuild] [--help]"
-            echo ""
-            echo "  --dry-run              Show all commands without executing destructive ops."
-            echo "                         Non-destructive reads (parted print, blkid, dd reads) still run."
-            echo "  --no-cfgload-rebuild   Skip the cfgload rebuild and install the legacy"
-            echo "                         mount-storage.sh hook + nofsck workarounds instead."
-            echo "                         Use this if a future CoreELEC build ships a cfgload"
-            echo "                         format the rebuild step doesn't understand."
-            echo "  --help                 Show this help and exit."
+            cat <<EOF
+Usage: ce-emmc-install.sh [options]
+
+Options:
+  --info                     Read-only diagnostic; print device state and exit.
+                             No backups, no writes, no install actions.
+  --dry-run                  Show all commands without executing destructive ops.
+                             Non-destructive reads (parted print, blkid, dd reads)
+                             still run.
+  --no-cfgload-rebuild       Skip the cfgload rebuild and install the legacy
+                             mount-storage.sh hook + nofsck workarounds instead.
+                             Use this if a future CoreELEC build ships a cfgload
+                             format the rebuild step doesn't understand.
+  --restore-logo PATH        Write a custom boot logo to p10 during install.
+                             PATH is either a packed AML_RES .bin (must start
+                             with the AML_RES! magic) or a directory of
+                             NN_name.bmp files from aml-logo-tool.py unpack.
+  --help                     Show this help and exit.
+EOF
             exit 0
+            ;;
+        *)
+            echo "Unknown option: $1 (try --help)" >&2
+            exit 1
             ;;
     esac
 done
@@ -52,6 +91,10 @@ SD_FLASH="/flash"
 MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
 BACKUP_DIR="/storage"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KEYSTORE_TOOL="${SCRIPT_DIR}/aml-keystore-tool.py"
+BOOTLOADER_TOOL="${SCRIPT_DIR}/aml-bootloader-tool.py"
+LOGO_TOOL="${SCRIPT_DIR}/aml-logo-tool.py"
 
 # ── Cleanup trap ──────────────────────────────────────────────────────────────
 
@@ -85,6 +128,19 @@ run() {
 }
 
 $DRY_RUN && warn "DRY-RUN mode — no changes will be made"
+
+# --info mode: print diagnostics and exit before any preflight changes state
+if $INFO_MODE; then
+    do_info
+fi
+
+# --restore-logo: validate / pack the logo path NOW (before destructive ops),
+# so a bad argument fails fast without partial-install side effects.
+LOGO_BIN=""
+if [[ -n "$LOGO_PATH" ]]; then
+    LOGO_BIN=$(prepare_logo_bin "$LOGO_PATH")
+    log "Custom logo prepared: $LOGO_BIN (will be written to ${EMMC}p10 during install)"
+fi
 
 # ── TUI detection ─────────────────────────────────────────────────────────────
 
@@ -175,6 +231,178 @@ part_size_mib() {
 
 human_mib() { awk -v m="$1" 'BEGIN{if(m>=1024)printf "%.1f GB",m/1024; else printf "%d MB",m}'; }
 
+# ── Keystore / identity helpers ──────────────────────────────────────────────
+
+# Extract a slot's value from p1 via aml-keystore-tool.py list. Returns ""
+# if the tool is unavailable or the slot isn't populated.
+keystore_value() {
+    local slot_name="$1"
+    [[ -f "$KEYSTORE_TOOL" ]] || return 0
+    python3 "$KEYSTORE_TOOL" list "${EMMC}p1" 2>/dev/null \
+        | awk -v s="'$slot_name'" "
+            /name:[[:space:]]+/ { in_slot = (\$0 ~ s) }
+            in_slot && /value:/ { gsub(/^.*value:[[:space:]]+'?/, \"\"); gsub(/'\$/, \"\"); print; exit }
+        "
+}
+
+# After a p1 backup is written, verify it's a valid AMLNORMAL keystore.
+# Returns non-zero if the backup looks corrupt (and the caller should abort).
+verify_p1_backup() {
+    local backup_file="$1"
+    [[ -f "$KEYSTORE_TOOL" ]] || { warn "aml-keystore-tool.py not present — skipping p1 verification"; return 0; }
+    [[ -f "$backup_file" ]] || { warn "p1 backup $backup_file missing"; return 1; }
+
+    local info
+    info=$(python3 "$KEYSTORE_TOOL" info "$backup_file" 2>&1) || {
+        warn "aml-keystore-tool.py failed on p1 backup:"
+        echo "$info" | sed 's/^/  /' >&2
+        return 1
+    }
+
+    local keycnt
+    keycnt=$(echo "$info" | awk '/keycnt:/ {print $2; exit}')
+    if [[ -z "$keycnt" || "$keycnt" -lt 1 ]]; then
+        warn "p1 backup: keycnt parsed as '${keycnt:-empty}' — expected >= 1"
+        echo "$info" | sed 's/^/  /' >&2
+        return 1
+    fi
+
+    log "p1 backup verified — AMLNORMAL keystore with $keycnt populated slot(s)"
+    return 0
+}
+
+# Cross-check the running cmdline's androidboot.serialno and mac= against
+# the values stored in p1's keystore. Mismatch => abort (something tampered,
+# or device is in unexpected state).
+identity_cross_check() {
+    [[ -f "$KEYSTORE_TOOL" ]] || { warn "aml-keystore-tool.py not present — skipping identity cross-check"; return 0; }
+
+    local cmdline_serial cmdline_mac
+    cmdline_serial=$(awk -v RS=' ' '/^androidboot\.serialno=/{sub(/^androidboot\.serialno=/,""); print}' /proc/cmdline | tr -d '\n')
+    cmdline_mac=$(awk -v RS=' ' '/^mac=/{sub(/^mac=/,""); print; exit}' /proc/cmdline | tr -d '\n')
+
+    local keystore_serial keystore_mac
+    keystore_serial=$(keystore_value usid)
+    keystore_mac=$(keystore_value mac)
+
+    if [[ -z "$keystore_serial" && -z "$keystore_mac" ]]; then
+        warn "Keystore returned no usid or mac slot — skipping cross-check"
+        return 0
+    fi
+
+    if [[ -n "$cmdline_serial" && -n "$keystore_serial" && "$cmdline_serial" != "$keystore_serial" ]]; then
+        die "Identity mismatch: cmdline serial '$cmdline_serial' != keystore usid '$keystore_serial'"
+    fi
+    if [[ -n "$cmdline_mac" && -n "$keystore_mac" && "${cmdline_mac,,}" != "${keystore_mac,,}" ]]; then
+        die "Identity mismatch: cmdline mac '$cmdline_mac' != keystore mac '$keystore_mac'"
+    fi
+    log "Identity cross-check: serial=$keystore_serial mac=$keystore_mac (matches cmdline)"
+}
+
+# ── Logo processing helper (--restore-logo) ──────────────────────────────────
+
+# Validates --restore-logo argument and returns (via echo) the path to a
+# ready-to-write AML_RES .bin file. If a directory was given, packs it first.
+prepare_logo_bin() {
+    local input="$1"
+    [[ -e "$input" ]] || die "--restore-logo: '$input' does not exist"
+    if [[ -d "$input" ]]; then
+        [[ -f "$LOGO_TOOL" ]] || die "--restore-logo with a directory requires aml-logo-tool.py"
+        local out
+        out=$(mktemp --suffix=.bin 2>/dev/null || mktemp)
+        python3 "$LOGO_TOOL" pack "$input" "$out" >&2 || die "aml-logo-tool.py pack failed"
+        echo "$out"
+    else
+        # File — verify AML_RES! magic at offset 8 (after the 4-byte CRC + 4-byte version)
+        local magic
+        magic=$(dd if="$input" bs=1 skip=8 count=8 status=none 2>/dev/null)
+        [[ "$magic" == "AML_RES!" ]] || die "--restore-logo: '$input' is not an AML_RES container (no AML_RES! magic at offset 8)"
+        echo "$input"
+    fi
+}
+
+# ── --info mode ──────────────────────────────────────────────────────────────
+
+do_info() {
+    [[ "$(id -u)" == "0" ]] || die "Must be run as root"
+    [[ -b "$EMMC" ]] || die "eMMC not found at $EMMC"
+    make_emmc_nodes
+
+    header "Hardware"
+    log "Kernel: $(uname -r)"
+    if [[ -f /etc/os-release ]]; then
+        log "OS: $(grep -E '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '\"')"
+    fi
+    local mmc_dir
+    mmc_dir=$(ls -d /sys/class/mmc_host/mmc0/mmc0:* 2>/dev/null | head -1)
+    if [[ -n "$mmc_dir" ]]; then
+        log "eMMC: $(cat "$mmc_dir/name") manfid=$(cat "$mmc_dir/manfid") date=$(cat "$mmc_dir/date") fwrev=$(cat "$mmc_dir/fwrev")"
+        log "Health: life=$(cat "$mmc_dir/life_time") pre_eol=$(cat "$mmc_dir/pre_eol_info")"
+    fi
+    local sectors
+    sectors=$(cat /sys/block/mmcblk0/size 2>/dev/null || echo 0)
+    log "eMMC size: $sectors sectors = $(awk -v s="$sectors" 'BEGIN{printf "%.2f GiB", s*512/1024/1024/1024}')"
+
+    header "Partition layout (GPT)"
+    parted -sm "$EMMC" unit MiB print 2>/dev/null \
+        | awk -F: 'NR>2 && /^[0-9]/{gsub(/MiB/,"",$4); printf "  p%-3s %-20s %5.0f MiB\n",$1,$6,$4}'
+
+    header "Install state"
+    if blkid "${EMMC}p28" 2>/dev/null | grep -q "CE_FLASH"; then
+        log "CoreELEC IS installed (CE_FLASH at p28)"
+        if [[ -f /flash/mount-storage.sh ]]; then
+            warn "  Legacy mount-storage.sh hook present (workaround-style install)"
+        fi
+        if grep -q "nofsck" /flash/config.ini 2>/dev/null; then
+            warn "  nofsck present in config.ini (workaround-style install)"
+        fi
+        if [[ -f /flash/cfgload ]]; then
+            local cfg_size
+            cfg_size=$(stat -c %s /flash/cfgload 2>/dev/null || stat -f %z /flash/cfgload)
+            log "  cfgload present: $cfg_size bytes"
+        fi
+    elif blkid "${EMMC}p27" 2>/dev/null | grep -q "CE_FLASH"; then
+        warn "Old-style CoreELEC install on p27 (pre-this-script)"
+    else
+        log "CoreELEC NOT installed (Android partition layout intact)"
+    fi
+
+    header "U-Boot env summary (p2)"
+    if [[ -r "${EMMC}p2" ]]; then
+        dd if="${EMMC}p2" bs=1M count=1 status=none 2>/dev/null | tr '\0' '\n' \
+            | grep -E '^(bootcmd|ce_on_emmc|firstboot|board|bootloader_version|active_slot|ethaddr|EnableSelinux|verifiedbootstate|avb2)=' \
+            | sort -u | head -20 | sed 's/^/  /'
+    fi
+
+    header "AMLNORMAL keystore (p1)"
+    if [[ -f "$KEYSTORE_TOOL" ]]; then
+        python3 "$KEYSTORE_TOOL" info "${EMMC}p1" 2>&1 | sed 's/^/  /'
+        echo
+        log "Slots:"
+        python3 "$KEYSTORE_TOOL" list "${EMMC}p1" 2>&1 \
+            | awk '/slot #/{slot=$2} /name:/{n=$2} /value:/{v=$2; printf "  %s %-12s %s\n", slot, n, v}'
+    else
+        warn "aml-keystore-tool.py not found in $SCRIPT_DIR — skipping keystore info"
+    fi
+
+    header "Bootloader (p7)"
+    if [[ -f "$BOOTLOADER_TOOL" ]]; then
+        python3 "$BOOTLOADER_TOOL" info "${EMMC}p7" 2>&1 | sed 's/^/  /' | head -10
+    else
+        warn "aml-bootloader-tool.py not found — skipping bootloader info"
+    fi
+
+    header "Cmdline identity"
+    local serial mac
+    serial=$(awk -v RS=' ' '/^androidboot\.serialno=/{sub(/.*=/,""); print; exit}' /proc/cmdline)
+    mac=$(awk -v RS=' ' '/^mac=/{sub(/.*=/,""); print; exit}' /proc/cmdline)
+    log "Kernel cmdline serial: ${serial:-<missing>}"
+    log "Kernel cmdline MAC:    ${mac:-<missing>}"
+    [[ -f "$KEYSTORE_TOOL" ]] && identity_cross_check
+
+    exit 0
+}
+
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
 header "Preflight checks"
@@ -231,6 +459,11 @@ parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^29:" || \
     die "Partition 29 (userdata) not found — unexpected layout."
 
 log "Partition layout: 29-partition Android layout confirmed"
+
+# Cross-check device identity vs the AMLNORMAL keystore in p1 — aborts on
+# mismatch. Catches the case where someone has been modifying state, or the
+# device is in an unexpected configuration we shouldn't proceed against.
+identity_cross_check
 
 # ── Read dynamic partition sizes ──────────────────────────────────────────────
 
@@ -308,6 +541,27 @@ log "bootloader_a (p7) → ${BACKUP_DIR}/bootloader_a_backup.bin"
 # restore would not recover the values. Cheap insurance.
 run dd if="${EMMC}p1" of="${BACKUP_DIR}/reserved_backup.bin" bs=1M status=none
 log "reserved (p1) → ${BACKUP_DIR}/reserved_backup.bin"
+
+# Verify the p1 backup actually contains a valid AMLNORMAL keystore. If the
+# dd read silently produced zeros or the keystore is corrupt, we want to know
+# NOW (before destructive ops) so the user can investigate. Falls through
+# silently if aml-keystore-tool.py isn't shipped alongside the install script.
+if ! $DRY_RUN; then
+    verify_p1_backup "${BACKUP_DIR}/reserved_backup.bin" \
+        || die "p1 backup verification failed — aborting before destructive ops."
+fi
+
+# Back up frp (p3) — contains 36 bytes of unit-unique anti-rollback / FRP
+# signing material at offset 0. The install doesn't touch p3 either; this is
+# defensive in case of future destructive operations on the partition table.
+run dd if="${EMMC}p3" of="${BACKUP_DIR}/frp_backup.bin" bs=1M status=none
+log "frp (p3) → ${BACKUP_DIR}/frp_backup.bin"
+
+# Back up param (p15) — ext4 filesystem mounted at /mnt/vendor/param in
+# Android, containing the TV picture-quality DB (pq.db, pq_ext.db) which
+# is likely tuned per-device at the factory. Same defensive rationale.
+run dd if="${EMMC}p15" of="${BACKUP_DIR}/param_backup.bin" bs=1M status=none
+log "param (p15) → ${BACKUP_DIR}/param_backup.bin"
 
 # ── Repartition ───────────────────────────────────────────────────────────────
 
@@ -492,6 +746,20 @@ fi  # end REBUILD_CFGLOAD branch
 run umount "$MNT_FLASH"
 log "CE_FLASH ready"
 
+# ── Optional custom boot logo (--restore-logo) ───────────────────────────────
+
+if [[ -n "$LOGO_BIN" ]]; then
+    header "Writing custom boot logo to p10"
+    # p10 is the logo partition (8 MB). The actual AML_RES content is
+    # typically ~1.7 MB on this device; the rest is zero padding. Writing
+    # the whole file is safe — partition is 8 MB and any AML_RES container
+    # we'd produce is well under that.
+    LOGO_SIZE=$(stat -c %s "$LOGO_BIN" 2>/dev/null || stat -f %z "$LOGO_BIN")
+    log "Logo source: $LOGO_BIN ($LOGO_SIZE bytes)"
+    run dd if="$LOGO_BIN" of="${EMMC}p10" bs=1M conv=fsync status=none
+    log "Custom logo written to ${EMMC}p10"
+fi
+
 # ── Optional storage migration ─────────────────────────────────────────────────
 
 MIGRATE_MSG="  The eMMC install is ready. CE_STORAGE is currently empty —
@@ -550,5 +818,7 @@ echo "    rsv_backup.bin"
 echo "    env_backup.bin"
 echo "    bootloader_a_backup.bin"
 echo "    reserved_backup.bin    (Amlogic UKS keystore — MAC/serial)"
+echo "    frp_backup.bin         (anti-rollback / FRP nonce)"
+echo "    param_backup.bin       (Amlogic TV picture-quality DB)"
 echo ""
 $DRY_RUN && warn "DRY-RUN complete — no changes were made"

@@ -46,24 +46,30 @@ See [`emmc-research.md`](emmc-research.md) for the full research notes.
 1. Verifies you're on the right board and booting from SD
 2. Reads actual partition sizes from the live GPT for the confirmation screen
 3. Checks whether `rsv` (p28) contains data and notes it in the confirmation
-4. Backs up to `/storage` (on the SD card):
+4. **Cross-checks device identity** — confirms the running `androidboot.serialno` and `mac=` on the kernel cmdline agree with the AMLNORMAL keystore values stored in `reserved` (p1). Aborts if they disagree (would indicate tampering or partial-flash state)
+5. Backs up to `/storage` (on the SD card):
    - `partition_layout.txt` — the full partition table, needed by the restore script
    - `rsv_backup.bin` — the rsv partition (64 MB)
    - `env_backup.bin` — U-Boot environment (p2)
-   - `bootloader_a_backup.bin` — bootloader (p7)
-   - `reserved_backup.bin` — `reserved` partition (p1, 64 MB), which holds the Amlogic UKS keystore with the device's ETH MAC and serial. The installer doesn't write to p1, but the backup is cheap insurance because the factory image doesn't include p1 either — if it were ever wiped, USB Burning Tool restore would NOT bring it back.
-5. **Keeps `super` (p27) untouched** — Android system images remain on the eMMC
-6. Deletes two Android partitions:
+   - `bootloader_a_backup.bin` — bootloader (p7, 8 MB)
+   - `reserved_backup.bin` — `reserved` partition (p1, 64 MB), which holds the Amlogic UKS keystore with the device's ETH MAC and serial. The installer doesn't write to p1, but the backup is cheap insurance because the factory image doesn't include p1 either — if it were ever wiped, USB Burning Tool restore would NOT bring it back. **The backup is verified after writing**: if `aml-keystore-tool.py info` doesn't see a valid AMLNORMAL header + populated slot count, the install aborts before any destructive operations.
+   - `frp_backup.bin` — `frp` partition (p3, 2 MB) — contains 36 bytes of unit-unique anti-rollback / FRP signing material
+   - `param_backup.bin` — `param` partition (p15, 16 MB) — ext4 filesystem with the TV picture-quality DB (`pq.db`, `TV_PICTURE`), likely tuned per-device at the factory
+6. **Keeps `super` (p27) untouched** — Android system images remain on the eMMC
+7. Deletes two Android partitions:
    - `rsv` (p28, ~64 MB) — reserved partition, unknown purpose, backed up first
    - `userdata` (p29, ~54.4 GB) — encrypted, unrecoverable
-7. Creates two new partitions in their place:
+8. Creates two new partitions in their place:
    - `CE_FLASH` (p28, 512 MB, FAT32) — CoreELEC boot partition
    - `CE_STORAGE` (p29, ~53.9 GB, ext4) — CoreELEC storage
-8. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
-9. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes). Pass `--no-cfgload-rebuild` to install the legacy `mount-storage.sh` + `nofsck` workarounds instead, as a fallback if a future CoreELEC build ships a cfgload format the rebuild step doesn't understand.
-10. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
+9. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
+10. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes). Pass `--no-cfgload-rebuild` to install the legacy `mount-storage.sh` + `nofsck` workarounds instead, as a fallback if a future CoreELEC build ships a cfgload format the rebuild step doesn't understand.
+11. With `--restore-logo PATH`: writes a custom boot logo to `p10` (the AML_RES container). PATH can be either a packed `.bin` (validated against the `AML_RES!` magic) or a directory of `NN_name.bmp` files produced by `aml-logo-tool.py unpack`.
+12. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
 
-Partitions p1–p26, `super` (p27), `boot0`, and `boot1` are not touched. `boot0`/`boot1` are hardware write-protected and cannot be modified by anything running in Linux. The installer is a single self-contained bash script — no helper files to scp alongside it.
+The installer also supports **`--info`** — a read-only diagnostic mode that prints the partition layout, eMMC chip details, U-Boot env summary, AMLNORMAL keystore contents, bootloader build version, current install state (with warnings if legacy workarounds are present), and the cmdline-vs-keystore identity check result. No backups, no writes, safe to run any time. Useful before committing to an install.
+
+Partitions p1–p26 (except p10 if `--restore-logo` is used), `super` (p27), `boot0`, and `boot1` are not touched. `boot0`/`boot1` are hardware write-protected and cannot be modified by anything running in Linux. The installer is a self-contained bash script; it picks up `aml-keystore-tool.py` / `aml-bootloader-tool.py` / `aml-logo-tool.py` from the same directory if they're there (for verification / `--info` / `--restore-logo` respectively).
 
 ---
 
