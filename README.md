@@ -187,5 +187,6 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 | `ce-emmc-restore.sh` | Android partition restore script |
 | `aml-logo-tool.py` | Unpack/repack the Amlogic AML_RES boot-logo container (p10) |
 | `aml-bootloader-tool.py` | Decode the `@AMLBOOT` manifest and unpack sections from `bootloader_a` (p7) — contents are encrypted at rest, so the unpacker yields encrypted blobs not directly disassemblable |
+| `aml-keystore-tool.py` | Read the AMLNORMAL keystore from a `reserved` (p1) dump — dumps the header, lists every populated slot with name/attribute/type/value/hash, and extracts each slot's raw value to its own file |
 | `emmc-research.md` | Full technical research notes |
 | `factory-investigation.md` | Pre-first-boot investigation into where MAC/serial actually live |

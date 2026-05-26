@@ -3,8 +3,8 @@
 **Date:** May 14, 2026  
 **Device:** Ugoos AM9 Pro  
 **SoC:** Amlogic S905X5-J (S6 family per CoreELEC board ID `s6_s905x5_ugoos_am9_pro`; serial `0x3e` in Amlogic's internal numbering, referred to as "S5" in tee-loader.sh; the -J suffix denotes Dolby Vision licensing)  
-**CPU:** Quad-core ARMv9.0 Cortex-A510  
-**GPU:** Mali G310 V5  
+**CPU:** Quad-core **Cortex-A55** (ARMv8.2) — confirmed via the active DTB (`/flash/dtb.img`), which lists four `compatible = "arm,cortex-a55"` cores. The PMU is from the A510 family (`cortex-a510-pmu`), which likely explains Ugoos's "Cortex-A510 / ARMv9.0" marketing claim — the CPU cores themselves are A55.  
+**GPU:** Mali Valhall G310 (CSF variant — `compatible = "arm,mali-valhall-csf"` in the DTB)  
 **RAM:** 4 GB LPDDR5  
 **CoreELEC:** 22.0-Piers_nightly_20260514  
 **Kernel:** 5.15.196  
@@ -417,6 +417,153 @@ The factory image was fully parsed. Notable findings:
 Because `boot0` is hardware write-protected, the BL2 is always intact and the device can always be put into USB burn mode by holding the reset/ADB button during power-on. A full USB Burning Tool flash wipes and rewrites every partition (including the GPT itself), fully restoring the original 29-partition Android layout regardless of what was done to the partition table.
 
 This means a full restore is always possible, but it requires a Windows PC, a USB-C to USB-A cable, and the factory image. The restored Android will be in the Ugoos-shipped state — pre-rooted via Magisk with an unlocked bootloader.
+
+---
+
+## Boot-Time Scripts on CE_FLASH
+
+Three U-Boot-related files sit alongside `cfgload` on CE_FLASH. Documented here for completeness — only `cfgload` is on the live boot path; the other two are inactive on this install.
+
+### `aml_autoscript` — env "installer"
+
+A mkimage-format U-Boot script (1.3 KB; same `[size_be32][0_terminator][script]` layout as `cfgload`). Auto-loaded by some U-Boot configurations when a `aml_autoscript` file is found on the boot device. Contents:
+
+```sh
+defenv                                # reset U-Boot env to defaults
+setenv bootfromnand 0
+setenv upgrade_step 2
+setenv ce_on_emmc "no"
+
+# overwrite the boot-flow env variables with CoreELEC's eMMC-scan logic
+setenv cfgload_env 'if fatload ${device} 0:1 ${loadaddr} cfgload_env; then env import -t ${loadaddr} ${filesize}; run ceboot; fi'
+setenv cfgloadsd   'if fatload mmc 0:1 ${loadaddr} cfgload; then setenv device mmc; setenv devnr 0; setenv partnr 1; source ${loadaddr}; ...; run cfgload_env; fi'
+setenv cfgloadusb  '...'
+setenv cfgloademmc 'for p in 1 .. 1F; do if fatload mmc 1:${p} ${loadaddr} cfgload; then setenv device mmc; setenv devnr 1; setenv partnr ${p}; setenv ce_on_emmc "yes"; source ${loadaddr}; ...; fi; done'
+setenv bootfromsd 'if mmcinfo; then run cfgloadsd; fi'
+setenv bootfromusb '...'
+setenv bootfromemmc 'run cfgloademmc'
+setenv bootcmd '... run bootfromsd; run bootfromusb; run bootfromemmc; ...'
+
+saveenv
+run storeargs
+run bootfromsd
+run bootfromusb
+run bootfromemmc
+```
+
+This is the **boot-env installer**: when U-Boot's `autoscr` is invoked on this file, it rewrites the persistent env to enable CoreELEC's "scan SD → USB → eMMC for `cfgload`" boot flow. On our system the env has already been provisioned (via the original CoreELEC SD-card boot), so `aml_autoscript` is not re-run; it stays on CE_FLASH as a recovery aid.
+
+### `cfgload_env` — plaintext alternative to `cfgload`
+
+A plain U-Boot env-import text file (2.2 KB). Defines a single env variable `ceboot=...` whose value is the same boot-logic script as `cfgload`'s inner script, but as one long line with `\` continuations. Intended use:
+
+```sh
+if fatload ${device} 0:1 ${loadaddr} cfgload_env; then
+    env import -t ${loadaddr} ${filesize}   # import as env vars
+    run ceboot                              # execute the variable
+fi
+```
+
+Notable: this file contains the same `disk=FOLDER=/dev/CE_STORAGE` dual-boot path that the original `cfgload` had. Our install rebuilds `cfgload` to use `LABEL=` but does not touch `cfgload_env`, because the boot flow goes through `cfgload`, never `cfgload_env`. If you ever switch CoreELEC's boot mechanism to the env-import path, you'd need to fix `cfgload_env` similarly (or it would re-introduce the FOLDER= bug).
+
+---
+
+## AMLNORMAL Keystore — TLV Slot Format (in p1)
+
+The header struct from CoreELEC/u-boot covers the AMLNORMAL block start, but the **slot value layout** is the file's own TLV encoding — reverse-engineered from a p1 dump on this device.
+
+### Slot table layout (offset 0x200 from the AMLNORMAL header)
+
+```
+0x4200: T=1  L=24   value=<index/metadata>      (one per bank — purpose TBD)
+0x4400: T=3  L=128  value=<slot 1: usid>
+0x4488: T=3  L=128  value=<slot 2: mac>
+0x4510+ zeros (no more populated slots on this unit)
+```
+
+Each top-level record is `(u32 type LE, u32 length LE, u8 value[length])`. T=3 records are slot containers.
+
+### Slot inner records (within a T=3 container's value)
+
+```
+T=4   L=4   attribute     (4-byte flags — see below)
+T=5   L=4+  name          ("usid", "mac", "$widevinekeybox", etc., variable length)
+T=6   L=4   datasize      (4-byte actual byte count of the value)
+T=7   L=N+  data buffer   (variable, often padded to a 4-byte boundary)
+T=8   L=4   object type   (0xA00000BF = OBJ_TYPE_GENERIC; matches normal_key.h)
+T=9   L=4   reserved      (observed 0; purpose unclear)
+T=10  L=32  hash          (SHA-256 over the slot's value)
+```
+
+Attribute flag values (from `normal_key.h`):
+
+| Bit | Constant | Meaning |
+|---|---|---|
+| 0x1 | `OBJ_ATTR_SECURE` | Slot is marked as "secure" (TEE-only on supported SoCs) |
+| 0x2 | `OBJ_ATTR_OTP` | Slot is write-once after first programming |
+| 0x4 | (undocumented) | Observed on `usid`; possibly "OTP locked" or "key was burned in" |
+| 0x100 | `OBJ_ATTR_ENC` | Slot value is AES-encrypted (with a key from eFuse) |
+
+### Decoded slots on this unit
+
+```
+slot #1: usid
+  attribute: 0x4 (the undocumented bit; see above)
+  type:      GENERIC
+  datasize:  17
+  value:     'AM9PRO26010005693'
+  hash:      30b031bf2136977905b8826ffb049d60d61bfe31653cd2f99affb9f2c0c2fd64
+
+slot #2: mac
+  attribute: 0x3 (SECURE | OTP)
+  type:      GENERIC
+  datasize:  17
+  value:     '90:0e:b3:fd:f8:55'
+  hash:      524d46490670ee6963cdb90617f14c9572ef58274db0a4bc15863b725cf123d6
+```
+
+The `mac` slot's `OBJ_ATTR_OTP` flag means it's nominally write-once. The slot's SHA-256 hash would detect tampering on read but doesn't actually prevent rewrites at the eMMC level — see the security caveat in [Per-Device Identity Provenance](#per-device-identity-provenance).
+
+### Inspector tool
+
+`aml-keystore-tool.py` in this repo decodes any AMLNORMAL dump:
+
+```bash
+python3 aml-keystore-tool.py info reserved.bin     # header summary
+python3 aml-keystore-tool.py list reserved.bin     # walk all populated slots
+python3 aml-keystore-tool.py extract reserved.bin out/   # write each slot's value to a file
+```
+
+Verified against the dump of `/dev/mmcblk0p1` on this unit. Read-only; never writes to the input file.
+
+---
+
+## Active DTB — `/flash/dtb.img`
+
+The active device tree (`/flash/dtb.img`, 84 KB) is the compiled S6 Ugoos AM9 Pro DTB. Decompilable with standard `dtc`:
+
+```bash
+dtc -I dtb -O dts -o ugoos-am9-pro.dts dtb.img
+```
+
+Resulting DTS (~4900 lines) confirms the hardware identification used elsewhere in this document:
+
+```dts
+/ {
+    amlogic-dt-id = "s6_s905x5_umx5jyks";
+    coreelec-dt-id = "s6_s905x5_ugoos_am9_pro";
+    compatible = "amlogic, s6";
+    model = "Ugoos AM9 Pro";
+    ...
+};
+```
+
+Notable findings from the DTB (and used to correct earlier marketing-derived claims):
+
+- **CPU**: four `compatible = "arm,cortex-a55"` cores. The PMU is `cortex-a510-pmu` (newer telemetry IP), but the cores themselves are A55 (ARMv8.2). Ugoos's marketing claim of "ARMv9.0 Cortex-A510" appears to be inaccurate.
+- **GPU**: `arm,mali-valhall-csf` — Mali Valhall G310 with the Compute Shader Frontend (CSF) variant.
+- **Board name**: `umx5jyks` (matches the U-Boot env `board=umx5jyks`). Ugoos's internal codename.
+- **Bootloader build timestamp**: from the U-Boot env `bootloader_version=01.01.260115.144049` and the `@AMLBOOT` board ID `S6-s905x5-2601151440`, the encoding is `YYMMDD.HHMMSS` → built **2026-01-15 at 14:40:49**.
 
 ---
 
