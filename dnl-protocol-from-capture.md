@@ -211,16 +211,37 @@ from this capture alone.
 
 **Paths forward (prioritized):**
 
-1. **Re-capture a Windows burn with `usbmon_max_pkt_size` raised** so we
-   get all 272384 bytes of the DDR upload. Then a clean byte-diff
-   reveals the full transformation rule, which we can replicate in our
-   Layer 2 image processing.
-2. **Static analysis of `V3_setup_V3.3.3.exe`** to find the blob-prep
-   code path. The transformation is probably a short function (likely
-   `aml_image_pack` or similar in Amlogic SDK).
-3. Once we know the right bytes, fix Layer 1's URB submission (libusb
-   async API via `python-libusb1`, or `usbfs` ioctls directly) to send
-   them as one URB.
+1. **Run Khadas's `adnl` against our device on ollie.** Khadas ships a
+   working Linux x86-64 binary that drives the exact same protocol:
+   <https://github.com/khadas/utils> →
+   `aml-flash-tool/tools/adnl/{adnl,usb_flow/}`. It's not stripped
+   (so debuggable) and uses Lua-scripted burn flows in `usb_flow/`. If
+   it works on the AM9 Pro, we can read its source-equivalent (symbols
+   + strings + Lua) and/or capture its USB traffic to see exactly how
+   a *working* Linux implementation submits URBs. Skips all the
+   Windows-tool reverse engineering.
+2. **Re-capture a Windows burn with `usbmon_max_pkt_size` raised** so
+   we get all 272384 bytes of the DDR upload. Empirical comparison
+   confirms whatever theory (1) reveals.
+3. **Static analysis of `V3_setup_V3.3.3.exe`** as a fallback if (1)
+   doesn't work. The installed-tool binary on the Windows VM is
+   easier to parse than the installer itself.
+
+Observations from a brief survey of the open-source tools:
+
+- **pyamlboot** (Baylibre, `pyamlboot/adnl.py::burn_bl2`) implements
+  the older S5-family BL2 boot flow. No `firstsect` — that's S6-only.
+  Useful reference for the `burnsteps` and `setvar:checksum` patterns
+  but doesn't cover our exact case.
+- **Khadas tools** include `adnl` (the actual Amlogic binary, x86-64
+  ELF, not stripped), `adnl_burn_pkg`, and a `usb_flow/` directory of
+  Lua-driven shared libraries (`libamlfastboot.so`, `libaml_usb_flow.so`,
+  `liblua53.so`, `AmlImagePack.so`). The burn sequencing is in Lua,
+  not hardcoded.
+- **Our `.img` file** contains its own `usb_flow` item (212 KB, AML_RES
+  container with 12 sub-items). The sub-item descriptors look scrambled
+  (possibly encrypted/CRC'd in a way our V2 parser doesn't handle) —
+  this is the per-device burn script Ugoos ships.
 
 The wire captures from this session (`captures/round{1,2,3,4}.pcap`) are
 saved for direct comparison against the working Windows pcap.
