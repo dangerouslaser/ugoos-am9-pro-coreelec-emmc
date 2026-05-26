@@ -1,0 +1,31 @@
+boot_a                 p18  7e6a7a933ed3307b6d3c23373605bc9ebcc863ca67ee7b42ebd83ca4e38b1119
+boot_b                 p19  3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351
+bootloader_a           p7   55b39c50f2909227a1112db6fc8476bc414b8d40191194ad89a544ec17ab2e52
+bootloader_b           p8   2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74
+cri_data               p14  2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74
+dtbo_a                 p12  862edca3fb4adc82a093e217c0c97a80382bb33a584c80fa0b3fd50769ff345d
+dtbo_b                 p13  5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee
+env                    p2   c7cadf7d52b9d45a997fd95786c9e7d5668329372d01172bb40050897b627fa4
+factory                p4   b66ec1b7e250a754265660aed66f76c2374a9b00283aeeaa8858470c0f9e5a4d
+frp                    p3   b6a0ba241c44e91ecfc760f8b565504bba6e32a6f276ddfce5ca6fe9233a1655
+init_boot_a            p20  b0078e7721d5e2c41fe780a3babaf5e9be3d26bb9ed4830ceff41f0b6cbff29e
+init_boot_b            p21  2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74
+logo                   p10  53d177f53ded129e2456dc05580cfd8941427fb58a07192dbe6eda783e570205
+metadata               p22  d756a6aa325e73308ca3607e74cfba50d2f520f54fa2b322f7841be6ff81d5ae
+misc                   p11  27276650c6c2824b8fb932af1e01749cae71c5e3e9759ea5c27beb9c20c863be
+odm_ext_a              p16  e096186bf3e07c333127d54a4f7b94527f14d99a504336cb535f30e2fd56a6b2
+odm_ext_b              p17  080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e
+param                  p15  f8e43981c37998b1fb9d8c92f5ba77bbe4910ce567d74074f9d4bdbe0f1c4e54
+reserved               p1   bff9c212736f7ff8c96474c0851922764b1a62f4f6d9b429a43ab617eff288d3
+rsv                    p28  3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351
+super                  p27  da6f6fbd36697d5bcd2e95de7fbe53ae62120d933e66fefc998c2fafca962b05
+tee                    p9   1f87fa022539d3ec21ece55d9cde4c5e5bbdb0953bebddeb65ba050a08497cb7
+userdata               p29  (skipped — 27GB encrypted noise, hash is meaningless)
+vbmeta_a               p23  5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee
+vbmeta_b               p24  5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee
+vbmeta_system_a        p25  5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee
+vbmeta_system_b        p26  5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee
+vendor_boot_a          p5   0d121479a33d48d7862920ececeaea049f125db2eddf429313f1a403291d3384
+vendor_boot_b          p6   3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351
+mmcblk0boot0           -    a1104a81deaeee29afb9a3beee97607b173c62371fe795e1c15cabe3937e4caa   (HW boot, 8192 sectors)
+mmcblk0boot1           -    a1104a81deaeee29afb9a3beee97607b173c62371fe795e1c15cabe3937e4caa   (HW boot, 8192 sectors)

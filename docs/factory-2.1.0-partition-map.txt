@@ -1,0 +1,39 @@
+# Factory snapshot — AM9 Pro, AM9PRO_2.1.0 just-flashed via USB Burning Tool
+# Captured: 2026-05-26T20:05:01Z
+# CID: ec29004133314d3843309ea834a5bc00
+# Model: A31M8C
+
+# Total sectors (mmcblk0): 122142720
+# Sector size: 512 bytes
+
+name                    pnum        start      sectors    size_mb
+------------------------------------------------------------------------
+reserved                   1        73728       131072       64.0
+env                        2       221184        16384        8.0
+frp                        3       270336         4096        2.0
+factory                    4       290816        16384        8.0
+vendor_boot_a              5       309248       131072       64.0
+vendor_boot_b              6       442368       131072       64.0
+bootloader_a               7       575488        16384        8.0
+bootloader_b               8       593920        16384        8.0
+tee                        9       612352        65536       32.0
+logo                      10       679936        16384        8.0
+misc                      11       698368         4096        2.0
+dtbo_a                    12       704512         4096        2.0
+dtbo_b                    13       710656         4096        2.0
+cri_data                  14       716800        16384        8.0
+param                     15       735232        32768       16.0
+odm_ext_a                 16       770048        32768       16.0
+odm_ext_b                 17       804864        32768       16.0
+boot_a                    18       839680       131072       64.0
+boot_b                    19       972800       131072       64.0
+init_boot_a               20      1105920        16384        8.0
+init_boot_b               21      1124352        16384        8.0
+metadata                  22      1142784       131072       64.0
+vbmeta_a                  23      1275904         4096        2.0
+vbmeta_b                  24      1282048         4096        2.0
+vbmeta_system_a           25      1288192         4096        2.0
+vbmeta_system_b           26      1294336         4096        2.0
+super                     27      1300480      6553600     3200.0
+rsv                       28      7856128       131072       64.0
+userdata                  29      7989248    114149376    55737.0

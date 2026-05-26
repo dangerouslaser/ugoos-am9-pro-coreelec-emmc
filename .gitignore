@@ -7,3 +7,8 @@ cfgload-rebuild/
 logo-analysis/
 bootloader-analysis/
 loose-ends/
+captures/*.pcap
+captures/*.pcapng
+.venv/
+__pycache__/
+*.pyc

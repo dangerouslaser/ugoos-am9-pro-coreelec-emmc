@@ -1,0 +1,223 @@
+     time     frm  dev  dir    len  payload
+--------------------------------------------------------------------------------
+
+=== unique ASCII strings on OUT endpoint ===
+                  %Z%I  (    1 times, 1 unique)
+      → '%Z%I'
+                  )^jf  (    1 times, 1 unique)
+      → ')^jf'
+                    *a  (    1 times, 1 unique)
+      → '*a:6'
+                  /C9!  (    1 times, 1 unique)
+      → '/C9!'
+                  45 !  (    1 times, 1 unique)
+      → '45 !'
+                  B u1  (    1 times, 1 unique)
+      → 'B u1'
+                  Br$3  (    1 times, 1 unique)
+      → 'Br$3'
+                  F>Qg  (    1 times, 1 unique)
+      → 'F>Qg'
+                  Gn`_  (    1 times, 1 unique)
+      → 'Gn`_'
+                  J4H|  (    1 times, 1 unique)
+      → 'J4H|'
+                  K!Rb  (    1 times, 1 unique)
+      → 'K!Rb'
+                  [HXQ  (    1 times, 1 unique)
+      → '[HXQ'
+                  ^l;g  (    1 times, 1 unique)
+      → '^l;g'
+                  boot  (    1 times, 1 unique)
+      → 'boot'
+              download  (  175 times, 5 unique)
+      → 'download:00002000'
+      → 'download:00002480'
+      → 'download:00003000'
+      → 'download:00004000'
+      … and 1 more
+                  ds|/  (    1 times, 1 unique)
+      → 'ds|/'
+                  f#@?  (    1 times, 1 unique)
+      → 'f#@?'
+             firstsect  (    1 times, 1 unique)
+      → 'firstsect'
+                getvar  (   29 times, 11 unique)
+      → 'getvar:cbw'
+      → 'getvar:downloadsize'
+      → 'getvar:getchipinfo-0'
+      → 'getvar:getchipinfo-1'
+      … and 7 more
+                mwrite  ( 1267 times, 1 unique)
+      → 'mwrite:verify=addsum'
+                    nT  (    1 times, 1 unique)
+      → 'nT:`'
+    oem disk_initial 1  (    1 times, 1 unique)
+      → 'oem disk_initial 1'
+  oem env_get bootloader_version  (    1 times, 1 unique)
+      → 'oem env_get bootloader_version'
+  oem get_bootloaderversion  (    1 times, 1 unique)
+      → 'oem get_bootloaderversion'
+  oem mwrite 0x1000000 normal store odm_ext_a  (    1 times, 1 unique)
+      → 'oem mwrite 0x1000000 normal store odm_ext_a'
+  oem mwrite 0x14ff4 normal mem dtb  (    2 times, 1 unique)
+      → 'oem mwrite 0x14ff4 normal mem dtb'
+  oem mwrite 0x14ff4 normal store _aml_dtb  (    1 times, 1 unique)
+      → 'oem mwrite 0x14ff4 normal store _aml_dtb'
+  oem mwrite 0x1a7710 normal store logo  (    1 times, 1 unique)
+      → 'oem mwrite 0x1a7710 normal store logo'
+  oem mwrite 0x1b6 normal store dtbo_a  (    1 times, 1 unique)
+      → 'oem mwrite 0x1b6 normal store dtbo_a'
+  oem mwrite 0x29f000 normal store init_boot_a  (    1 times, 1 unique)
+      → 'oem mwrite 0x29f000 normal store init_boot_a'
+  oem mwrite 0x32db800 normal store vendor_boot_a  (    1 times, 1 unique)
+      → 'oem mwrite 0x32db800 normal store vendor_boot_a'
+  oem mwrite 0x3300000 normal store boot_a  (    1 times, 1 unique)
+      → 'oem mwrite 0x3300000 normal store boot_a'
+  oem mwrite 0x3e8400 normal mem sheader  (    1 times, 1 unique)
+      → 'oem mwrite 0x3e8400 normal mem sheader'
+  oem mwrite 0x3e8400 normal store bootloader  (    1 times, 1 unique)
+      → 'oem mwrite 0x3e8400 normal store bootloader'
+  oem mwrite 0x3e8400 normal store bootloader_a  (    1 times, 1 unique)
+      → 'oem mwrite 0x3e8400 normal store bootloader_a'
+  oem mwrite 0x5e327200 sparse store super  (    1 times, 1 unique)
+      → 'oem mwrite 0x5e327200 sparse store super'
+  oem mwrite 0x8600 normal mem gpt  (    1 times, 1 unique)
+      → 'oem mwrite 0x8600 normal mem gpt'
+  oem mwrite 0x8600 normal store gpt  (    1 times, 1 unique)
+      → 'oem mwrite 0x8600 normal store gpt'
+      oem save_setting  (    1 times, 1 unique)
+      → 'oem save_setting'
+  oem setvar burnsteps 0xc0041030  (    1 times, 1 unique)
+      → 'oem setvar burnsteps 0xc0041030'
+  oem setvar burnsteps 0xc0041031  (    1 times, 1 unique)
+      → 'oem setvar burnsteps 0xc0041031'
+  oem setvar burnsteps 0xc0041032  (    1 times, 1 unique)
+      → 'oem setvar burnsteps 0xc0041032'
+      oem sheader_need  (    1 times, 1 unique)
+      → 'oem sheader_need'
+  oem verify sha1sum 31576d87f8c3261db157785d4040fbeec62b7269  (    1 times, 1 unique)
+      → 'oem verify sha1sum 31576d87f8c3261db157785d4040fbeec62b7269'
+  oem verify sha1sum 3e31adc03e1540ce2d00e27a816aa57a4e0a811d  (    1 times, 1 unique)
+      → 'oem verify sha1sum 3e31adc03e1540ce2d00e27a816aa57a4e0a811d'
+  oem verify sha1sum 420a69c0e106da4c026bb383b0691e048c5de7c4  (    2 times, 1 unique)
+      → 'oem verify sha1sum 420a69c0e106da4c026bb383b0691e048c5de7c4'
+  oem verify sha1sum 4b506f2543c42333ebd9e6e9c0bf5568554ffddc  (    1 times, 1 unique)
+      → 'oem verify sha1sum 4b506f2543c42333ebd9e6e9c0bf5568554ffddc'
+  oem verify sha1sum 5921d6967f97b5aea70eb5c446ff6d2bc39938ad  (    1 times, 1 unique)
+      → 'oem verify sha1sum 5921d6967f97b5aea70eb5c446ff6d2bc39938ad'
+  oem verify sha1sum 69d0104b96afe36927883c131569e3a89cefdafa  (    1 times, 1 unique)
+      → 'oem verify sha1sum 69d0104b96afe36927883c131569e3a89cefdafa'
+  oem verify sha1sum 7e63f51086267cbfc7ea71d55d89d967a9d2916a  (    1 times, 1 unique)
+      → 'oem verify sha1sum 7e63f51086267cbfc7ea71d55d89d967a9d2916a'
+  oem verify sha1sum 87e1e759f2c1b465cc6b84422809ff5039fc2d72  (    1 times, 1 unique)
+      → 'oem verify sha1sum 87e1e759f2c1b465cc6b84422809ff5039fc2d72'
+  oem verify sha1sum 915d33eda9c6c1efdcc1fc991dfbf7a03ebe5a30  (    1 times, 1 unique)
+      → 'oem verify sha1sum 915d33eda9c6c1efdcc1fc991dfbf7a03ebe5a30'
+         reboot-romusb  (    1 times, 1 unique)
+      → 'reboot-romusb'
+                setvar  (    4 times, 1 unique)
+      → 'setvar:checksum'
+                  t !f  (    1 times, 1 unique)
+      → 't !f'
+                  zDWs  (    1 times, 1 unique)
+      → 'zDWs'
+
+=== unique ASCII response prefixes on IN endpoint ===
+      'DATA'  (1433 times, 627 unique)
+      ← 'DATA00000004'
+      ← 'DATA00000400'
+      ← 'DATA00002000'
+      'OKAY'  (1482 times, 3 unique)
+      ← 'OKAY'
+      ← 'OKAY0008 / 0040 Chunks'
+      ← 'OKAY01.01.260518.144819'
+
+=== first 80 ASCII command/response events ===
+   20.212     883   14  OUT     15  'getvar:identify'
+   20.213     887   14  OUT     13  'reboot-romusb'
+   20.214     890   14  IN       4  'OKAY'
+   26.261     985   15  OUT     15  'getvar:identify'
+   26.262     989   15  OUT     15  'getvar:serialno'
+   26.263     993   15  OUT     20  'getvar:getchipinfo-1'
+   26.264     997   15  OUT     20  'getvar:getchipinfo-1'
+   26.265    1001   15  OUT     20  'getvar:getchipinfo-0'
+   26.266    1005   15  OUT     20  'getvar:getchipinfo-1'
+   26.267    1009   15  OUT     20  'getvar:getchipinfo-2'
+   26.270    1013   15  OUT     20  'getvar:getchipinfo-3'
+   26.271    1017   15  OUT      9  'firstsect'
+   26.272    1020   15  IN      12  'DATA00000400'
+   26.274    1024   15  IN       4  'OKAY'
+   26.274    1025   15  OUT     19  'getvar:downloadsize'
+   26.275    1029   15  OUT     17  'download:00042800'
+   26.276    1032   15  IN      12  'DATA00042800'
+   26.293    1036   15  IN       4  'OKAY'
+   28.307    1039   15  OUT      4  'boot'
+   28.307    1042   15  IN       4  'OKAY'
+   33.265    1057   16  OUT     15  'getvar:identify'
+   33.267    1061   16  OUT     15  'getvar:identify'
+   33.268    1065   16  OUT     20  'getvar:getchipinfo-5'
+   33.269    1069   16  OUT     20  'getvar:getchipinfo-4'
+   33.272    1073   16  OUT     20  'getvar:getchipinfo-0'
+   33.273    1077   16  OUT     20  'getvar:getchipinfo-4'
+   33.276    1081   16  OUT     20  'getvar:getchipinfo-5'
+   33.278    1085   16  OUT     10  'getvar:cbw'
+   33.279    1089   16  OUT     17  'download:00004000'
+   33.280    1092   16  IN      12  'DATA00004000'
+   33.281    1096   16  IN       4  'OKAY'
+   33.281    1097   16  OUT     17  'download:00004000'
+   33.282    1100   16  IN      12  'DATA00004000'
+   33.283    1104   16  IN       4  'OKAY'
+   33.283    1105   16  OUT     17  'download:00004000'
+   33.284    1108   16  IN      12  'DATA00004000'
+   33.285    1112   16  IN       4  'OKAY'
+   33.285    1113   16  OUT     17  'download:00004000'
+   33.286    1116   16  IN      12  'DATA00004000'
+   33.287    1120   16  IN       4  'OKAY'
+   33.287    1121   16  OUT     17  'download:00004000'
+   33.288    1124   16  IN      12  'DATA00004000'
+   33.289    1128   16  IN       4  'OKAY'
+   33.289    1129   16  OUT     17  'download:00004000'
+   33.290    1132   16  IN      12  'DATA00004000'
+   33.291    1136   16  IN       4  'OKAY'
+   33.291    1137   16  OUT     17  'download:00003000'
+   33.292    1140   16  IN      12  'DATA00003000'
+   33.293    1144   16  IN       4  'OKAY'
+   33.293    1145   16  OUT     15  'setvar:checksum'
+   33.294    1148   16  IN      12  'DATA00000004'
+   33.299    1152   16  IN       4  'OKAY'
+   33.300    1153   16  OUT     10  'getvar:cbw'
+   33.804    1157   16  OUT     15  'getvar:identify'
+   33.805    1161   16  OUT     10  'getvar:cbw'
+   33.806    1165   16  OUT     17  'download:00004000'
+   33.807    1168   16  IN      12  'DATA00004000'
+   33.808    1172   16  IN       4  'OKAY'
+   33.808    1173   16  OUT     17  'download:00004000'
+   33.809    1176   16  IN      12  'DATA00004000'
+   33.810    1180   16  IN       4  'OKAY'
+   33.810    1181   16  OUT     17  'download:00004000'
+   33.811    1184   16  IN      12  'DATA00004000'
+   33.812    1188   16  IN       4  'OKAY'
+   33.812    1189   16  OUT     17  'download:00004000'
+   33.813    1192   16  IN      12  'DATA00004000'
+   33.814    1196   16  IN       4  'OKAY'
+   33.814    1197   16  OUT     17  'download:00004000'
+   33.815    1200   16  IN      12  'DATA00004000'
+   33.816    1204   16  IN       4  'OKAY'
+   33.816    1205   16  OUT     17  'download:00004000'
+   33.817    1208   16  IN      12  'DATA00004000'
+   33.818    1212   16  IN       4  'OKAY'
+   33.818    1213   16  OUT     17  'download:00003000'
+   33.819    1216   16  IN      12  'DATA00003000'
+   33.820    1220   16  IN       4  'OKAY'
+   33.820    1221   16  OUT     15  'setvar:checksum'
+   33.821    1224   16  IN      12  'DATA00000004'
+   33.821    1225   16  OUT      4  'Gn`_'
+   33.826    1228   16  IN       4  'OKAY'
+
+=== device address timeline (each = a re-enumeration) ===
+  t=   20.21  device address → 14
+  t=   26.26  device address → 15
+  t=   33.26  device address → 16
+  t=   37.26  device address → 17
+  t=   44.81  device address → 18
