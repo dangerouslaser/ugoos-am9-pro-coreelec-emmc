@@ -3,8 +3,8 @@
 **Date:** May 14, 2026  
 **Device:** Ugoos AM9 Pro  
 **SoC:** Amlogic S905X5-J (S6 family per CoreELEC board ID `s6_s905x5_ugoos_am9_pro`; serial `0x3e` in Amlogic's internal numbering, referred to as "S5" in tee-loader.sh; the -J suffix denotes Dolby Vision licensing)  
-**CPU:** Quad-core **Cortex-A55** (ARMv8.2) — confirmed via the active DTB (`/flash/dtb.img`), which lists four `compatible = "arm,cortex-a55"` cores. The PMU is from the A510 family (`cortex-a510-pmu`), which likely explains Ugoos's "Cortex-A510 / ARMv9.0" marketing claim — the CPU cores themselves are A55.  
-**GPU:** Mali Valhall G310 (CSF variant — `compatible = "arm,mali-valhall-csf"` in the DTB)  
+**CPU:** Quad-core **Cortex-A510** (ARMv9.0a) — confirmed by `MIDR_EL1 = 0x411fd463` (part `0xd46` = A510) and the CPU feature set advertised in `/proc/cpuinfo`, which includes SVE2, MTE, BF16, and i8mm — all ARMv9 extensions absent on A55. Note that both the CoreELEC and factory Ugoos DTBs declare these cores as `compatible = "arm,cortex-a55"`; that's a kernel-compatibility shim (so existing A55 drivers in the older Linux 5.15 base bind correctly) and not what the hardware actually is. The PMU is correctly declared as `cortex-a510-pmu` — that gives away the real core identity.  
+**GPU:** Mali Valhall G310 (CSF variant) — `compatible = "arm,mali-valhall-csf"` in CoreELEC's DTB. The factory Ugoos DTB misidentifies it as Mali Midgard (`"arm,malit60x", "arm,malit6xx", "arm,mali-midgard"`) — CoreELEC corrected this.  
 **RAM:** 4 GB LPDDR5  
 **CoreELEC:** 22.0-Piers_nightly_20260514  
 **Kernel:** 5.15.196  
@@ -538,9 +538,31 @@ Verified against the dump of `/dev/mmcblk0p1` on this unit. Read-only; never wri
 
 ---
 
-## Active DTB — `/flash/dtb.img`
+## Active DTB — `/flash/dtb.img` (CoreELEC variant)
 
-The active device tree (`/flash/dtb.img`, 84 KB) is the compiled S6 Ugoos AM9 Pro DTB. Decompilable with standard `dtc`:
+The active device tree (`/flash/dtb.img`, 84 KB) is **CoreELEC's customized DTB for the AM9 Pro**, not the stock Ugoos one. The CoreELEC variant has CoreELEC-specific marker properties:
+
+```dts
+/ {
+    coreelec;                                       // CoreELEC marker
+    coreelec-dt-id = "s6_s905x5_ugoos_am9_pro";    // CoreELEC board name
+    ...
+};
+```
+
+The factory Ugoos DTB lives inside `bootloader_a` (encrypted) and is also shipped in `AM9PRO_2.0.9.img` as the `dtb/meson1` item (86004 bytes, plaintext). The factory and CoreELEC DTBs both compile to ~85 KB and describe the same hardware but differ in a few important places:
+
+| Subsystem | Factory Ugoos DTB | CoreELEC DTB |
+|---|---|---|
+| Root `compatible` | `"s6_s905x5_umx5jyks"` | `"amlogic, s6"` |
+| Root `model` | not set | `"Ugoos AM9 Pro"` |
+| CoreELEC markers | none | `coreelec;` + `coreelec-dt-id` |
+| GPU `compatible` | **`"arm,malit60x", "arm,malit6xx", "arm,mali-midgard"`** (WRONG — Midgard is the older generation) | `"arm,mali-valhall-csf"` (correct) |
+| CPU `compatible` | `"arm,cortex-a55", "arm,armv8"` | same as factory |
+
+Both DTBs declare the CPU as A55 even though the hardware is A510 (see CPU note above). Both DTBs correctly identify the PMU as A510-family. The GPU is the one place CoreELEC's DTB is actually more accurate than the factory's — `Mali Valhall G310 CSF` is what the silicon actually is, not Midgard.
+
+Decompilable with standard `dtc`:
 
 ```bash
 dtc -I dtb -O dts -o ugoos-am9-pro.dts dtb.img
@@ -558,10 +580,10 @@ Resulting DTS (~4900 lines) confirms the hardware identification used elsewhere 
 };
 ```
 
-Notable findings from the DTB (and used to correct earlier marketing-derived claims):
+Notable findings from the DTBs:
 
-- **CPU**: four `compatible = "arm,cortex-a55"` cores. The PMU is `cortex-a510-pmu` (newer telemetry IP), but the cores themselves are A55 (ARMv8.2). Ugoos's marketing claim of "ARMv9.0 Cortex-A510" appears to be inaccurate.
-- **GPU**: `arm,mali-valhall-csf` — Mali Valhall G310 with the Compute Shader Frontend (CSF) variant.
+- **CPU declaration is a software shim, not ground truth.** Both DTBs declare the CPU as `cortex-a55`, but `MIDR_EL1 = 0x411fd463` and the SVE2/MTE/BF16 feature flags confirm the hardware is Cortex-A510 (ARMv9.0a). The DTB uses A55 for kernel-driver binding compatibility on the 5.15 kernel base; the silicon is A510.
+- **GPU**: CoreELEC's DTB correctly declares `arm,mali-valhall-csf` (Mali Valhall G310 CSF). The factory Ugoos DTB declares the GPU as Mali Midgard — an older generation entirely. CoreELEC fixed this in their patch set.
 - **Board name**: `umx5jyks` (matches the U-Boot env `board=umx5jyks`). Ugoos's internal codename.
 - **Bootloader build timestamp**: from the U-Boot env `bootloader_version=01.01.260115.144049` and the `@AMLBOOT` board ID `S6-s905x5-2601151440`, the encoding is `YYMMDD.HHMMSS` → built **2026-01-15 at 14:40:49**.
 
