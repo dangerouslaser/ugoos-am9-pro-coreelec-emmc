@@ -420,6 +420,113 @@ This means a full restore is always possible, but it requires a Windows PC, a US
 
 ---
 
+## Bootloader Partition (p7) — Amlogic `@AMLBOOT` Container
+
+The `bootloader_a` partition (p7, 8 MB allocated, 3.91 MB active content) is the Amlogic signed bootloader image — a single binary that bundles BL2, BL30, BL31 (ARM Trusted Firmware), BL32 (TEE), BL33 (U-Boot), and the DDR firmware. The SoC's mask-ROM BL1 reads this partition at boot and chain-loads each stage.
+
+### Container structure (verified on `s6_s905x5_ugoos_am9_pro`)
+
+```
++--------+--------+----------------------------------------------+
+| 0x000  |        | encrypted boot-stage chunks, framed by       |
+|        |        | @ML  16-byte markers, with 32-byte tail      |
+|        | BBST   | hashes and DBLK_PAYLOAD_END sentinels         |
+| 0x4382 | ◀━━━━━ | @AMLBOOT manifest (plaintext, decodable)     |
+| 0x44000|--------+----------------------------------------------+
+|        | BL2E   | BL2 entry image (encrypted)                  |
+| 0x61000|--------+----------------------------------------------+
+|        | BL2X   | BL2 extension (encrypted; DDR init logic)    |
+| 0x7c000|--------+----------------------------------------------+
+|        | DDRF   | DDR firmware slot (256 KB, all zero — DDR     |
+|        |        | firmware is bundled into the BL2 stages on    |
+|        |        | this SoC family)                              |
+| 0xbc000|--------+----------------------------------------------+
+|        | DEVF   | device firmware: BL31 + BL32 + BL33 + DTBs   |
+|        |        | (encrypted as a single 2.5 MB blob)          |
+| 0x339000|------------------------------------------------------|
+|        |        | zero padding to 8 MB partition end           |
++--------+--------+----------------------------------------------+
+```
+
+### `@AMLBOOT` manifest (32 bytes + N×16-byte entries)
+
+The manifest at file offset `0x43820` is the only **plaintext** part of the container. It is what `aml-bootloader-tool.py info` decodes:
+
+```
+@AMLBOOT manifest at file offset 0x43820
+  flags: 02059000
+  board: 'S6-s905x5-2601151440'
+
+name       offset       size  size (KB)  flags
+BBST          0x0    0x44000        272  0x0
+BL2E      0x44000    0x1d000        116  0x0
+BL2X      0x61000    0x1b000        108  0x0
+DDRF      0x7c000    0x40000        256  0x0
+DEVF      0xbc000   0x27d000       2548  0x0
+```
+
+Manifest header:
+- `[0:8]`   ASCII magic `"@AMLBOOT"`
+- `[8:12]`  flags/version (observed `02 05 90 00`)
+- `[12:32]` 20-byte board identifier (`S6-s905x5-2601151440` on this unit — matches the U-Boot env `bootloader_version=01.01.260115.144049`)
+
+Each entry (16 bytes):
+- `[0:4]`   4-character ASCII section name
+- `[4:8]`   absolute offset within the bootloader image (uint32 LE)
+- `[8:12]`  section size in bytes (uint32 LE)
+- `[12:16]` flags (zero on this unit)
+
+The entry list terminates on a `\\0\\0\\0\\0` name.
+
+### Encryption — and why we can't disassemble it
+
+All four content sections (BBST, BL2E, BL2X, DEVF) measure as near-maximum byte entropy:
+
+| Section | Entropy (bits/byte) |
+|---|---|
+| BBST | 7.723 |
+| BL2E | 7.606 |
+| BL2X | 7.897 |
+| DDRF | 0.000 (all zeros) |
+| DEVF | 7.988 |
+
+For comparison, plaintext code and data on ARM64 typically measures 4–6 bits/byte. Anything above ~7.8 is essentially indistinguishable from random output — the SoC encrypts the stages at rest and decrypts them in the BootROM at load time using a per-SoC-family hardware key. No `U-Boot` string, no `OP-TEE` magic, no FDT magic (`0xd00dfeed`) appears anywhere in the file.
+
+The encryption key for the S6 family (`s5_s4` / `s5_s6` Amlogic naming) is not publicly available. Without it:
+
+- The U-Boot binary, BL31 (ARM-TF), and BL32 (TEE) cannot be disassembled from the on-disk image.
+- The implementation of `keyman read mac/usid` (the U-Boot command that reads the UKS keystore in p1) cannot be inspected statically.
+- `factory_provision init` (the command that runs at the end of `cmdline_keys` and is expected to write the UKS keystore on first Android boot) is opaque.
+
+### Paths forward if you actually want the decrypted binary
+
+1. **Runtime memory capture via UART.** Solder/clip to the debug pads, interrupt U-Boot's autoboot (the env has `bootdelay=0`, so this requires sending characters before BL2 hands off), and use `md` to dump the U-Boot text segment from RAM. Same approach works for BL31/BL32 if you can read secure memory (you generally can't from U-Boot non-secure, but can from a custom BL31 patch — circular dependency).
+
+2. **JTAG / SWD.** Most Amlogic boards expose JTAG pads. Halting before BL2 decrypts would let you watch the decryption happen. Significant hardware project.
+
+3. **Public Amlogic BSP releases.** Khadas, Hardkernel (Odroid), and others have released U-Boot source for some Amlogic SoC families. The Khadas VIM4 (S6 family) sources may correlate. The vendor binary would still differ from Ugoos's, but the surface API (`keyman`, `factory_provision`) would be identical or near-identical.
+
+4. **`aml_image_v2_packer` / `aml_encrypt_*` tools.** Amlogic ships these for SDK customers. They are sometimes leaked. The packer side teaches you the container format (already partially documented above); the encrypt side requires the family key, which is not in the public versions.
+
+### What you can still see without decryption
+
+- The `@AMLBOOT` manifest reveals which stages are present, their sizes, and their offsets — confirmed via this tool.
+- The 5 `@ML`-framed chunks in BBST (at offsets `0x1000, 0x1fc0, 0x4320, 0x6680, 0x7640`) plus two more (`0x99a0, 0x9a20`) are likely BL2 boot stages (each followed by a `DBLK_PAYLOAD_END` sentinel). They are encrypted independently — possibly different stages run with different keys.
+- All DTBs referenced at boot are also shipped unencrypted in CoreELEC's `/flash/device_trees/` directory, so device-tree inspection doesn't require decrypting the bootloader.
+
+### Unpack tool
+
+`aml-bootloader-tool.py` in this repo handles inspection and extraction:
+
+```bash
+python3 aml-bootloader-tool.py info bootloader_a.bin
+python3 aml-bootloader-tool.py unpack bootloader_a.bin extracted/
+```
+
+The unpacker writes each section to its own file (`BBST.bin`, `BL2E.bin`, etc.) plus a `manifest.txt`. The output is preserved in encrypted form — useful as a starting point if the S6 family key ever surfaces, and useful for cross-comparison against bootloader updates.
+
+---
+
 ## Logo Partition (p10) — AML_RES v2 Format
 
 The `logo` partition holds Amlogic's resource container for the bootup logo and various upgrade-state graphics. It uses the **AML_RES v2** format (`AML_RES!` magic). On this unit the partition is 8 MB allocated; the active content is 1,679,328 bytes (1.6 MB).
