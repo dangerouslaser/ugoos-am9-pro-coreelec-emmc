@@ -555,11 +555,181 @@ A Linux/macOS USB-restore would need:
 
 Whether this is worth doing depends on whether you want a fully Linux/macOS-native restore flow. For the common case ("go back to Android from CoreELEC") the existing `ce-emmc-restore.sh` already handles it without USB Burning Tool. USB Burning Tool is only needed for catastrophic recovery, and at that point the question is just "is it OK to boot Windows once" — the answer for most users is yes.
 
+### Deeper investigation — actual DNL protocol on this S6 chip
+
+After the Khadas-adnl-rejects-mode-06 finding, a deeper dive using pyamlboot's source as a reference (and bypassing its hardcoded checks) was done against a live device. The full picture:
+
+#### USB descriptor
+
+```
+idVendor:        0x1b8e
+idProduct:       0xc004  (newer "ADNL" PID; older Amlogic chips used 0xc003)
+bInterfaceClass:    0xff (vendor-specific)
+bInterfaceSubClass: 0x42
+bInterfaceProtocol: 0x3
+endpoints:       0x01 BULK OUT, 0x81 BULK IN, 512-byte max packets
+USB serial:      first 8 bytes of the chip's unique CID, hex-encoded
+```
+
+#### Two stages reachable from burn mode
+
+Initial entry (reset button + power) lands the device in **TPL stage** — U-Boot is already running, loaded automatically from boot0+bootloader_a. From there, `reboot-romusb` (a fastboot top-level command, OKAY-accepted) transitions back to **ROM/BootROM stage**.
+
+```
+power-cycle + reset → TPL (U-Boot)  ──reboot-romusb──→ ROM (mask-ROM)
+                       ^                                   ^
+                       │                                   │
+                       │            ← power-cycle ←        │
+                       └───────────────────────────────────┘
+```
+
+Stages confirmed via `getvar:identify` reply byte 7 (`Stage` enum from pyamlboot: ROM=0, SPL=8, TPL=16).
+
+#### Identify replies decoded
+
+**TPL stage** (12-byte reply):
+```
+4f 4b 41 59 06 00 00 10 00 00 00 00
+^^^^^^^^^^^ OKAY
+            ^^ protocol type = 0x06 (S6 generation)
+               ^^ minor version
+                  ^^ reserved
+                     ^^ stage = 0x10 = Stage.TPL
+```
+
+**ROM stage** (69-byte reply):
+```
+4f 4b 41 59 08 00 00 00 00 00 00 0f ... 57 more zero bytes
+^^^^^^^^^^^ OKAY
+            ^^ different field meaning in ROM stage
+               ^^^^^ ...                ^^ stage = 0x00 = Stage.ROM
+                                ^^ msg[11] = 0x0f = bitmap (pages 0-3 available)
+```
+
+Both `adnl` v2.7.5 (Khadas) and pyamlboot reject msg[4] != 0x05. The fix is a one-line patch:
+
+```python
+# pyamlboot adnl.py send_cmd_identify:
+- if msg[4] != 0x5:
++ if msg[4] not in (0x5, 0x6):
+      raise RuntimeError('Unexpected data in reply to "identify"')
+```
+
+But the patch is **necessary but not sufficient** for S6 flashing — see below.
+
+#### Chip identification from BootROM stage
+
+`getvar:getchipinfo-{0..7}` returns 65-byte pages. Pages 0-3 populated on this device:
+
+| Page | Magic | Content |
+|---|---|---|
+| 0 | `INDX` | Index page; byte 4 = 0x0f = pages bitmap (pages 0-3 valid) |
+| 1 | `CHIP` | **SoC family ID at offset 4 = `0x48`**; FEAT at offset 0x24 = `0x00000000`; chip unique ID at offset 0x14 = `80 1d f7 6c c5 00 32 15` |
+| 2 | `CID_` | Chip ID, 16 bytes (8-byte unique ID + 8-byte repeat): `80 1d f7 6c c5 00 32 15 80 1d f7 6c c5 00 32 15` |
+| 3 | `SGVR` | Signature/secure-version page — all zeros (no secureboot version provisioned, consistent with the unlocked bootloader) |
+
+**SoC family ID 0x48 is NOT in pyamlboot's `SocFamily` enum** (which has values up to S4 = 0x37). This is the S6 family ID — undocumented in public Amlogic tools.
+
+```python
+class SocFamily(IntEnum):  # pyamlboot's current enum
+    A1 = 0x2c
+    C1 = 0x30
+    SC2 = 0x32
+    C2 = 0x33
+    T5 = 0x34
+    T5D = 0x35
+    T7 = 0x36
+    S4 = 0x37
+    # Missing — discovered from chipinfo-1 on Ugoos AM9 Pro:
+    # S6 = 0x48
+```
+
+The chip's unique ID (`80 1d f7 6c c5 00 32 15`) is the same value that appears as the USB DNL serial (`801df76cc500321500000000` with zero-padding). Different from `usid` in the AMLNORMAL keystore (the OEM-assigned `AM9PRO26010005693`).
+
+#### TPL (U-Boot) fastboot dispatch table on S6
+
+Tested every standard fastboot command from TPL stage. Implemented:
+
+| Command | Result |
+|---|---|
+| `getvar:identify` | OKAY, returns identify struct (protocol=6, stage=TPL) |
+| `getvar:serialno` | OKAY, returns USB DNL serial |
+| `getvar:product` | OKAY: `amlogic` |
+| `getvar:version`, `getvar:version-baseband`, `getvar:version-bootloader` | OKAY: `0.1` |
+| `getvar:slot-count` | OKAY: `2` |
+| `getvar:erase-block-size` | OKAY: `2000` |
+| `getvar:all` | INFO returns `version:0.1` (everything else hidden) |
+| `getvar:<anything else>` | FAIL: `Variable not implemented` |
+| `flash:<part>` | **FAIL: `unknown command`** |
+| `erase:<part>` | FAIL: `unknown command` |
+| `boot`, `continue`, `set_active:*`, `download:*` | FAIL: `unknown command` |
+| `reboot` | OKAY (device reboots) |
+| `reboot-romusb` | OKAY (transitions to ROM stage) |
+| `oem <anything>` | FAIL: `'cmd <X> not in secure boot white list'` |
+| `oem help` | OKAY (empty body) — the only `oem` command not denied |
+
+So U-Boot in burn mode exposes essentially nothing useful for writes. **The Windows USB Burning Tool cannot be using the TPL/U-Boot fastboot interface** — there's nothing there to use.
+
+#### BootROM stage primitives
+
+Tested from ROM stage:
+
+| Command | Result |
+|---|---|
+| `getvar:identify` | OKAY, returns 69-byte reply (different format than TPL) |
+| `getvar:serialno` | OKAY, returns USB DNL serial |
+| `getvar:getchipinfo-0` through `-7` | OKAY, returns 65-byte pages (see above) |
+| **`setvar:burnsteps`** | **FAIL: `unknow command`** (typo in firmware — sic) |
+| `download:N`, `getvar:downloadsize` | **FAIL: `'1sect not send'`** |
+
+#### The smoking gun: `'1sect not send'`
+
+`'1sect not send'` is the most diagnostic message in the whole investigation. It tells us:
+
+1. S6's BootROM has a **state machine** that gates data-plane commands behind an undocumented "first section" prerequisite — some specific control transfer or special opening packet must be sent before `download:` / `getvar:downloadsize` / probably all other write-path commands are accepted.
+2. **pyamlboot's flow never sends this packet.** It assumes the BURNSTEPS primitive (`setvar:burnsteps`) is available immediately — and on S4-era chips it is. On S6 the primitive itself is `unknow command`, and the alternative path requires the "1sect" preamble we don't have.
+3. **Windows USB Burning Tool must be sending the "1sect" packet** before any data plane work. Amlogic's proprietary tool knows the protocol; the public open-source tools don't.
+
+#### Why this means Phase 2 is blocked
+
+Combining all the findings, the obstacles to a Linux/macOS USB restore on the AM9 Pro:
+
+| Layer | Problem |
+|---|---|
+| pyamlboot `send_cmd_identify` | Rejects protocol type 6 (one-line patch fixes) |
+| pyamlboot `SocFamily` enum | Doesn't include 0x48 (one-line patch fixes) |
+| pyamlboot `FeatSecurebootMask` | No entry for S6 (would need entry; FEAT=0 on this chip so trivially could default to 0x0) |
+| pyamlboot `run_bootrom_stage` | Sends `setvar:burnsteps` which S6 BootROM doesn't implement — fundamental incompatibility |
+| pyamlboot `run_tpl_stage` | Uses `oem mwrite ...` which the current bootloader denies via whitelist |
+| **S6 BootROM** | Requires undocumented "1sect" preamble before any data-plane commands work |
+
+The minor patches fix problems 1-3 in isolation. Problems 4-5 are protocol incompatibilities — the S6 BURNSTEPS / `oem mwrite` either has different syntax or is gated by the "1sect" preamble (#6). **Reverse-engineering the "1sect" preamble and S6's actual write protocol is the unblock — and that requires capturing USB traffic from the Windows USB Burning Tool against a real device.**
+
+#### Concrete recommendation for anyone picking this up
+
+The path forward to make this work is **NOT** "keep poking at pyamlboot." It's:
+
+1. Boot Windows on a real PC or in a VM with USB passthrough.
+2. Install the Amlogic USB Burning Tool v3 (or newer) — same one Ugoos ships.
+3. Install [USBPcap](https://desowin.org/usbpcap/) (Windows) or use Wireshark with USB capture.
+4. Capture an entire burn cycle of `AM9PRO_2.1.0.img` against a real AM9 Pro.
+5. The "1sect" preamble will be visible in the capture as the first non-enumeration packet.
+6. The S6 BURNSTEPS / `oem mwrite` commands will be visible with their actual payload formats.
+7. Replicate in Python (extending pyamlboot or starting fresh).
+
+Until that capture exists, **Linux/macOS USB restore on AM9 Pro is not achievable** with public tooling. The fastboot path is closed; the BURNSTEPS path is closed; there's no third option.
+
+#### What stayed working
+
+For the common "go back to Android from CoreELEC" case, [`ce-emmc-restore.sh`](ce-emmc-restore.sh) in this repo handles it without USB Burning Tool — it recreates the original partition table from the backup the install made, and Android reinitializes its own state from the still-intact `super` partition. **No Windows needed for the routine case.**
+
+USB Burning Tool only matters for catastrophic recovery (lost backups, broken partition table, manual bootloader writes). For that, booting Windows once is the working path; everything we've built lets you inspect/modify the firmware image you'll flash from there.
+
 ### Where this stands
 
-- `am9pro-usb-restore.sh` Phase 1 (image+adnl+device verification) — **working**.
-- Phase 1.5 (`--probe-bl2`, load BL2 into SRAM) — **blocked** by Khadas adnl 2.7.5's rejection of mode 06. Script handles the rejection cleanly and prints the diagnostic.
-- Phase 2 (actual flash) — **not implemented**. Would require the pyamlboot patch above plus careful protocol work, and is gated by external tooling availability for the S6 family.
+- `am9pro-usb-restore.sh` Phase 1 + 1.5 — **working, complete, useful** as a diagnostic.
+- Phase 2 (actual flash) — **blocked at the protocol level**, not just at the tooling level. Requires Windows-side USB capture to make further progress.
+- Tools shipped: `aml-img-tool.py` (image parser), `aml-bootloader-tool.py` (encrypted bootloader), `aml-keystore-tool.py` (AMLNORMAL), `aml-logo-tool.py` (AML_RES). The complete file-format toolset on the Linux/macOS side, ready for the day someone reverse-engineers the S6 USB DNL write protocol.
 
 ---
 
