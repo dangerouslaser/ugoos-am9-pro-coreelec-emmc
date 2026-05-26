@@ -129,18 +129,8 @@ run() {
 
 $DRY_RUN && warn "DRY-RUN mode — no changes will be made"
 
-# --info mode: print diagnostics and exit before any preflight changes state
-if $INFO_MODE; then
-    do_info
-fi
-
-# --restore-logo: validate / pack the logo path NOW (before destructive ops),
-# so a bad argument fails fast without partial-install side effects.
-LOGO_BIN=""
-if [[ -n "$LOGO_PATH" ]]; then
-    LOGO_BIN=$(prepare_logo_bin "$LOGO_PATH")
-    log "Custom logo prepared: $LOGO_BIN (will be written to ${EMMC}p10 during install)"
-fi
+# (--info and --restore-logo validation run after all helper functions are
+# defined; see the block just above "## Preflight".)
 
 # ── TUI detection ─────────────────────────────────────────────────────────────
 
@@ -180,18 +170,31 @@ tui_yesno() {
 
 # ── eMMC node helpers ─────────────────────────────────────────────────────────
 
-# Create /dev nodes for eMMC partitions the kernel already knows about,
-# reading major:minor from sysfs rather than assuming sequential numbering.
+# Create /dev nodes for eMMC partitions the kernel already knows about.
+# Handles both kernel naming styles:
+#   - SD-card boot: sysfs entries are mmcblk0p1, mmcblk0p2, etc.
+#   - eMMC boot:    sysfs entries are by partition label (reserved, env, ...).
+# In both cases the authoritative partition number lives in <dir>/partition.
+# We create /dev/mmcblk0pN regardless of label so the rest of the script
+# can use canonical paths.
 make_emmc_nodes() {
-    for sysfs_dev in /sys/block/mmcblk0/mmcblk0p*/dev; do
-        [[ -f "$sysfs_dev" ]] || continue
-        local partname
-        partname=$(basename "$(dirname "$sysfs_dev")")
-        local devnum maj min
-        read -r devnum < "$sysfs_dev"
+    for dir in /sys/block/mmcblk0/*/; do
+        [[ -f "${dir}partition" ]] || continue
+        local partnum devnum maj min
+        partnum=$(cat "${dir}partition" 2>/dev/null) || continue
+        [[ -n "$partnum" ]] || continue
+        [[ -f "${dir}dev" ]] || continue
+        read -r devnum < "${dir}dev"
         maj="${devnum%%:*}"
         min="${devnum##*:}"
-        mknod "/dev/${partname}" b "$maj" "$min" 2>/dev/null || true
+        mknod "/dev/mmcblk0p${partnum}" b "$maj" "$min" 2>/dev/null || true
+        # Also create a label node if the sysfs entry uses a label name (not
+        # already a mmcblk0pN entry) — preserves backward compatibility.
+        local label
+        label=$(basename "$dir")
+        if [[ "$label" != mmcblk0p* ]]; then
+            mknod "/dev/${label}" b "$maj" "$min" 2>/dev/null || true
+        fi
     done
 }
 
@@ -348,21 +351,30 @@ do_info() {
         | awk -F: 'NR>2 && /^[0-9]/{gsub(/MiB/,"",$4); printf "  p%-3s %-20s %5.0f MiB\n",$1,$6,$4}'
 
     header "Install state"
-    if blkid "${EMMC}p28" 2>/dev/null | grep -q "CE_FLASH"; then
-        log "CoreELEC IS installed (CE_FLASH at p28)"
+    # Use parted to find CE_FLASH regardless of which partition number it
+    # ended up on (old-style install was p27, current install is p28).
+    local ce_flash_p
+    ce_flash_p=$(parted -sm "$EMMC" unit MiB print 2>/dev/null \
+        | awk -F: '/:CE_FLASH:/{print $1; exit}')
+    if [[ -n "$ce_flash_p" ]]; then
+        if [[ "$ce_flash_p" == "28" ]]; then
+            log "CoreELEC IS installed (CE_FLASH at p${ce_flash_p}, super preserved)"
+        else
+            warn "CoreELEC IS installed (CE_FLASH at p${ce_flash_p} — old-style install, super was deleted)"
+        fi
         if [[ -f /flash/mount-storage.sh ]]; then
             warn "  Legacy mount-storage.sh hook present (workaround-style install)"
         fi
-        if grep -q "nofsck" /flash/config.ini 2>/dev/null; then
-            warn "  nofsck present in config.ini (workaround-style install)"
+        # Match nofsck only inside the actual coreelec='...' setting, not
+        # within documentation comments that list it as a valid option.
+        if grep -qE "^coreelec=['\"][^'\"]*nofsck" /flash/config.ini 2>/dev/null; then
+            warn "  nofsck present in coreelec= setting (workaround-style install)"
         fi
         if [[ -f /flash/cfgload ]]; then
             local cfg_size
             cfg_size=$(stat -c %s /flash/cfgload 2>/dev/null || stat -f %z /flash/cfgload)
             log "  cfgload present: $cfg_size bytes"
         fi
-    elif blkid "${EMMC}p27" 2>/dev/null | grep -q "CE_FLASH"; then
-        warn "Old-style CoreELEC install on p27 (pre-this-script)"
     else
         log "CoreELEC NOT installed (Android partition layout intact)"
     fi
@@ -402,6 +414,21 @@ do_info() {
 
     exit 0
 }
+
+# ── Early flag handling (now that helper functions are defined) ──────────────
+
+# --info mode: read-only diagnostic. Exits without entering preflight.
+if $INFO_MODE; then
+    do_info
+fi
+
+# --restore-logo: validate / pack the logo path NOW (before destructive ops),
+# so a bad argument fails fast without partial-install side effects.
+LOGO_BIN=""
+if [[ -n "$LOGO_PATH" ]]; then
+    LOGO_BIN=$(prepare_logo_bin "$LOGO_PATH")
+    log "Custom logo prepared: $LOGO_BIN (will be written to ${EMMC}p10 during install)"
+fi
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
