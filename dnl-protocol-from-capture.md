@@ -187,14 +187,40 @@ count split across multiple URBs leaves the device in a "got the bytes
 but the validating state machine never closed" state, and `boot` runs
 against a half-committed buffer.
 
-**Paths forward:**
+**Update (later this session):** byte-for-byte hash comparison of what
+Windows actually uploads vs what we read from the `.img` reveals that
+**the URB structure isn't the only difference — the byte content
+differs too.**
 
-- Use libusb's async API directly (via `ctypes` or `python-libusb1`) to
-  submit one URB of the full size. Linux 6.x supports much larger URBs
-  than libusb's sync default; the cap is in libusb, not the kernel.
-- Or: write a small C helper that uses `usbfs` ioctls directly and call
-  it via subprocess. Avoids the libusb abstraction entirely.
-- Or: bypass userspace and write a tiny kernel module — overkill.
+The Windows tool **does NOT upload the .img's `DDR.USB` blob verbatim**.
+First-64KB diff:
+- Our blob: has a duplicate @AML sub-header at offset 0x110 and 0xC00
+  bytes of zero padding at [0x400..0xFFF]
+- Windows upload: those are stripped — the whole upload is shifted by
+  0x1000 relative to our blob
+
+The same pattern shows up against our 2.1.0 `bootloader_a` dumped
+directly from eMMC after a clean factory burn — so it's not a
+2.0.9-vs-2.1.0 issue, it's a "the upload is a TRANSFORMED view of the
+on-disk blob" issue. The Amlogic USB Burning Tool appears to strip
+signature blocks / padding before transmission.
+
+usbmon's per-URB truncation (default 64KB) means we only have the first
+~64KB of the 272384-byte upload; we can't reverse the full transformation
+from this capture alone.
+
+**Paths forward (prioritized):**
+
+1. **Re-capture a Windows burn with `usbmon_max_pkt_size` raised** so we
+   get all 272384 bytes of the DDR upload. Then a clean byte-diff
+   reveals the full transformation rule, which we can replicate in our
+   Layer 2 image processing.
+2. **Static analysis of `V3_setup_V3.3.3.exe`** to find the blob-prep
+   code path. The transformation is probably a short function (likely
+   `aml_image_pack` or similar in Amlogic SDK).
+3. Once we know the right bytes, fix Layer 1's URB submission (libusb
+   async API via `python-libusb1`, or `usbfs` ioctls directly) to send
+   them as one URB.
 
 The wire captures from this session (`captures/round{1,2,3,4}.pcap`) are
 saved for direct comparison against the working Windows pcap.
