@@ -8,7 +8,7 @@ A manual installer for CoreELEC to the internal eMMC of the Ugoos AM9 Pro, docum
 
 **This installation method is not supported by CoreELEC. Any support request, bug report, or forum post related to a CoreELEC install performed this way will be rejected, closed, or removed by the CoreELEC team. Do not ask for help on the CoreELEC forums if something goes wrong.**
 
-**This was tested on one specific device running one specific firmware build (22.0-Piers_nightly_20260514). A different device revision or a newer firmware version may fail to boot or permanently break media playback. There is no way to know in advance.**
+**Tested on one physical Ugoos AM9 Pro across CoreELEC nightlies `22.0-Piers_nightly_20260514` and `22.0-Piers_nightly_20260525`. A different hardware revision or a future firmware build may behave differently — the installer could fail or produce a non-booting eMMC, particularly if CoreELEC changes the cfgload script format the rebuild step depends on. The device cannot be permanently bricked from a software install: `boot0`/`boot1` are hardware write-protected, per-device identity (MAC, serial) lives in RPMB and the Wi-Fi chip's OTP rather than the eMMC, and the Amlogic USB Burning Tool can always restore stock Android over the USB-C OTG port. A bad install means an SD-card recovery cycle, not a dead device. See [`factory-investigation.md`](factory-investigation.md) for the underlying analysis.**
 
 **This process removes Android userdata and the rsv partition. Android can be restored — see [Restoring Android](#restoring-android) below.**
 
@@ -36,7 +36,7 @@ See [`emmc-research.md`](emmc-research.md) for the full research notes.
 ## Requirements
 
 - Ugoos AM9 Pro booted into CoreELEC from an SD card
-- CoreELEC nightly build (tested on 22.0-Piers_nightly_20260514 only)
+- CoreELEC nightly build (tested on `22.0-Piers_nightly_20260514` and `22.0-Piers_nightly_20260525`)
 - SSH access or direct terminal access to the device
 
 ---
