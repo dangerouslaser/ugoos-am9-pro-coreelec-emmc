@@ -420,6 +420,91 @@ This means a full restore is always possible, but it requires a Windows PC, a US
 
 ---
 
+## Logo Partition (p10) — AML_RES v2 Format
+
+The `logo` partition holds Amlogic's resource container for the bootup logo and various upgrade-state graphics. It uses the **AML_RES v2** format (`AML_RES!` magic). On this unit the partition is 8 MB allocated; the active content is 1,679,328 bytes (1.6 MB).
+
+### Container layout
+
+```
++--------+------------------------------------------+
+| 0x000  | header (64 bytes)                        |
+| 0x040  | item descriptors (N × 64 bytes)          |
+| 0x???  | BMP data, each aligned to alignSz (16)   |
++--------+------------------------------------------+
+```
+
+**Header (64 bytes):**
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | CRC32 of bytes `[4:imgSz]` — Amlogic uses the *raw* CRC32 (`zlib.crc32() XOR 0xFFFFFFFF`), i.e., the intermediate state without the standard final XOR-out. |
+| 4 | 4 | version (`= 2`) |
+| 8 | 8 | magic `"AML_RES!"` |
+| 16 | 4 | `imgSz` — total bytes including header |
+| 20 | 4 | `imgItemNum` — number of items |
+| 24 | 4 | `alignSz` — alignment for item data (16) |
+| 28 | 36 | reserved (zeros) |
+
+**Each item descriptor (64 bytes):**
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | item magic `0x27051956` (the mkimage magic, used here as a marker) |
+| 4 | 4 | nameId = 0 |
+| 8 | 4 | BMP size in bytes |
+| 12 | 4 | BMP start offset within the file |
+| 16 | 4 | 0 |
+| 20 | 4 | file offset of the **next** item descriptor (`0` for the last item) |
+| 24 | 4 | 0 |
+| 28 | 4 | `index | (totalItems << 8)` |
+| 32 | 32 | null-terminated item name |
+
+### Items on this unit
+
+| Idx | Name | Size | Dimensions | bpp | Content |
+|---|---|---|---|---|---|
+| 0 | `upgrade_upgrading` | 180072 | 300 × 300 | 16 (BI_BITFIELDS) | Android bugdroid with "Upgrading…" label |
+| 1 | `upgrade_logo` | 180072 | 300 × 300 | 16 | Android bugdroid |
+| 2 | `upgrade_error` | 180072 | 300 × 300 | 16 | Android + orange warning triangle |
+| 3 | `upgrade_bar` | 184 | 4 × 14 | 16 | Tiny progress-bar fill |
+| 4 | `upgrade_success` | 180072 | 300 × 300 | 16 | Android + green check |
+| 5 | `bootup_lowcurrent` | 259272 | 360 × 360 | 16 | "INSUFFICIENT POWER SUPPLY" warning |
+| 6 | `upgrade_fail` | 180072 | 300 × 300 | 16 | Android + red X |
+| 7 | `bootup` | 259270 | 360 × 360 | 16 | **Main boot logo** — Amlogic + AV1 + S905X5 jaguar |
+| 8 | `low_voltage` | 259270 | 360 × 360 | 16 | "USB PD 9V 12V" warning |
+| 9 | `upgrade_unfocus` | 184 | 4 × 14 | 16 | Progress-bar background |
+
+All BMPs use 16bpp with `BI_BITFIELDS` compression and Adobe Photoshop's alpha-channel mask variant (the `file` utility reports them as "Adobe Photoshop with alpha channel mask").
+
+### Unpack and pack
+
+`aml-logo-tool.py` in this repo handles both directions:
+
+```bash
+# Extract BMPs from a logo partition dump
+python3 aml-logo-tool.py unpack logo.bin extracted/
+
+# Repack a directory of BMPs into an AML_RES container
+python3 aml-logo-tool.py pack edited/ new-logo.bin
+```
+
+The unpacker names files as `NN_name.bmp` so the packer can recover the ordering and slot names from the filenames alone. Verified by round-trip: `unpack` + `pack` of the stock AM9 Pro logo produces a byte-identical container with the same CRC.
+
+### Customizing the boot logo
+
+To replace, e.g., the main boot logo with a custom image:
+
+1. Pull p10 to a working machine: `dd if=/dev/logo of=logo.bin bs=1M count=2` (only the active 1.6 MB is meaningful).
+2. Unpack: `python3 aml-logo-tool.py unpack logo.bin extracted/`.
+3. Edit `07_bootup.bmp` in any image editor. Match the original's dimensions (360 × 360), color depth (16bpp / BI_BITFIELDS), and BMP variant if you want the exact look. Different sizes work as long as the total fits in the 8 MB partition; the packer adjusts offsets.
+4. Repack: `python3 aml-logo-tool.py pack extracted/ new-logo.bin`.
+5. Write back: `dd if=new-logo.bin of=/dev/logo bs=1M conv=fsync` on the device.
+
+Write-back has not been performed or tested on this device. The format is well-understood and the unpack→repack round-trip is verified byte-identical, but customizing the live logo is a destructive operation against p10 that should be done after backing up the original.
+
+---
+
 ## Brick Risk Assessment
 
 Low. Specifically:
