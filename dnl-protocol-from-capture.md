@@ -238,6 +238,20 @@ Observations from a brief survey of the open-source tools:
   Lua-driven shared libraries (`libamlfastboot.so`, `libaml_usb_flow.so`,
   `liblua53.so`, `AmlImagePack.so`). The burn sequencing is in Lua,
   not hardcoded.
+- **Tested both Linux (v2.6.3, 2021) and Mac universal (v2.7.5, 2024)
+  versions of Khadas adnl against the AM9 Pro — BOTH refuse our S6
+  device.** `adnl bl1_boot` rejects with `illegle device mode:06-00-00-16`;
+  the checker (disassembled from the Mac arm64 binary at
+  `_fb_bl1_boot+0xC3`) requires identify byte 0 ≥ 5 (we pass: S6 = 6)
+  AND identify byte 3 == 0 (we fail: 0x10 = 16). `adnl bl2_boot`
+  similarly rejects with `illegle fw mode 16 for bl2_boot`. Per
+  pyamlboot's identify-reply documentation, the byte-4-of-identify
+  field is the *protocol type* — values 3 (Optimus) and 5 (ADNL) are
+  known; **our S6 device returns 6, a protocol variant that no
+  open-source tool has implemented yet**. The S905X5 / S6 family is
+  newer than Khadas's distributed tools support, and the rebuilt
+  Amlogic SDK that does support it doesn't appear to be publicly
+  available.
 - **Our `.img` file** contains its own `usb_flow` item (212 KB, AML_RES
   container with 12 sub-items). The sub-item descriptors look scrambled
   (possibly encrypted/CRC'd in a way our V2 parser doesn't handle) —

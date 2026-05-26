@@ -12,3 +12,4 @@ captures/*.pcapng
 .venv/
 __pycache__/
 *.pyc
+khadas-mac/
