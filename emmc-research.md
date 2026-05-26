@@ -111,7 +111,7 @@ Where the working ETH MAC, WLAN/BT MACs, and serial actually come from — verif
 
 | Identity | Value (example) | Source |
 |---|---|---|
-| ETH MAC | `90:0E:B3:FD:F8:55` | Stored as plaintext in the **Amlogic UKS keystore on the `reserved` partition (p1)** at offset 0x4000 (with redundant copy at 0x44000). U-Boot's `cmdline_keys` script reads it via `keyman read mac` and sets the kernel cmdline `mac=`. The env partition also stores `ethaddr=` as a redundant copy. RPMB likely holds the integrity key that authenticates the keystore on read, but the value itself is in p1. |
+| ETH MAC | `90:0E:B3:FD:F8:55` | Plaintext in the **Amlogic UKS keystore on `reserved` (p1)** at offset 0x4000 (redundant copy at 0x44000). U-Boot's `cmdline_keys` script reads it via `keyman read mac` and sets the kernel cmdline `mac=`. The env partition also stores `ethaddr=` as a redundant copy. Integrity is SHA-256 (not HMAC) — see [Bootloader Partition](#bootloader-partition-p7--amlogic-amlboot-container) for the public-source confirmation. |
 | WLAN MAC | `40:D9:5A:FC:E2:88` | BCM4389 chip OTP. dmesg: `[dhd] use firmware generated mac_address`. Not stored on the eMMC at all. |
 | BT MAC | `40:D9:5A:FC:E2:89` | BCM4389 OTP (WLAN MAC + 1, Broadcom convention). |
 | Serial | `AM9PRO26010005693` | Plaintext in the p1 UKS keystore (slot `usid`); read at boot via `keyman read usid`. |
@@ -122,7 +122,7 @@ Where the working ETH MAC, WLAN/BT MACs, and serial actually come from — verif
 - **The `factory` (p4) partition is empty.** It is preformatted as FAT12 with label "KEYBOX PART" but contains no keybox data. The Widevine L3 state does not depend on any on-eMMC blob.
 - **The `cri_data` (p14) partition is empty.** All-zero across the full 8 MB.
 - **`mmcblk0boot0` / `mmcblk0boot1` are nearly all zero.** No clear-text keys live in the boot partitions.
-- **RPMB does not hold the identity values directly.** It holds (most likely) the integrity key that authenticates the on-eMMC keystore — the values themselves sit in p1 reserved.
+- **RPMB does not hold the identity values directly, and is not part of the read path.** The integrity check on the AMLNORMAL keystore is plain SHA-256 — see [Bootloader Partition](#bootloader-partition-p7--amlogic-amlboot-container) for the public-source struct. RPMB is provisioned on this unit (`rpmb_state=0x1`) but is used by Android Keymaster / TEE for hardware-backed key storage, not by U-Boot's `keyman` flow.
 
 ### The `cmdline_keys` flow
 
@@ -145,7 +145,7 @@ fi
 ... factory_provision init;
 ```
 
-`keyman` is Amlogic's Unified Key Store interface; `0x1234` selects the secure key device. The keystore itself sits in p1 reserved (verified — `AMLNORMAL` magic at offset 0x4000, with the `usid` slot containing the literal serial `AM9PRO26010005693` and the `mac` slot containing the literal MAC `90:0e:b3:fd:f8:55`). RPMB (`rpmb_state=0x1`) most likely holds the HMAC key that authenticates these reads. The trailing `factory_provision init` is an Amlogic command that runs on first boot and is expected to populate additional keystore slots (`widevinekeybox`, `attestationkeybox`, etc.) when stock Android first comes up — that path has not been observed on this unit since Android has never completed first boot.
+`keyman` is Amlogic's Unified Key Store interface; `0x1234` selects the secure key device. The keystore itself sits in p1 reserved (verified — `AMLNORMAL` magic at offset 0x4000, with the `usid` slot containing the literal serial `AM9PRO26010005693` and the `mac` slot containing the literal MAC `90:0e:b3:fd:f8:55`). The on-disk format is verified against the public CoreELEC/u-boot source — see [Bootloader Partition](#bootloader-partition-p7--amlogic-amlboot-container) for the full struct definition and reader API. The trailing `factory_provision init` initializes the factory partition (p4) for AVB persistent storage; on this unit `avb2=0` so the AVB code path is inactive and `init` is never invoked, explaining why p4 stays as an empty FAT12 placeholder.
 
 ### Keystore structure observed in p1
 
@@ -513,6 +513,83 @@ The encryption key for the S6 family (`s5_s4` / `s5_s6` Amlogic naming) is not p
 - The `@AMLBOOT` manifest reveals which stages are present, their sizes, and their offsets — confirmed via this tool.
 - The 5 `@ML`-framed chunks in BBST (at offsets `0x1000, 0x1fc0, 0x4320, 0x6680, 0x7640`) plus two more (`0x99a0, 0x9a20`) are likely BL2 boot stages (each followed by a `DBLK_PAYLOAD_END` sentinel). They are encrypted independently — possibly different stages run with different keys.
 - All DTBs referenced at boot are also shipped unencrypted in CoreELEC's `/flash/device_trees/` directory, so device-tree inspection doesn't require decrypting the bootloader.
+
+### Public BSP correlation — what's actually inside
+
+The encrypted U-Boot binary on the device is a Ugoos build of Amlogic's reference U-Boot. CoreELEC publishes a near-identical fork at [`CoreELEC/u-boot`](https://github.com/CoreELEC/u-boot) — same SoC family (S5/S6), same `bl33/v2023` tree, same command set. Reading the public source gives us the exact same behavior at the API level even though the on-device binary stays encrypted.
+
+**`keyman` command** — [`bl33/v2023/drivers/amlogic/keymanage/key_manage.c`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/drivers/amlogic/keymanage/key_manage.c):
+
+```
+U_BOOT_CMD(keyman, 5, 0, do_keymanage, "Unify key ops interfaces based dts cfg",
+    "    init seedNum <dtbAddr>\n"
+    "    read keyname addr <hex/str>\n"
+    "    write keyname size addr \n"
+    "    write keyname hex/str value\n"
+    "    query exist/secure/size keyname\n"
+    "    exit \n");
+```
+
+`keyman init 0x1234` passes the seed number to `key_unify_init(seednum, dtbaddr)` which selects the storage backend. `keyman read <name> <addr> str` calls `key_manage_read(keyname, dataBuf, keyLen)`, null-terminates the result, and calls `env_set(keyname, dataBuf)` — that's how the U-Boot env variable `mac=...` gets populated from the keystore.
+
+**Storage backend** — [`bl33/v2023/drivers/amlogic/storagekey/storagekey.c`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/drivers/amlogic/storagekey/storagekey.c) and [`normal_key.c`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/drivers/amlogic/storagekey/normal_key.c):
+
+The keystore reads from the eMMC via `store_rsv_read("key", ...)`. The `"key"` sub-region is a named area within Amlogic's reserved partition (p1). Default block size is `DEF_NORMAL_BLOCK_SIZE = 256 KB`, and total storage area `SECUESTORAGE_WHOLE_SIZE = 0x40000` (256 KB) — exactly matching the stride we observed between the two `AMLNORMAL` copies at offsets `0x4000` and `0x44000` in p1.
+
+**AMLNORMAL on-disk header (from the public source):**
+
+```c
+struct storage_block_raw_head {
+    u8  mark[16];      /* "AMLNORMAL" magic */
+    u32 version;
+    u32 enctype;       /* 0 = plaintext, nonzero = AES with eFuse-bound key */
+    u32 keycnt;        /* number of populated slots */
+    u32 initcnt;
+    u32 wrtcnt;
+    u32 errcnt;
+    u32 flags;
+    u8  headhash[32];  /* SHA-256 of the header */
+    u8  hash[32];      /* SHA-256 of the data */
+};
+```
+
+Integrity is via SHA-256 (NOT HMAC — anyone with the on-disk image can compute and verify these hashes). This means the integrity protection is weaker than initially assumed: there's no secret involved, only an integrity check. The protection against eMMC-level tampering would have to come from the `enctype` field (AES-encrypted slots), but on this unit `enctype = 0` (plaintext, which is why `usid` and `mac` show up directly as readable strings).
+
+Slot lookup uses `normalkey_get((u8*)"usid")` — an in-memory linked-list search after the on-disk block is loaded and decoded. Slot definitions live in [`normal_key.h`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/drivers/amlogic/storagekey/normal_key.h):
+
+```c
+struct storage_object {
+    char name[MAX_OBJ_NAME_LEN];  /* 80 bytes */
+    u32 namesize;
+    u32 attribute;                 /* OBJ_ATTR_SECURE / OTP / ENC */
+    u32 type;                      /* AES / RSA / GENERIC (0xA00000BF) */
+    u32 datasize;
+    u8 *dataptr;
+    u8 hashptr[32];
+};
+```
+
+**`factory_provision init`** — [`bl33/v2023/cmd/amlogic/cmd_avb.c`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/cmd/amlogic/cmd_avb.c) in `persistent_store()`:
+
+```c
+/* initialize factory partition */
+rc = run_command("factory_provision init", 0);
+if (rc) {
+    printf("init factory partition failed\n");
+    return NULL;
+}
+```
+
+The `init` subcommand prepares the factory partition (p4) for use before AVB persistent data can be written. The `factory_provision` command itself is in [`cmd/amlogic/factory_provision/cmd_factory_provision.c`](https://github.com/CoreELEC/u-boot/blob/master/bl33/v2023/cmd/amlogic/factory_provision/cmd_factory_provision.c) and supports `write`, `query`, `list`, `remove`, `clear`, `version`. The `init` form is invoked when Android's AVB code needs to materialize the partition's filesystem; on this unit `avb2=0` is set in the U-Boot env, so the AVB code path is inactive — explaining why p4 has been left as an empty FAT12 placeholder.
+
+### Key takeaways from the BSP correlation
+
+1. **Verified that the `cmdline_keys` env script in p2 maps 1:1 to public CoreELEC/u-boot source.** Nothing in the boot path is Ugoos-proprietary at the command level — it's the standard Amlogic SDK U-Boot.
+2. **`keyman init 0x1234` is the standard secure-key-device selector.** The seed value picks which backend (eFuse vs. normal-key-storage). On this device it resolves to the AMLNORMAL keystore in p1.
+3. **The keystore's integrity guarantee is SHA-256, not HMAC.** That's enough to detect bit-rot, not to prevent forgery. The "anti-tamper" property comes from `enctype` (encryption) which is OFF on this unit — anyone with eMMC-level write access could rewrite the ETH MAC and serial. (Practically: only useful if you have the device opened up and can wire to the eMMC bus, since boot/storage signing prevents post-boot rewrites of p1.)
+4. **`factory_provision init` is only triggered by the AVB code path.** With `avb2=0`, it never runs — confirming why p4 stays empty on this unit.
+5. **Slot value format is structured, not raw.** The header is followed by TLV-encoded `storage_object` entries (name, attribute, type, data, hash). Our observation of `05 00 00 00 04 00 00 00 75 73 69 64 …` followed by the literal `"AM9PRO26010005693"` matches the expected TLV layout (type 5, name-length 4, name `"usid"`, …).
+6. **Decrypting the actual on-device U-Boot binary is no longer necessary** to understand its behavior — the public source has it line-for-line. Decryption would still be needed to verify the on-device binary matches the public source byte-for-byte (i.e., Ugoos didn't add custom commands beyond the standard set), but functional understanding is complete.
 
 ### Unpack tool
 
