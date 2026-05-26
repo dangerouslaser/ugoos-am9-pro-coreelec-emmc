@@ -189,5 +189,6 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 | `aml-bootloader-tool.py` | Decode the `@AMLBOOT` manifest and unpack sections from `bootloader_a` (p7) — contents are encrypted at rest, so the unpacker yields encrypted blobs not directly disassemblable |
 | `aml-keystore-tool.py` | Read the AMLNORMAL keystore from a `reserved` (p1) dump — dumps the header, lists every populated slot with name/attribute/type/value/hash, and extracts each slot's raw value to its own file |
 | `aml-img-tool.py` | Inspect, unpack, and rebuild Amlogic USB Burning Tool `.img` archives (the format Ugoos ships for factory restores). Pure file-format tool — does not flash the device. Round-trip verified byte-identical against `AM9PRO_2.0.9.img` |
+| `am9pro-usb-restore.sh` | Phase 1 wrapper: verifies a `.img`, confirms the closed-source `adnl` (Amlogic DNL protocol) binary works, and (when the device is in burn mode) confirms it identifies cleanly. **Read-only** — no device writes. Phase 2 (the actual restore flow using `adnl bl1_boot`/`bl2_boot`/`partition`) is not yet implemented. |
 | `emmc-research.md` | Full technical research notes |
 | `factory-investigation.md` | Pre-first-boot investigation into where MAC/serial actually live |

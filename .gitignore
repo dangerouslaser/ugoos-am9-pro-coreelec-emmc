@@ -1,6 +1,7 @@
 .DS_Store
-AM9PRO_2.0.9.7z
-AM9PRO_2.0.9/
+AM9PRO_*.7z
+AM9PRO_*/
+*.ko
 device-backups/
 cfgload-rebuild/
 logo-analysis/
