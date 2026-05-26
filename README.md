@@ -51,6 +51,7 @@ See [`emmc-research.md`](emmc-research.md) for the full research notes.
    - `rsv_backup.bin` — the rsv partition (64 MB)
    - `env_backup.bin` — U-Boot environment (p2)
    - `bootloader_a_backup.bin` — bootloader (p7)
+   - `reserved_backup.bin` — `reserved` partition (p1, 64 MB), which holds the Amlogic UKS keystore with the device's ETH MAC and serial. The installer doesn't write to p1, but the backup is cheap insurance because the factory image doesn't include p1 either — if it were ever wiped, USB Burning Tool restore would NOT bring it back.
 5. **Keeps `super` (p27) untouched** — Android system images remain on the eMMC
 6. Deletes two Android partitions:
    - `rsv` (p28, ~64 MB) — reserved partition, unknown purpose, backed up first
@@ -59,10 +60,10 @@ See [`emmc-research.md`](emmc-research.md) for the full research notes.
    - `CE_FLASH` (p28, 512 MB, FAT32) — CoreELEC boot partition
    - `CE_STORAGE` (p29, ~53.9 GB, ext4) — CoreELEC storage
 8. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
-9. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes)
+9. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes). Pass `--no-cfgload-rebuild` to install the legacy `mount-storage.sh` + `nofsck` workarounds instead, as a fallback if a future CoreELEC build ships a cfgload format the rebuild step doesn't understand.
 10. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
 
-Partitions p1–p26, `super` (p27), `boot0`, and `boot1` are not touched. `boot0`/`boot1` are hardware write-protected and cannot be modified by anything running in Linux.
+Partitions p1–p26, `super` (p27), `boot0`, and `boot1` are not touched. `boot0`/`boot1` are hardware write-protected and cannot be modified by anything running in Linux. The installer is a single self-contained bash script — no helper files to scp alongside it.
 
 ---
 

@@ -1,8 +1,10 @@
 # Factory Provisioning Investigation — AM9 Pro
 
-**Date:** 2026-05-25
+**Date:** 2026-05-25 (initial), 2026-05-26 (revised after p1 keystore discovery)
 **Device:** 192.168.1.139, CoreELEC 22.0-Piers_nightly_20260525
 **Question:** On a pre-first-boot unit with empty `factory` (p4), where do the working MACs, serial, and other per-unit data actually live?
+
+> **Revision note (2026-05-26):** The initial investigation concluded RPMB held the identity values directly. A subsequent read of p1 `reserved` found the **Amlogic UKS keystore in plaintext on the eMMC** at offset 0x4000, with the serial and ETH MAC stored as named slots. RPMB most likely holds the HMAC integrity key, not the values. The conclusions below have been updated to reflect this. Implication: p1 IS load-bearing for eMMC-stored identity, and the original "no eMMC operation can lose identity" claim was wrong.
 
 ---
 
@@ -10,19 +12,19 @@
 
 | Identity | Value on this unit | Source (verified) |
 |---|---|---|
-| Ethernet MAC | `90:0E:B3:FD:F8:55` | U-Boot `mac=` on kernel cmdline → set by `cmdline_keys` script via `keyman read mac` (Amlogic Unified Key Store, RPMB-backed). U-Boot env also has `ethaddr=90:0e:b3:fd:f8:55` as a backup. |
+| Ethernet MAC | `90:0E:B3:FD:F8:55` | Plaintext in the Amlogic UKS keystore on **p1 `reserved`** at offset 0x4000 (redundant copy at 0x44000). U-Boot's `cmdline_keys` script reads via `keyman read mac` and sets the kernel cmdline `mac=`. The env partition also stores `ethaddr=` as a redundant copy. RPMB most likely holds the HMAC key that authenticates the keystore on read. |
 | WLAN MAC | `40:D9:5A:FC:E2:88` | **BCM4389 chip OTP.** dmesg: `[dhd] use firmware generated mac_address 40:d9:5a:fc:e2:88` |
 | BT MAC | `40:D9:5A:FC:E2:89` | Same BCM4389 OTP (WLAN MAC + 1) |
-| Serial | `AM9PRO26010005693` | `keyman read usid` → Amlogic UKS / RPMB |
+| Serial | `AM9PRO26010005693` | Plaintext in the p1 UKS keystore (slot `usid`); read at boot via `keyman read usid`. |
 
 **Conclusions:**
 
 1. The empty `factory` partition (p4 KEYBOX PART, FAT12, content-empty) is **not** the source of any working identity on this device. It is a placeholder.
 2. The Amlogic SoC eFuses for MAC/USID are **all zero** — also not the source.
-3. The working ETH MAC and serial are read by U-Boot from **RPMB** via `keyman init 0x1234`, then injected into the kernel cmdline at boot.
+3. The working ETH MAC and serial are stored in plaintext in the **p1 `reserved` partition** under the Amlogic UKS / `AMLNORMAL` keystore format. U-Boot reads them via `keyman init 0x1234` + `keyman read mac/usid`.
 4. The working WLAN/BT MACs are read by the Broadcom firmware from the **BCM4389 chip's own OTP**, completely independent of the eMMC.
 5. `cri_data` (p14) is fully zeroed — no per-device data there.
-6. None of the per-unit identities are at risk from anything on the eMMC. A full eMMC wipe (including the partition table) does not lose any of them. They survive a USB Burning Tool restore as well.
+6. **eMMC-stored identity IS at risk if p1 is wiped.** WLAN/BT MACs from BCM OTP survive any eMMC operation. ETH MAC and serial would be lost if p1 is wiped; the factory image does not include p1, so USB Burning Tool restore would NOT bring them back. None of this is a concern for the CoreELEC install — it does not touch p1 — but it changes how aggressive an eMMC-wipe experiment can be without permanent identity loss.
 
 ---
 
@@ -61,7 +63,7 @@ Entirely zeros across all 8 MB. md5 matches that of /dev/zero of the same size. 
 
 ## Where the IDs really come from
 
-### Ethernet MAC and serial: U-Boot `keyman` → RPMB (most likely)
+### Ethernet MAC and serial: U-Boot `keyman` → Amlogic UKS keystore in p1 reserved
 
 The `env` partition (p2) contains a U-Boot script variable `cmdline_keys` that runs late in `storeargs`:
 
@@ -82,16 +84,33 @@ fi
 ... factory_provision init;
 ```
 
-`keyman` is Amlogic's Unified Key Store (UKS) interface. The magic `0x1234` selects the secure key device. On this SoC family the UKS reads from a fixed set of backing stores:
+`keyman` is Amlogic's Unified Key Store (UKS) interface. The magic `0x1234` selects the secure key device. The UKS keystore on this SoC lives on the eMMC in the `reserved` partition (p1):
 
-- **eFuses** — confirmed empty on this unit (`/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` all read as zero bytes).
-- **factory partition (p4 KEYBOX PART)** — confirmed empty.
-- **RPMB** — already provisioned (`rpmb_state=0x1`, key burned at factory).
-- **A secure region within boot0/boot1 or the bootloader payload** — both `mmcblk0boot0` and `mmcblk0boot1` are nearly all zero (just a 1-byte header), so the keys aren't sitting in clear here. (Could still be in the Replay Protected Memory Block, which is a separate ~4 MB region not visible as `mmcblk0boot*`.)
+```
+$ python3 -c 'import re; d=open("/dev/reserved","rb").read(); \
+  print([hex(m.start()) for m in re.finditer(b"AMLNORMAL", d)])'
+['0x4000', '0x44000']
 
-By elimination, the IDs are stored in RPMB. This is consistent with how Amlogic factory tools provision new units.
+$ python3 -c 'import re; d=open("/dev/reserved","rb").read(); \
+  print([hex(m.start()) for m in re.finditer(b"AM9PRO26010005693", d)])'
+['0x4434', '0x44434']
 
-The U-Boot env partition (p2) also stores `ethaddr=90:0e:b3:fd:f8:55` as a legacy variable. Both keyman and ethaddr report the same MAC. If the env partition is wiped, the kernel cmdline path via keyman still works.
+$ python3 -c 'import re; d=open("/dev/reserved","rb").read(); \
+  print([hex(m.start()) for m in re.finditer(b"90:0e:b3:fd:f8:55", d)])'
+['0x44bc', '0x444bc']
+```
+
+The keystore is duplicated (offsets 0x4000 and 0x44000 — a 256 KB stride for redundancy). Each bank has an `AMLNORMAL` magic header, a version word, ~80 bytes of high-entropy hash/HMAC material, and a slot table containing both the **slot names** (e.g. `usid`, `mac`, `$widevinekeybox`, `$attestationkeybox`, `$netflix_mgkid`, `$PlayReadykeybox25`, `$hdcp22_fw_private`, `$mac_wifi`, `$deviceid`, `$region_code`, `$secure_boot_set`) and their values. On this unit only `usid` and `mac` are populated; the other slot names exist but the values are empty — consistent with `androidboot.firstboot=1` (factory provisioning ran far enough to set identity, not far enough to run `factory_provision init` and populate the DRM keyboxes).
+
+The other candidates were ruled out by direct observation:
+
+- **eFuses** — `/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` all read as zero bytes.
+- **factory partition (p4)** — empty FAT12.
+- **mmcblk0boot0 / mmcblk0boot1** — nearly all zero (one-byte header each, identical md5).
+
+**RPMB** is provisioned on this unit (`rpmb_state=0x1`). Since the keystore values themselves are visible in plaintext on the user area, RPMB most likely holds the HMAC integrity key used to authenticate reads of the on-eMMC keystore, rather than the values directly.
+
+The U-Boot env partition (p2) also stores `ethaddr=90:0e:b3:fd:f8:55` as a legacy variable, providing a secondary path to the ETH MAC if the keystore read fails. WLAN/BT MACs come from the BCM4389 chip OTP entirely independently.
 
 ### WLAN / BT MACs: BCM4389 chip OTP
 
@@ -175,11 +194,12 @@ Not blocking for this investigation, but worth a separate backup pass if doing a
 
 Suggested additions / corrections to the existing notes file:
 
-1. **Per-device identity provenance** — the existing notes say `factory` partition stores the Widevine keybox, but on this unit p4 is empty FAT12 and the Widevine state is L3-software anyway. Working ETH MAC and serial actually live in **RPMB** and are read at boot via `keyman read`. Wi-Fi/BT MACs live in the **BCM4389 chip OTP** and are not stored on the eMMC at all. This means:
+1. **Per-device identity provenance** — the existing notes say `factory` partition stores the Widevine keybox, but on this unit p4 is empty FAT12 and the Widevine state is L3-software anyway. Working ETH MAC and serial actually live as **plaintext slots in the Amlogic UKS keystore on `reserved` (p1)** at offset 0x4000, with a redundant copy at 0x44000. Wi-Fi/BT MACs live in the **BCM4389 chip OTP** and are not stored on the eMMC at all. This means:
    - The CoreELEC install scripts do not need to back up p4 to preserve identity (it is already empty on at least some Ugoos shipping units).
-   - USB Burning Tool restore does not need to recreate identity content — the RPMB-stored keys and BCM-OTP MACs survive any eMMC-level operation.
+   - **p1 `reserved` IS load-bearing for ETH MAC and serial** — wiping or rewriting it would lose them, and USB Burning Tool restore would NOT bring them back because the factory image does not include p1.
+   - USB Burning Tool restore IS safe for identity as long as p1 itself is left untouched, which the burn tool does (the `reserved` partition is not in the image manifest).
 
-2. **eFuses are all zero on this unit.** `/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` all read as zero bytes. The Amlogic eFuse path is NOT used for per-device identity on the AM9 Pro S905X5-J — UKS/RPMB is the storage backend.
+2. **eFuses are all zero on this unit.** `/sys/class/efuse/{mac,mac_wifi,mac_bt,usid}` all read as zero bytes. The Amlogic eFuse path is NOT used for per-device identity on the AM9 Pro S905X5-J — the on-eMMC UKS keystore in p1 (with RPMB-backed integrity) is the storage backend.
 
 3. **`cri_data` (p14) is unused.** Currently listed as "unknown" in the partition table — now confirmed all-zero. Not worth special-casing in install/restore scripts.
 

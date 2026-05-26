@@ -5,13 +5,18 @@
 # Must be run from CoreELEC booted off an SD card.
 #
 # What this does:
-#   1. Backs up partition layout, rsv (p28), env (p2), and bootloader_a (p7) to /storage
+#   1. Backs up partition layout, rsv (p28), env (p2), bootloader_a (p7), and
+#      reserved (p1, holds the Amlogic UKS keystore with the device's MAC and
+#      serial) to /storage
 #   2. Keeps super (p27) — Android system images intact for potential restore
 #   3. Deletes rsv (p28) and userdata (p29)
 #   4. Creates CE_FLASH (512 MB FAT32) at p28 and CE_STORAGE (remaining space ext4) at p29
 #   5. Copies all boot files from the SD card's /flash to CE_FLASH
 #   6. Rebuilds cfgload to use disk=LABEL=CE_STORAGE (replaces the dual-boot
-#      ceemmc disk=FOLDER=/dev/CE_STORAGE path with standalone label resolution)
+#      ceemmc disk=FOLDER=/dev/CE_STORAGE path with standalone label resolution).
+#      Pass --no-cfgload-rebuild to install the legacy mount-storage.sh hook +
+#      nofsck workarounds instead, as a fallback if the rebuild step doesn't
+#      handle a future cfgload format.
 #   7. Optionally migrates your current /storage to CE_STORAGE
 
 set -euo pipefail
@@ -19,16 +24,22 @@ set -euo pipefail
 # ── Flags ─────────────────────────────────────────────────────────────────────
 
 DRY_RUN=false
+REBUILD_CFGLOAD=true
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=true ;;
+        --no-cfgload-rebuild) REBUILD_CFGLOAD=false ;;
         --help)
-            echo "Usage: ce-emmc-install.sh [--dry-run] [--help]"
+            echo "Usage: ce-emmc-install.sh [--dry-run] [--no-cfgload-rebuild] [--help]"
             echo ""
-            echo "  --dry-run  Show all commands without executing destructive operations."
-            echo "             Non-destructive reads (parted print, blkid, dd reads) still run."
-            echo "  --help     Show this help and exit."
+            echo "  --dry-run              Show all commands without executing destructive ops."
+            echo "                         Non-destructive reads (parted print, blkid, dd reads) still run."
+            echo "  --no-cfgload-rebuild   Skip the cfgload rebuild and install the legacy"
+            echo "                         mount-storage.sh hook + nofsck workarounds instead."
+            echo "                         Use this if a future CoreELEC build ships a cfgload"
+            echo "                         format the rebuild step doesn't understand."
+            echo "  --help                 Show this help and exit."
             exit 0
             ;;
     esac
@@ -289,6 +300,15 @@ log "env (p2) → ${BACKUP_DIR}/env_backup.bin"
 run dd if="${EMMC}p7" of="${BACKUP_DIR}/bootloader_a_backup.bin" bs=1M status=none
 log "bootloader_a (p7) → ${BACKUP_DIR}/bootloader_a_backup.bin"
 
+# Back up p1 reserved — it holds the Amlogic UKS keystore (AMLNORMAL magic at
+# offset 0x4000, with a redundant copy at 0x44000). On this SoC family the
+# device's ETH MAC and serial are stored there as plaintext slots. The install
+# does not touch p1, but a wipe of this partition would lose eMMC-stored
+# identity and the factory image does not include it, so USB Burning Tool
+# restore would not recover the values. Cheap insurance.
+run dd if="${EMMC}p1" of="${BACKUP_DIR}/reserved_backup.bin" bs=1M status=none
+log "reserved (p1) → ${BACKUP_DIR}/reserved_backup.bin"
+
 # ── Repartition ───────────────────────────────────────────────────────────────
 
 header "Repartitioning eMMC"
@@ -337,6 +357,8 @@ run mount "${EMMC}p28" "$MNT_FLASH"
 log "Copying files from ${SD_FLASH}..."
 run cp -a "${SD_FLASH}/." "${MNT_FLASH}/"
 run rm -f "${MNT_FLASH}/fs-resize.log"
+
+if $REBUILD_CFGLOAD; then
 
 # Rebuild cfgload for a standalone install.
 #
@@ -433,6 +455,40 @@ print(f"rebuild_cfgload: {path}: {len(data)} → {HDR_SIZE + new_dsize} bytes "
 PYEOF
 fi
 
+else  # REBUILD_CFGLOAD = false — install the legacy workarounds instead
+
+# Legacy fallback path: install mount-storage.sh hook + nofsck in config.ini.
+# Use this if a future CoreELEC build ships a cfgload format the Python
+# rebuilder doesn't understand. The cfgload stays in its stock dual-boot
+# state with disk=FOLDER=/dev/CE_STORAGE in the cmdline; the hook bypasses
+# the resulting broken mount path, and nofsck suppresses the 10-second
+# retry loop the missing /dev/CE_STORAGE node would otherwise cause.
+warn "Using legacy workaround path (--no-cfgload-rebuild): mount-storage.sh + nofsck"
+
+log "Installing mount-storage.sh hook..."
+if ! $DRY_RUN; then
+    cat > "${MNT_FLASH}/mount-storage.sh" << 'EOF'
+mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
+EOF
+else
+    echo -e "${YELLOW}[DRY-RUN]${NC} write ${MNT_FLASH}/mount-storage.sh"
+fi
+
+log "Updating config.ini (adding nofsck)..."
+if ! $DRY_RUN; then
+    if grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
+        if ! grep -q "nofsck" "${MNT_FLASH}/config.ini"; then
+            sed -i "s/coreelec='\(.*\)'/coreelec='\1 nofsck'/" "${MNT_FLASH}/config.ini"
+        fi
+    else
+        echo "coreelec='quiet nofsck'" >> "${MNT_FLASH}/config.ini"
+    fi
+else
+    echo -e "${YELLOW}[DRY-RUN]${NC} update ${MNT_FLASH}/config.ini — add nofsck"
+fi
+
+fi  # end REBUILD_CFGLOAD branch
+
 run umount "$MNT_FLASH"
 log "CE_FLASH ready"
 
@@ -489,9 +545,10 @@ echo "  Clear your old entry before reconnecting:"
 echo "    ssh-keygen -R <device-ip>"
 echo ""
 echo "  Backups saved to ${BACKUP_DIR}:"
-echo "    partition_layout.txt  (needed by ce-emmc-restore.sh)"
+echo "    partition_layout.txt   (needed by ce-emmc-restore.sh)"
 echo "    rsv_backup.bin"
 echo "    env_backup.bin"
 echo "    bootloader_a_backup.bin"
+echo "    reserved_backup.bin    (Amlogic UKS keystore — MAC/serial)"
 echo ""
 $DRY_RUN && warn "DRY-RUN complete — no changes were made"
