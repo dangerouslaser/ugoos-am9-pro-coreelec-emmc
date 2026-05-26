@@ -281,7 +281,7 @@ disk=FOLDER=/dev/CE_STORAGE
 disk=LABEL=CE_STORAGE
 ```
 
-However, cfgload is a compiled U-Boot script in mkimage format — it cannot be edited with a text editor. The change requires decompiling, editing, and recompiling with `mkimage`. See the CRC trap section below. This is what ceemmc would do correctly if it supported this board.
+cfgload is a compiled U-Boot script in mkimage format and cannot be edited with a text editor. The change requires decompiling, editing, and recompiling so the CRC fields in the mkimage header are correct. See the "cfgload rebuild" section below. This is what ceemmc would do if it supported this board, and what the install script in this repository now does.
 
 ---
 
@@ -302,33 +302,15 @@ Created:
 - `CE_FLASH` (p28, 512 MB, FAT32) — boot partition, holds kernel/DTB/cfgload. U-Boot's `cfgloademmc` scans partitions 1–31 for a FAT filesystem containing cfgload — it finds CE_FLASH at p28 by content, not by partition number.
 - `CE_STORAGE` (p29, ~53.9 GB, ext4) — CoreELEC storage
 
-### cfgload CRC trap
+### cfgload rebuild
 
-The cfgload file is a compiled U-Boot script in mkimage format — it has a binary header containing a CRC of the script data. Editing the file with `sed` changes the content but leaves the old CRC in the header. U-Boot verifies the CRC on load and silently rejects a mismatched script, causing eMMC boot to fail without any obvious error.
+The cfgload file is a compiled U-Boot script in mkimage legacy-image format. The header carries two CRC32 fields: `ih_hcrc` (over the 64-byte header with the hcrc field zeroed) and `ih_dcrc` (over the entire payload). Editing the file with `sed` changes the inner script but leaves the old CRCs in place — U-Boot verifies both on load and silently rejects a mismatched image, causing eMMC boot to fail with no obvious error.
 
-**Do not edit cfgload with sed or any text editor.** Either recompile it with `mkimage` after editing, or use the hooks described below.
+The install script reads the stock cfgload from the SD card's `/flash`, performs the `FOLDER=/dev/CE_STORAGE` → `LABEL=CE_STORAGE` substitution in the inner script, then rebuilds the mkimage container with correct CRCs. This is done in Python because `mkimage` is not installed on CoreELEC. The script-image payload format is a null-terminated list of big-endian uint32 script sizes followed by the script bodies concatenated; for a single-script image the payload is `[size_be32][0_terminator][script]`, an 8-byte overhead.
 
-### The mount-storage.sh hook
+The Python rebuilder is idempotent — running it on an already-patched cfgload prints "already patched" and exits 0. The output is byte-identical (modulo timestamp and header CRC) to what `mkimage -A arm64 -T script -O linux -C none -d <script> <out>` produces.
 
-The initrd sources `/flash/mount-storage.sh` if it exists, instead of running the normal `mount_part "$disk"` logic. This was used to sidestep the `FOLDER=/dev/CE_STORAGE` path entirely.
-
-`/flash/mount-storage.sh` on CE_FLASH:
-```sh
-mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
-```
-
-**Note:** This is a workaround, not a proper solution. The right approach is to recompile cfgload with `mkimage` so it uses `disk=LABEL=CE_STORAGE` directly — which is exactly what ceemmc would do if it supported this board. The FOLDER= mechanism isn't "broken"; it's the dual-boot path designed for when CoreELEC storage lives as a subfolder inside Android's userdata. For a standalone CoreELEC install, cfgload should simply be rebuilt with the correct `LABEL=` argument. The mount-storage.sh hook achieves the same end result but bypasses the intended boot mechanism in a way that the CoreELEC team would not consider correct.
-
-### nofsck in config.ini
-
-With `disk=FOLDER=/dev/CE_STORAGE` still in the kernel cmdline (from the unmodified cfgload), the initrd adds `/dev/CE_STORAGE` to its fsck disk list. Since that device node never gets created, fsck retries 20 times at 0.5s each — a 10-second boot penalty.
-
-Fix: add `nofsck` to the `coreelec` variable in `config.ini` on CE_FLASH:
-```
-coreelec='quiet nofsck'
-```
-
-This passes `nofsck` as a kernel argument, which the initrd parses to skip fsck entirely.
+With cfgload using `LABEL=CE_STORAGE`, the kernel cmdline gets `disk=LABEL=CE_STORAGE`, the initrd resolves the label via `blkid` to the actual partition device, and `mount_part` + `fsck` work the way they do for SD-card boots. No `mount-storage.sh` hook and no `nofsck` workaround required.
 
 ### Final working file layout on CE_FLASH (p28)
 
@@ -339,9 +321,8 @@ CE_FLASH/
 ├── kernel.img       (23.5 MB — kernel + initrd)
 ├── kernel.img.md5
 ├── dtb.img          (82.7 KB — s6_s905x5_ugoos_am9_pro.dtb)
-├── cfgload          (original unmodified mkimage binary from SD)
-├── config.ini       (with coreelec='quiet nofsck')
-├── mount-storage.sh (mounts LABEL=CE_STORAGE as /storage)
+├── cfgload          (rebuilt — disk=LABEL=CE_STORAGE, CRCs recomputed)
+├── config.ini       (stock from SD — coreelec='quiet')
 ├── resolution.ini
 ├── aml_autoscript
 ├── cfgload_env
@@ -351,9 +332,13 @@ CE_FLASH/
     └── s6_s905x5_ugoos_am9_pro.dtb  (and all other DTBs)
 ```
 
+### Historical note: previous workarounds
+
+The original install installed a `mount-storage.sh` hook (sourced by the initrd in place of `mount_part`) and added `nofsck` to `config.ini` to suppress a 10-second fsck retry loop caused by the missing `/dev/CE_STORAGE` device node. Both workarounds existed only because cfgload was left unmodified; they were superseded by the cfgload rebuild and are no longer produced by the install script.
+
 ### Result
 
-Device boots CoreELEC successfully from eMMC with SD card removed. First boot initializes the empty CE_STORAGE partition. SSH host key changes on first eMMC boot (fresh install generates new keys) — clear the old entry with `ssh-keygen -R 192.168.1.139` before reconnecting.
+Device boots CoreELEC successfully from eMMC with SD card removed. First boot initializes the empty CE_STORAGE partition. fsck runs cleanly on both CE_FLASH and CE_STORAGE during initrd. SSH host key changes on first eMMC boot (fresh install generates new keys) — clear the old entry with `ssh-keygen -R 192.168.1.139` before reconnecting.
 
 ---
 

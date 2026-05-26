@@ -59,9 +59,8 @@ See [`emmc-research.md`](emmc-research.md) for the full research notes.
    - `CE_FLASH` (p28, 512 MB, FAT32) — CoreELEC boot partition
    - `CE_STORAGE` (p29, ~53.9 GB, ext4) — CoreELEC storage
 8. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
-9. Installs a `mount-storage.sh` hook as a workaround for the cfgload `FOLDER=` path (see technical notes)
-10. Adds `nofsck` to `config.ini` to avoid a 10-second boot delay
-11. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
+9. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes)
+10. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
 
 Partitions p1–p26, `super` (p27), `boot0`, and `boot1` are not touched. `boot0`/`boot1` are hardware write-protected and cannot be modified by anything running in Linux.
 
@@ -163,15 +162,15 @@ U-Boot's `cfgloademmc` command scans eMMC partitions 1–31 looking for a FAT fi
 
 The original install approach placed CE_FLASH at p27 (replacing `super`). The current approach keeps `super` at p27 and places CE_FLASH at p28 (replacing `rsv`). The boot process is unchanged.
 
-### Why not just edit cfgload?
+### How the cfgload rebuild works
 
-`cfgload` is a compiled U-Boot script in mkimage format with a CRC in the binary header. Editing it with a text editor or `sed` changes the content but not the CRC — U-Boot verifies the CRC on load and silently rejects a mismatched script, failing silently with no obvious error.
+`cfgload` is a compiled U-Boot script in mkimage format with two CRC32 fields in its header (one over the header itself, one over the data). Editing it with a text editor or `sed` changes the content but leaves the old CRCs in place — U-Boot verifies them on load and silently rejects the script, failing without any obvious error.
 
-The correct approach is to decompile, edit, and recompile cfgload with `mkimage` so it uses `disk=LABEL=CE_STORAGE` directly — which is what ceemmc would do if it supported this board. The `mount-storage.sh` hook is used here as a workaround to avoid that recompilation step, but it is not the intended mechanism.
+The installer reads the stock cfgload from the SD card, performs the `FOLDER=/dev/CE_STORAGE` → `LABEL=CE_STORAGE` substitution in the inner script body, then rebuilds the mkimage container with correct CRCs. It does this in Python because `mkimage` is not installed on CoreELEC — the legacy-script format is straightforward to pack with `struct` and `zlib.crc32`. The result is byte-identical (modulo timestamp and header CRC) to what `mkimage -A arm64 -T script -O linux -C none -d <script> <out>` produces.
 
-### Why nofsck?
+The rebuild step is idempotent: running it on an already-patched cfgload is a no-op.
 
-Because cfgload was left unmodified, the kernel cmdline still contains `disk=FOLDER=/dev/CE_STORAGE`. The CoreELEC initrd adds `/dev/CE_STORAGE` to its fsck checklist, then retries 20 times at 0.5 seconds each when the device node is not found. `nofsck` skips this check. If cfgload were properly recompiled to use `LABEL=`, this workaround would not be needed.
+This is the same change `ceemmc` would make if it supported this board — `LABEL=`-based mounting goes through the initrd's standard `mount_part` path, no hook scripts or `nofsck` workarounds required.
 
 ### Brick risk
 

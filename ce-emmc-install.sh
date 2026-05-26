@@ -10,9 +10,9 @@
 #   3. Deletes rsv (p28) and userdata (p29)
 #   4. Creates CE_FLASH (512 MB FAT32) at p28 and CE_STORAGE (remaining space ext4) at p29
 #   5. Copies all boot files from the SD card's /flash to CE_FLASH
-#   6. Installs mount-storage.sh hook (workaround for cfgload's dual-boot FOLDER= path)
-#   7. Adds nofsck to config.ini (avoids 10s boot delay from phantom fsck)
-#   8. Optionally migrates your current /storage to CE_STORAGE
+#   6. Rebuilds cfgload to use disk=LABEL=CE_STORAGE (replaces the dual-boot
+#      ceemmc disk=FOLDER=/dev/CE_STORAGE path with standalone label resolution)
+#   7. Optionally migrates your current /storage to CE_STORAGE
 
 set -euo pipefail
 
@@ -338,38 +338,99 @@ log "Copying files from ${SD_FLASH}..."
 run cp -a "${SD_FLASH}/." "${MNT_FLASH}/"
 run rm -f "${MNT_FLASH}/fs-resize.log"
 
-# Install mount-storage.sh hook.
-# The initrd sources this file instead of running the normal mount_part() logic.
-# This sidesteps cfgload's disk=FOLDER=/dev/CE_STORAGE path, which is a dual-boot
-# mechanism designed for CoreELEC storage living inside Android's userdata — not
-# applicable to a standalone install. The correct fix is recompiling cfgload with
-# mkimage to use disk=LABEL=CE_STORAGE, but that requires mkimage and adds
-# complexity. This hook achieves the same result without touching cfgload.
-log "Installing mount-storage.sh hook..."
-if ! $DRY_RUN; then
-    cat > "${MNT_FLASH}/mount-storage.sh" << 'EOF'
-mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
-EOF
+# Rebuild cfgload for a standalone install.
+#
+# CoreELEC's stock cfgload contains a dual-boot path used by ceemmc: when
+# ce_on_emmc=yes it sets disk=FOLDER=/dev/CE_STORAGE, which expects
+# CoreELEC storage to live as a coreelec_storage/ subfolder inside
+# Android's userdata. For a standalone install we want
+# disk=LABEL=CE_STORAGE — the partition root, resolved by label.
+#
+# cfgload is a U-Boot mkimage script container with CRC32 fields in its
+# header. Editing it with sed corrupts the CRC and U-Boot silently
+# rejects the result, so we rebuild the container with correct CRCs
+# after the substitution. mkimage is not installed on CoreELEC, so the
+# rebuild is done in Python (the script-image format is short enough to
+# pack/unpack with `struct` and `zlib.crc32`).
+log "Rebuilding cfgload for standalone install..."
+if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY-RUN]${NC} rebuild ${MNT_FLASH}/cfgload (FOLDER=/dev/CE_STORAGE → LABEL=CE_STORAGE)"
 else
-    echo -e "${YELLOW}[DRY-RUN]${NC} write ${MNT_FLASH}/mount-storage.sh"
-fi
+    python3 - "${MNT_FLASH}/cfgload" << 'PYEOF'
+import struct
+import sys
+import time
+import zlib
 
-# Add nofsck to config.ini.
-# With cfgload unmodified, the kernel cmdline still contains
-# disk=FOLDER=/dev/CE_STORAGE. The initrd adds /dev/CE_STORAGE to its fsck
-# list, then retries 20 times at 0.5s each when the device node never appears.
-# nofsck skips this entirely.
-log "Updating config.ini (adding nofsck)..."
-if ! $DRY_RUN; then
-    if grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
-        if ! grep -q "nofsck" "${MNT_FLASH}/config.ini"; then
-            sed -i "s/coreelec='\(.*\)'/coreelec='\1 nofsck'/" "${MNT_FLASH}/config.ini"
-        fi
-    else
-        echo "coreelec='quiet nofsck'" >> "${MNT_FLASH}/config.ini"
-    fi
-else
-    echo -e "${YELLOW}[DRY-RUN]${NC} update ${MNT_FLASH}/config.ini — add nofsck"
+MKIMAGE_MAGIC = 0x27051956
+IH_ARCH_ARM64 = 22
+IH_TYPE_SCRIPT = 6
+HDR_FMT = ">IIIIIIIBBBB"  # 7×u32 + 4×u8 = 32 bytes
+HDR_SIZE = 64             # legacy_img_hdr including 32-byte name field
+SUBHDR_FMT = ">II"        # [script_size][0_terminator]
+
+OLD = b"disk=FOLDER=/dev/CE_STORAGE"
+NEW = b"disk=LABEL=CE_STORAGE"
+
+path = sys.argv[1]
+
+def die(msg):
+    print(f"rebuild_cfgload: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+with open(path, "rb") as f:
+    data = f.read()
+
+if len(data) < HDR_SIZE + 8:
+    die(f"{path}: too small to be a mkimage script")
+
+magic, _hcrc, _time, dsize, load, ep, _dcrc, osv, arch, typ, comp = \
+    struct.unpack(HDR_FMT, data[:32])
+name = data[32:64]
+
+if magic != MKIMAGE_MAGIC:
+    die(f"{path}: bad magic 0x{magic:08x}")
+if typ != IH_TYPE_SCRIPT:
+    die(f"{path}: not a script image (type={typ})")
+if arch != IH_ARCH_ARM64:
+    die(f"{path}: not an arm64 image (arch={arch})")
+if len(data) < HDR_SIZE + dsize:
+    die(f"{path}: truncated payload")
+
+payload = data[HDR_SIZE:HDR_SIZE + dsize]
+script_size, terminator = struct.unpack(SUBHDR_FMT, payload[:8])
+if terminator != 0:
+    die(f"{path}: expected single-script terminator, got 0x{terminator:08x}")
+if len(payload) < 8 + script_size:
+    die(f"{path}: script body truncated")
+
+script = payload[8:8 + script_size]
+if OLD not in script:
+    print(f"rebuild_cfgload: {OLD.decode()!r} not present — already patched",
+          file=sys.stderr)
+    sys.exit(0)
+
+new_script = script.replace(OLD, NEW)
+new_size = len(new_script)
+new_payload = struct.pack(SUBHDR_FMT, new_size, 0) + new_script
+new_dsize = len(new_payload)
+new_dcrc = zlib.crc32(new_payload)
+now = int(time.time())
+
+def build_header(hcrc):
+    return struct.pack(
+        HDR_FMT,
+        MKIMAGE_MAGIC, hcrc, now, new_dsize,
+        load, ep, new_dcrc, osv, arch, typ, comp,
+    ) + name
+
+hcrc = zlib.crc32(build_header(0))
+with open(path, "wb") as f:
+    f.write(build_header(hcrc) + new_payload)
+
+print(f"rebuild_cfgload: {path}: {len(data)} → {HDR_SIZE + new_dsize} bytes "
+      f"(script {script_size} → {new_size})", file=sys.stderr)
+PYEOF
 fi
 
 run umount "$MNT_FLASH"
