@@ -13,3 +13,4 @@ captures/*.pcapng
 __pycache__/
 *.pyc
 khadas-mac/
+aml-analysis/

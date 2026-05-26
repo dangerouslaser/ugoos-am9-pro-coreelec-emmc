@@ -257,6 +257,67 @@ Observations from a brief survey of the open-source tools:
   (possibly encrypted/CRC'd in a way our V2 parser doesn't handle) —
   this is the per-device burn script Ugoos ships.
 
+### Where the blob transformation lives (Option B static analysis)
+
+Mounted the Windows VM disk on ollie and pulled out the installed
+`USB_Burning_Tool V3` binaries for analysis. The complete picture:
+
+```
+Aml_Burn_Tool.exe         — GUI front-end
+AmlImageCheck.dll         — sanity-checks .img validity
+AmlDevManage.dll          — Windows USB driver enumeration
+
+aml_usb_flow.dll          — loads & DECRYPTS usb_flow.aml (AES; Rijndael
+                            Sbox at offset 0xa229-0xa338; key derivation
+                            in lua_item_decrypt_and_load)
+libaulextend.dll          — Lua VM + bindings:
+                              l_aml_fastboot.cpp
+                              l_aml_libusb.cpp
+                              l_image_packer.cpp
+AmlImagePack.dll          — parses outer .img container (read-only;
+                            does NOT transform blob bytes)
+libamlfastboot.dll        — protocol layer: download:HHHHHHHH +
+                            sparse_file_* + fb_bl2_boot + fb_mwrite_data
+libamllibusb.dll / libusb0.dll — USB transport
+
+usb_flow.aml              — AML_RES container with 12 AES-ENCRYPTED
+                            Lua items; this is where the actual burn
+                            sequence + blob preprocessing lives
+key_flow.aml              — companion AES-encrypted Lua container for
+                            keystore operations
+```
+
+So the blob transformation (zeroing the @AML at 0x110, stripping the
+0xC00 padding at 0x400) is implemented in **encrypted Lua scripts**,
+not C code. To decode it we would need:
+
+1. Reverse-engineer `lua_item_decrypt_and_load` in aml_usb_flow.dll
+   (Ghidra job — find the AES key derivation)
+2. Decrypt the 12 items in usb_flow.aml
+3. Unluac/luadec the resulting Lua bytecode (Lua 5.3 per the
+   `liblua53.so` reference in Khadas's tools)
+4. Parse the actual burn script and extract the transformation logic
+
+That's a substantial project — easily days of careful RE work — and
+would need to be redone every time Amlogic ships a new tool version
+(the keys and Lua bytecode change).
+
+### Pragmatic recommendation
+
+**Skip the encryption decode.** Take the empirical path: re-capture a
+Windows burn with `usbmon_max_pkt_size` raised on ollie, get the full
+272384 bytes of the actual upload, and diff against our DDR blob
+byte-for-byte to derive the transformation rule directly. This costs
+one more burn cycle (~10 min) but avoids days of RE work and gives us
+the same answer (probably "skip @AML duplicates and align to next
+0x1000 boundary"). Then build a small Layer-2 preprocessor in our
+Python code that applies the rule, fix the URB submission to one big
+URB (via libusb async API or usbfs ioctls), and we have a working
+burner.
+
+The encryption RE path is worth doing only if we want to track Amlogic
+SDK changes long-term or contribute the algorithm back to pyamlboot.
+
 The wire captures from this session (`captures/round{1,2,3,4}.pcap`) are
 saved for direct comparison against the working Windows pcap.
 
