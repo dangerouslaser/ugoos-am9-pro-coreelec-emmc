@@ -469,6 +469,100 @@ This means a full restore is always possible, but it requires a Windows PC, a US
 
 ---
 
+## USB Burn Mode (Amlogic DNL) — Protocol Findings
+
+Investigated whether the device's USB DNL (mask-ROM + BL2 + BL33 burn) protocol can be driven from Linux/macOS using public open-source tooling, as an alternative to the Windows-only USB Burning Tool. Findings below — all verified against a live device in burn mode.
+
+### Burn-mode entry, USB enumeration
+
+Hold the recessed reset button while plugging in USB-C OTG + power. Device enumerates as:
+
+```
+USB Vendor Name: "Amlogic Inc"
+idVendor:        0x1b8e
+idProduct:       0xc004           ← newer ADNL PID (older devices use 0xc003)
+USB Product:     "DNL"
+Serial:          801df76cc500321500000000
+```
+
+The serial here is the **USB DNL session serial** — not the same as `usid` (the device's per-unit serial stored in the AMLNORMAL keystore, which is `AM9PRO26010005693`).
+
+### Protocol type 6 — the S6 generation marker
+
+Both [Khadas's `adnl` v2.7.5](https://github.com/khadas/utils/tree/master/aml-flash-tool/tools/adnl) and [pyamlboot's `adnl.py`](https://github.com/superna9999/pyamlboot/blob/master/adnl.py) **reject the device** with two different error messages that turn out to be the same root cause:
+
+- Khadas adnl: `ERR[DNL]illegle device mode:06-00-00-16  FAILED`
+- pyamlboot:   `RuntimeError: Unexpected data in reply to "identify"` (from the `if msg[4] != 0x5` check in `send_cmd_identify`)
+
+The device's reply to `getvar:identify`:
+
+```
+OKAY........
+4f 4b 41 59 06 00 00 10 00 00 00 00
+^^^^^^^^^^^ "OKAY" header (standard ADNL ACK)
+            ^^ protocol type = 0x06 (S6 generation; pyamlboot/khadas expect 0x05 = S5)
+               ^^ minor version = 0
+                  ^^ reserved = 0
+                     ^^ stage = 0x10 = 16 = Stage.TPL (U-Boot already running!)
+```
+
+Both clients hardcode "ADNL protocol type 5" and refuse anything else. Our S6 device speaks **protocol type 6** — almost certainly "ADNL v2" or the next-generation variant. The reply layout is otherwise identical: same `OKAY` header, same byte positions, same `Stage` semantics.
+
+This is a **one-line patch** to pyamlboot:
+
+```python
+# pyamlboot adnl.py send_cmd_identify():
+- if msg[4] != 0x5:
++ if msg[4] not in (0x5, 0x6):
+      raise RuntimeError('Unexpected data in reply to "identify"')
+```
+
+### What the BL33/U-Boot fastboot surface actually exposes
+
+The device boots through BL1 → BL2 → BL33 (U-Boot) automatically when entering burn mode, and **U-Boot is what's running and answering the USB protocol**. Stage = TPL (16) from the identify reply confirms this.
+
+U-Boot's fastboot implementation in burn mode is heavily locked down:
+
+| Query | Result | Notes |
+|---|---|---|
+| `getvar:identify` | OK | Returns protocol+stage as above |
+| `getvar:serialno` | OK | `801df76cc500321500000000` |
+| `getvar:product` | OK | `amlogic` |
+| `getvar:slot-count` | OK | `2` (A/B slots) |
+| `getvar:version` | OK | `0.1` (fastboot protocol version) |
+| `getvar:chipinfo` / `chipinfo-1` | FAIL | "Variable not implemented" |
+| `getvar:soc_family`, `getvar:feat`, `getvar:cbw`, `getvar:downloadsize`, `getvar:current-slot`, `getvar:max-download-size`, `getvar:variant`, `getvar:secure`, `getvar:unlocked` | FAIL | All "Variable not implemented" |
+| `getvar:partition-type:*`, `getvar:partition-size:*` | FAIL | All "Variable not implemented" (partition table not enumerable via fastboot!) |
+| `getvar:all` | INFO | Returns only `version:0.1` |
+
+The `oem` command channel is gated by a **secure-boot whitelist**, even though the bootloader is "unlocked" (`verifiedbootstate=orange`):
+
+| `oem` command | Result |
+|---|---|
+| `oem help` | OKAY (empty body) |
+| `oem version`, `oem ?`, `oem keyman ...`, `oem env ...`, `oem mac`, `oem serial`, `oem chipinfo` | `FAIL: 'cmd <name> not in secure boot white list'` |
+
+So **burn-mode fastboot is NOT a UART substitute**. The hope of running `keyman read mac` or `env print bootcmd` over USB to verify the AMLNORMAL keystore values from outside CoreELEC is blocked by the whitelist. UART or JTAG remain the only paths for live runtime introspection of the encrypted U-Boot's internal state.
+
+### Implications for Phase 2 (actual restore flow)
+
+A Linux/macOS USB-restore would need:
+
+1. **A one-line patch to pyamlboot** (or a fork) to accept protocol type 6.
+2. Probably patches to handle whatever S6 BURNSTEPS sequence the Windows USB Burning Tool sends (we have not characterized this — it's distinct from the protocol-type byte question).
+3. Acceptance that the flash is flying blind — the partition table is not enumerable via fastboot getvar.
+4. Recovery path on failure: Windows USB Burning Tool with the same `.img`.
+
+Whether this is worth doing depends on whether you want a fully Linux/macOS-native restore flow. For the common case ("go back to Android from CoreELEC") the existing `ce-emmc-restore.sh` already handles it without USB Burning Tool. USB Burning Tool is only needed for catastrophic recovery, and at that point the question is just "is it OK to boot Windows once" — the answer for most users is yes.
+
+### Where this stands
+
+- `am9pro-usb-restore.sh` Phase 1 (image+adnl+device verification) — **working**.
+- Phase 1.5 (`--probe-bl2`, load BL2 into SRAM) — **blocked** by Khadas adnl 2.7.5's rejection of mode 06. Script handles the rejection cleanly and prints the diagnostic.
+- Phase 2 (actual flash) — **not implemented**. Would require the pyamlboot patch above plus careful protocol work, and is gated by external tooling availability for the S6 family.
+
+---
+
 ## Boot-Time Scripts on CE_FLASH
 
 Three U-Boot-related files sit alongside `cfgload` on CE_FLASH. Documented here for completeness — only `cfgload` is on the live boot path; the other two are inactive on this install.

@@ -16,6 +16,11 @@
 #                      (default: looks for ./adnl, /tmp/khadas-tool/adnl-*,
 #                       or 'adnl' in $PATH)
 #   --keep-temp        Don't delete the temp dir created by image unpack
+#   --probe-bl2        Phase 1.5: after Phase 1, run adnl bl1_boot to load
+#                      BL2 into the device's SRAM, then re-query getvar
+#                      for real device identity (chipid, serialno, etc.).
+#                      Loads code into device RAM only — does NOT write
+#                      to eMMC. Recoverable by power-cycling the device.
 #   --unsafe-flash     RESERVED for Phase 2. Currently aborts with notice.
 #   --help             Show this help.
 #
@@ -56,6 +61,7 @@ header() { echo -e "\n${BOLD}── $* ──${NC}"; }
 IMG=""
 ADNL=""
 KEEP_TEMP=false
+PROBE_BL2=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --adnl)        ADNL="$2"; shift 2 ;;
         --adnl=*)      ADNL="${1#--adnl=}"; shift ;;
         --keep-temp)   KEEP_TEMP=true; shift ;;
+        --probe-bl2)   PROBE_BL2=true; shift ;;
         --unsafe-flash)
             die "Phase 2 (--unsafe-flash) is not yet implemented. Run without --unsafe-flash for Phase 1 verification."
             ;;
@@ -243,6 +250,96 @@ else
             echo "$result" | head -1
         fi
     done
+fi
+
+# ── Phase 1.5: load BL2 into SRAM and re-query ────────────────────────
+
+if $PROBE_BL2; then
+    if [[ -z "$DEVICES_LIST" ]]; then
+        die "--probe-bl2 requires a device in burn mode (none detected above)."
+    fi
+    if [[ -z "$BOOTLOADER" || ! -e "$BOOTLOADER" ]]; then
+        die "--probe-bl2 requires the bootloader item from the image (not found)."
+    fi
+
+    header "Phase 1.5: load BL2 into device SRAM"
+    cat <<EOF
+About to run:  $ADNL bl1_boot -f <bootloader>
+
+This downloads the BL2 stage from the firmware image into the device's
+SRAM and starts it executing. BL2 will initialize DDR and wait for
+further commands (i.e. it does NOT auto-continue to load BL33 in DNL
+mode — that requires a separate ${BOLD}bl2_boot${NC} call which this script does
+NOT make).
+
+No bytes are written to eMMC. To return the device to its previous
+state, just unplug power and plug back in without holding reset.
+
+Bootloader item: $BOOTLOADER
+@AMLBOOT board:  $(python3 "$AML_BOOT_TOOL" info "$BOOTLOADER" 2>/dev/null | awk -F"'" '/board:/{print $2}')
+
+EOF
+    log "Running bl1_boot..."
+    if ! "$ADNL" bl1_boot -f "$BOOTLOADER" 2>&1 | sed 's/^/  /'; then
+        warn "bl1_boot returned non-zero. Device may be in an unexpected state."
+        warn "Power-cycle the device (unplug, plug back in WITHOUT holding reset) to recover."
+        exit 1
+    fi
+
+    # The device usually re-enumerates after bl1_boot. Wait for it to
+    # come back up, with a short timeout.
+    log "Waiting for device to re-enumerate after bl1_boot..."
+    POST_DEVICES=""
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        DEV_OUT=$("$ADNL" devices 2>&1 \
+                  | grep -v "DNL protocol tool" \
+                  | grep -v "^$" \
+                  || true)
+        if [[ -n "$DEV_OUT" ]]; then
+            POST_DEVICES="$DEV_OUT"
+            log "Device re-enumerated after ${i}s"
+            break
+        fi
+    done
+
+    if [[ -z "$POST_DEVICES" ]]; then
+        warn "Device did not re-enumerate within 10 seconds."
+        warn "Either bl1_boot transitioned the device past DNL into something else,"
+        warn "or the device hung. Power-cycle to recover."
+        exit 1
+    fi
+
+    log "Device(s) now:"
+    echo "$POST_DEVICES" | sed 's/^/  /'
+
+    header "Querying device state in BL2 stage"
+    # Now that BL2 is running, getvar should return real device info.
+    # Try every variable the protocol documents, plus a few Amlogic-
+    # specific ones.
+    for var in identify chipid chipinfo chipinfo-1 serialno chip_id \
+               version downloadsize cbw rominfo socinfo board; do
+        printf "  %-15s → " "getvar:$var"
+        result=$("$ADNL" getvar "$var" 2>&1 \
+                  | grep -v "DNL protocol tool" \
+                  | grep -v "^$" \
+                  || true)
+        if [[ -z "$result" ]]; then
+            echo "(empty / not supported)"
+        else
+            # Show first useful line, indent any continuation
+            echo "$result" | head -3 | sed '2,$s/^/                    /'
+        fi
+    done
+
+    cat <<EOF
+
+${BOLD}Phase 1.5 complete.${NC} BL2 is now running in the device's SRAM. To recover:
+  - Unplug the USB-C and the power.
+  - Plug power back in (without holding reset). The device boots
+    CoreELEC normally — nothing was written to eMMC.
+
+EOF
 fi
 
 # ── verdict ────────────────────────────────────────────────────────────
