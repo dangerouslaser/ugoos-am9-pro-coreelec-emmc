@@ -705,6 +705,54 @@ Combining all the findings, the obstacles to a Linux/macOS USB restore on the AM
 
 The minor patches fix problems 1-3 in isolation. Problems 4-5 are protocol incompatibilities — the S6 BURNSTEPS / `oem mwrite` either has different syntax or is gated by the "1sect" preamble (#6). **Reverse-engineering the "1sect" preamble and S6's actual write protocol is the unblock — and that requires capturing USB traffic from the Windows USB Burning Tool against a real device.**
 
+#### What about `aml_boot` (Rust)?
+
+[`platform-system-interface/aml_boot`](https://github.com/platform-system-interface/aml_boot) is a Rust-based reverse-engineered Amlogic boot tool. It uses **USB control transfers** (vendor request type `0xc0` IN / `0x40` OUT on endpoint 0), with request codes documented in their `src/protocol.rs`:
+
+```
+REQ_CHIP_GEN       = 0x12
+REQ_READ_MEM       = 0x02
+REQ_WRITE_MEM      = 0x01
+REQ_RUN            = 0x05
+REQ_ADNL_WRITE_MEM = 0x07
+REQ_ADNL_READ_MEM  = 0x09
+REQ_IDENTIFY_HOST  = 0x20
+REQ_CHIPINFO       = 0x40
+REQ_TPL_CMD        = 0x30
+REQ_BULK           = 0x34
+REQ_PASSWORD       = 0x35
+REQ_NOP            = 0x36
+```
+
+Tested every one against the AM9 Pro in burn mode — both TPL and ROM stages. **All eight returned EPIPE (USB STALL)**:
+
+```
+REQ_NOP            (0x36) → ERROR: USBError: [Errno 32] Pipe error
+REQ_IDENTIFY_HOST  (0x20) → ERROR: USBError: [Errno 32] Pipe error
+REQ_CHIP_GEN       (0x12) → ERROR: USBError: [Errno 32] Pipe error
+REQ_CHIPINFO       (0x40) → ERROR: USBError: [Errno 32] Pipe error
+REQ_READ_MEM       (0x02) → ERROR: USBError: [Errno 32] Pipe error
+REQ_ADNL_READ_MEM  (0x09) → ERROR: USBError: [Errno 32] Pipe error
+REQ_PASSWORD       (0x35) → ERROR: USBError: [Errno 32] Pipe error
+REQ_BULK           (0x34) → ERROR: USBError: [Errno 32] Pipe error
+```
+
+`aml_boot` targets the older "GX-CHIP" protocol (USB PID **`0xc003`**, product string `"GX-CHIP"`) used on S905X / S905X2 / S905X3 / S905D3. The protocol primitives are at the USB-control-transfer layer. **Our AM9 Pro device uses PID `0xc004` and reports product string `"DNL"`** — the newer ADNL protocol family, which lives entirely on bulk endpoints. The vendor-specific control-transfer requests aren't implemented on this chip's BootROM.
+
+`aml_boot`'s `proto-rev.md` does have well-documented chipinfo page structures for S905D3 — they match ours format-wise (CHIP / OPS_ / ROMV / INDX magics, family ID at offset 4, chip ID at offset 0x14). Only protocol primitives diverged across generations.
+
+#### State of the art across public tools
+
+| Tool | Protocol layer | SoCs covered | Works on AM9 Pro? |
+|---|---|---|---|
+| `aml_boot` (Rust) | Vendor control transfers (EP0, type 0xc0/0x40) | GX-CHIP (PID `0xc003`): S905X/X2/X3/D3 | ✗ All STALL |
+| Khadas `adnl` v2.7.5 | ADNL bulk endpoints | ADNL (PID `0xc004`): S4, T7 | ✗ Rejects mode 06 |
+| pyamlboot `adnl.py` | ADNL bulk endpoints | ADNL: S4 family (`0x37`) | ✗ Rejects mode 06 |
+| pyamlboot with patch | ADNL bulk endpoints | (Adds S6 ID `0x48` to enum) | ✗ `setvar:burnsteps` "unknow command" |
+| Windows USB Burning Tool | ADNL bulk endpoints (private) | Everything Amlogic ships | ✓ |
+
+So we have full source for the older protocol (`aml_boot`) and partial source for the older ADNL (`pyamlboot`), but **the S6 ADNL variant is a closed protocol not yet reverse-engineered publicly**.
+
 #### Concrete recommendation for anyone picking this up
 
 The path forward to make this work is **NOT** "keep poking at pyamlboot." It's:
@@ -713,11 +761,15 @@ The path forward to make this work is **NOT** "keep poking at pyamlboot." It's:
 2. Install the Amlogic USB Burning Tool v3 (or newer) — same one Ugoos ships.
 3. Install [USBPcap](https://desowin.org/usbpcap/) (Windows) or use Wireshark with USB capture.
 4. Capture an entire burn cycle of `AM9PRO_2.1.0.img` against a real AM9 Pro.
-5. The "1sect" preamble will be visible in the capture as the first non-enumeration packet.
+5. The "1sect" preamble will be visible in the capture as the first non-enumeration packet from host → device after USB configuration.
 6. The S6 BURNSTEPS / `oem mwrite` commands will be visible with their actual payload formats.
-7. Replicate in Python (extending pyamlboot or starting fresh).
+7. Replicate in Python (extending pyamlboot or starting fresh), specifically:
+   - Add SoC family ID `0x48` to pyamlboot's `SocFamily` enum
+   - Patch `send_cmd_identify` to accept `msg[4]==0x06` for S6
+   - Replace the `setvar:burnsteps`-based opening with whatever the Windows tool actually sends (the "1sect" packet)
+   - Verify `oem mwrite` works after the fresh BL33 is loaded via the new opening sequence
 
-Until that capture exists, **Linux/macOS USB restore on AM9 Pro is not achievable** with public tooling. The fastboot path is closed; the BURNSTEPS path is closed; there's no third option.
+Until that capture exists, **Linux/macOS USB restore on AM9 Pro is not achievable** with public tooling. The fastboot path is closed; the BURNSTEPS path is closed; the GX-CHIP vendor-control-transfer path is closed; there's no fourth option.
 
 #### What stayed working
 
