@@ -13,4 +13,9 @@ captures/*.pcapng
 __pycache__/
 *.pyc
 khadas-mac/
-aml-analysis/
+# Binary DLLs (Amlogic proprietary) and decrypted Lua (their copyright)
+# stay local. Our analysis scripts (the *.py inside) are committed.
+aml-analysis/*.dll
+aml-analysis/*.exe
+aml-analysis/*.aml
+aml-analysis/usb_flow_decrypted/

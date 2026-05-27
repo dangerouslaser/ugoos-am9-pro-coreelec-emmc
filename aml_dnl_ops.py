@@ -140,23 +140,33 @@ def load_ddr_firmware(dev: AmlogicDevice, ddr_blob: bytes,
     `ddr_size` is the bytes-after-header to download; 0x42800 matches the
     Windows tool for AM9 Pro on AM9PRO_2.x.y images.
     """
-    if len(ddr_blob) < ddr_size:
+    # Per the Lua flow we decrypted from usb_flow.aml::usb_flow_dnl.lua
+    # `romcode_flow`:
+    #
+    #   infData = read(4096 bytes)              -- 4 KB working buffer
+    #   firstsect(infData)                      -- device asks for N bytes,
+    #                                              we send first N from this
+    #   item.seek(4096)                         -- !!! SKIP TO 0x1000 !!!
+    #   bl2Size = getvar('downloadsize')
+    #   download(item.read(bl2Size))            -- sends bytes [0x1000:]
+    #
+    # The "transformation" we measured on the wire (0x1000-byte shift, zero
+    # padding stripped) is just this seek-and-skip — bytes [0x400..0x1000]
+    # are never uploaded. They're typically zero-padding inside the @AML
+    # outer header anyway, since the next signed sub-block is aligned at
+    # offset 0x1000.
+    SECT_BUF = 0x1000          # 4 KB working buffer the OEM tool uses
+    if len(ddr_blob) < SECT_BUF + ddr_size:
         raise AmlogicError(
-            f"DDR blob too short: need {ddr_size}, have {len(ddr_blob)}"
+            f"DDR blob too short: need {SECT_BUF + ddr_size}, "
+            f"have {len(ddr_blob)}"
         )
-    firstsect(dev, ddr_blob[:0x400])
-    # The Windows tool issues `getvar:downloadsize` between firstsect and
-    # the main download. We mirror that exactly even though we don't use
-    # the returned value.
+    firstsect(dev, ddr_blob[:SECT_BUF])
     try:
         dev.cmd("getvar:downloadsize", timeout_ms=2000)
     except AmlogicError:
         pass
-    # download:HHHHHHHH starts from offset 0 of the blob (NOT 0x400) —
-    # firstsect's 0x400 bytes apparently go into a separate buffer that
-    # the boot ROM validates, while the main download is the entire DDR
-    # init portion including the @AML header.
-    dev.download(ddr_blob[:ddr_size])
+    dev.download(ddr_blob[SECT_BUF : SECT_BUF + ddr_size])
 
 
 def reboot_to_romusb(dev: AmlogicDevice, *, timeout_s: float = 20.0,
