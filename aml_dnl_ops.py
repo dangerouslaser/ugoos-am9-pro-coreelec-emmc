@@ -243,10 +243,23 @@ def load_ddr_firmware(dev: AmlogicDevice, ddr_blob: bytes,
 # ── CBW-driven U-Boot load (spl → tpl) ───────────────────────────────────────
 
 def _aml_addsum(data: bytes) -> int:
-    """Per `aml_mod_util.lua::addsum` — sum of every byte, u32 wrap.
+    """Amlogic's addsum: sum of u32 little-endian words, mod 2^32.
 
-    Used as the checksum word that `bl2_boot` sends after each CBW round."""
-    return sum(data) & 0xFFFFFFFF
+    Verified empirically against a live S6 device by sending a known
+    16-byte buffer through `mwrite:verify=addsum` and trying candidate
+    algorithms until the device replied OKAY. The Lua name is
+    `aml_buf_addsum` (in libaulextend.dll).
+
+    For inputs not a multiple of 4 bytes the tail is implicitly padded
+    with zeros for the purposes of the sum (we just pad in Python).
+    """
+    pad = (-len(data)) & 3
+    if pad:
+        data = bytes(data) + b"\x00" * pad
+    total = 0
+    for i in range(0, len(data), 4):
+        total += int.from_bytes(data[i:i + 4], "little")
+    return total & 0xFFFFFFFF
 
 
 def load_uboot_via_cbw(dev: AmlogicDevice, uboot_blob: bytes, *,
@@ -329,26 +342,34 @@ def flash_partition(dev: AmlogicDevice, part_name: str, blob: bytes, *,
                     media: str = "store",
                     file_fmt: str = "normal",
                     verify_cmd: Optional[str] = None,
-                    chunk_size: int = DEFAULT_CHUNK,
                     on_progress: Optional[Callable[[int, int], None]] = None
                     ) -> None:
-    """Port of `usb_flow_dnl.lua::tpl_flashOnePartition` for the `normal`
-    (non-sparse) case.
+    """Port of `usb_flow_dnl.lua::tpl_flashOnePartition` + the C-level
+    `fb_mwrite_data` (libamlfastboot.dll). Verified against the live S6.
 
-    Wire flow (per `libamlfastboot.dll::fb_mwrite_data` + the Lua):
+    Wire flow (two-phase, device-driven chunking):
 
         host → "oem mwrite SIZE_HEX normal store PARTNAME"
-        dev  → DATA<size>
-        host → <blob bytes in chunks>
-        dev  → OKAY ("mwrite finish")
-        (optional) host → verify_cmd via oem
-        dev  → OKAY
+        dev  → OKAY                       (transaction accepted)
+
+        loop:
+          host → "mwrite:verify=addsum"
+          dev  → "DATAOUT<chunk_size>:<offset>"   or   OKAY (= done)
+          if DATA:
+            host → <chunk_size bytes from blob[offset:offset+chunk_size]>
+            host → <4-byte addsum (u32 LE word sum)>
+            dev  → OKAY
+          else (OKAY):
+            break
+
+    After the loop, optionally run `oem <verify_cmd>` (typically
+    `verify sha1sum HEX`).
 
     Args:
         media: 'store' (eMMC), 'mem' (DRAM only), or 'key' (RPMB).
         file_fmt: 'normal' or 'sparse'. Only 'normal' supported here for now.
         verify_cmd: e.g. "verify sha1sum HEX...". If provided, `oem` is
-            prepended automatically.
+            prepended automatically. Leave as None to skip post-write verify.
     """
     if file_fmt == "sparse":
         raise NotImplementedError("sparse upload not yet ported")
@@ -358,43 +379,55 @@ def flash_partition(dev: AmlogicDevice, part_name: str, blob: bytes, *,
         raise ValueError(f"invalid media {media!r}")
 
     size = len(blob)
-    cmd = f"mwrite {size:#x} {file_fmt} {media} {part_name}"
-    # oem() handles the OKAY round-trip; for mwrite the device replies DATA
-    # not OKAY, so we use cmd() directly to capture the DATA.
-    dev._write(f"oem {cmd}".encode("ascii"))  # noqa: SLF001
-    status, body, ack = dev._read_response(timeout_ms=30_000)  # noqa: SLF001
-    if status != "DATA":
-        raise AmlogicError(
-            f"oem mwrite {part_name}: expected DATA, got {status} {body!r}"
-        )
-    expected = ack.size
-    if expected != size:
-        raise AmlogicError(
-            f"oem mwrite {part_name}: device wants {expected:#x} bytes, host has {size:#x}"
-        )
 
-    # Stream the payload in chunk_size pieces; this mirrors fb_mwrite_data's
-    # behavior. The cumulative addsum could be SetVar'd between chunks but
-    # for `normal` partitions the post-write verify is via `oem verify
-    # sha1sum`, not the running addsum.
-    offset = 0
-    while offset < size:
-        this = min(chunk_size, size - offset)
-        dev._write(blob[offset: offset + this])  # noqa: SLF001
-        offset += this
-        if on_progress:
-            on_progress(offset, size)
-
-    status, body, _ = dev._read_response(timeout_ms=30_000)  # noqa: SLF001
+    # Phase 1: announce the transaction.
+    dev._write(f"oem mwrite {size:#x} {file_fmt} {media} {part_name}".encode("ascii"))  # noqa: SLF001
+    status, body, _ = dev._read_response(timeout_ms=60_000)  # noqa: SLF001
     if status != "OKAY":
         raise AmlogicError(
-            f"oem mwrite {part_name}: expected OKAY after data, got {status} {body!r}"
+            f"oem mwrite {part_name}: expected OKAY, got {status} {body!r}"
         )
 
+    # Phase 2: device-chunked data loop. Each `mwrite:verify=addsum` either
+    # returns DATAOUT<chunk_size>:<offset> (more data needed) or OKAY (done).
+    bytes_sent = 0
+    while True:
+        dev._write(b"mwrite:verify=addsum")  # noqa: SLF001
+        status, body, ack = dev._read_response(timeout_ms=60_000)  # noqa: SLF001
+        if status == "OKAY":
+            break
+        if status != "DATA":
+            raise AmlogicError(
+                f"mwrite:verify=addsum: expected DATA or OKAY, got {status} {body!r}"
+            )
+        if not ack.is_download:
+            raise AmlogicError(
+                f"mwrite asked for upload (device→host) — not supported here"
+            )
+        chunk_size = ack.size
+        chunk_offset = ack.file_offset
+        if chunk_offset + chunk_size > size:
+            raise AmlogicError(
+                f"mwrite chunk out of range: offset={chunk_offset:#x} "
+                f"size={chunk_size:#x} blob_size={size:#x}"
+            )
+        chunk = blob[chunk_offset: chunk_offset + chunk_size]
+        addsum = _aml_addsum(chunk)
+        dev._write(chunk)  # noqa: SLF001
+        dev._write(addsum.to_bytes(4, "little"))  # noqa: SLF001
+        status, body, _ = dev._read_response(timeout_ms=60_000)  # noqa: SLF001
+        if status != "OKAY":
+            raise AmlogicError(
+                f"mwrite chunk @{chunk_offset:#x}: expected OKAY after data+addsum, "
+                f"got {status} {body!r}"
+            )
+        bytes_sent += chunk_size
+        if on_progress:
+            on_progress(bytes_sent, size)
+
     if verify_cmd:
-        # Pre-strip "oem " if caller included it.
         v = verify_cmd[4:] if verify_cmd.startswith("oem ") else verify_cmd
-        dev.oem(v)
+        dev.oem(v, timeout_ms=60_000)
 
 
 # ── identity / state helpers ─────────────────────────────────────────────────

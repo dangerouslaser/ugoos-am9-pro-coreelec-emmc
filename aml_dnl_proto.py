@@ -217,24 +217,34 @@ class AmlogicDevice:
     def _parse_data(body: bytes) -> DataAck:
         """Parse the payload after a `DATA` status prefix.
 
-        Three forms exist on the wire:
-          `<8 hex chars>`               — simple size, OUT direction
-          `OUT <hex> <hex>`             — explicit OUT, size + offset
-          `IN <hex> <hex>`              — device wants to UPLOAD to host
-
-        Numbers may or may not have a 0x prefix.
+        Wire forms observed:
+          `00042800`                    — simple 8-hex-char size (download)
+          `OUT 0x42800 0x1000`          — space-separated (some firmware)
+          `OUT0x14ff4:0x0`              — Amlogic mwrite — no space, `:` between size and offset
+          `IN0x100:0x200`               — same as OUT but device wants to upload
         """
         text = body.split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+        if not text:
+            raise AmlogicError(f"empty DATA payload: {body!r}")
+
         is_download = True
-        if text.startswith("OUT "):
-            text = text[4:]
-        elif text.startswith("IN "):
-            text = text[3:]
-            is_download = False
-        # Tokenise: tokens are whitespace-separated hex (with or without 0x).
+        # Strip OUT/IN prefix with or without trailing space.
+        for direction in ("OUT", "IN"):
+            if text.startswith(direction):
+                text = text[len(direction):]
+                if direction == "IN":
+                    is_download = False
+                if text.startswith(" "):
+                    text = text[1:]
+                break
+
+        # Normalise separators: ':' (mwrite form) and whitespace both delimit
+        # the size/offset fields.
+        for sep in (":",):
+            text = text.replace(sep, " ")
         tokens = [t for t in text.split() if t]
         if not tokens:
-            raise AmlogicError(f"empty DATA payload: {body!r}")
+            raise AmlogicError(f"empty DATA payload after parse: {body!r}")
 
         def _hex(t: str) -> int:
             t = t[2:] if t.lower().startswith("0x") else t
