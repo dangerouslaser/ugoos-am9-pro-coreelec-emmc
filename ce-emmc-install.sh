@@ -100,9 +100,22 @@ MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
 BACKUP_DIR="/storage"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-KEYSTORE_TOOL="${SCRIPT_DIR}/aml-keystore-tool.py"
-BOOTLOADER_TOOL="${SCRIPT_DIR}/aml-bootloader-tool.py"
-LOGO_TOOL="${SCRIPT_DIR}/aml-logo-tool.py"
+
+# Locate the aml-*-tool.py helpers. We accept either the legacy layout
+# (tools alongside this script — for /storage installs where the user
+# scp'd everything to one dir) or the repo layout (tools in img-tools/).
+find_aml_tool() {
+    local name="$1" candidate
+    for candidate in "${SCRIPT_DIR}/${name}" \
+                     "${SCRIPT_DIR}/img-tools/${name}" \
+                     "${SCRIPT_DIR}/../img-tools/${name}"; do
+        [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
+KEYSTORE_TOOL="$(find_aml_tool aml-keystore-tool.py)"   || KEYSTORE_TOOL=""
+BOOTLOADER_TOOL="$(find_aml_tool aml-bootloader-tool.py)" || BOOTLOADER_TOOL=""
+LOGO_TOOL="$(find_aml_tool aml-logo-tool.py)"           || LOGO_TOOL=""
 
 # ── Cleanup trap ──────────────────────────────────────────────────────────────
 

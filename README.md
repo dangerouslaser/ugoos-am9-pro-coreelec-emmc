@@ -211,38 +211,23 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 | `ce-emmc-install.sh` | CoreELEC eMMC installer |
 | `ce-emmc-restore.sh` | Android partition restore script |
 
-### Native Linux/macOS Amlogic burner (USB DNL path)
+### Shared libraries (at project root)
 
 | File | Description |
 |------|-------------|
-| `aml-dnl-burn.py` | CLI burner over USB DNL. Subcommands: `dry-run` (show flash plan), `ota-keep-ce` (update Android slot _a while preserving CE_FLASH/CE_STORAGE), `full-restore` (full USB-Burning-Tool-equivalent restore). Destructive operations gated by `--yes-i-mean-it`. Replaces the Windows-only Amlogic USB Burning Tool for the AM9 Pro. |
-| `aml-dnl-status.py` | Read-only DNL-mode status probe. Identifies device, dumps chipinfo pages, prints stage/mode. Safe to run any time the device is in burn mode. |
 | `aml_dnl_proto.py` | Layer 1 — USB transport + ADNL/DNL wire protocol (CBW, OUT/IN data acks, identify, getvar, oem, etc.). |
 | `aml_dnl_ops.py` | Layer 2 — partition flash, addsum verification, DDR firmware load, CBW-driven uboot upload. |
 | `aml_dnl_flows.py` | Layer 3 — composable flows (`plan_android_slot_a_update`, `plan_full_restore`, `execute_*`) built on Layers 1+2. |
+| `aml_img.py` | USB-free Amlogic `.img` parser (AML_PACK_v2 format) + Android sparse-image stream decoder. Shared by the host-side and in-device burners. Uses `mmap` so even a 1.6 GB OTA stays light on RAM. |
 | `am9pro-usb-restore.sh` | Bash wrapper that verifies a `.img`, sanity-checks the closed-source `adnl` binary if present, and (when device is in burn mode) confirms it identifies cleanly. Predates the native burner — kept for the closed-source verification path. **Read-only.** |
-
-### In-device eMMC flasher (no USB host needed)
-
-| File | Description |
-|------|-------------|
-| `aml-emmc-burn.py` | Runs **on the AM9 Pro itself** (under CoreELEC). Parses an AML `.img` with `aml_img.py` and writes Android-side partitions directly to `/dev/mmcblk0pN` — bootloader_a, boot_a, init_boot_a, vendor_boot_a, dtbo_a, vbmeta_a, super (Android sparse), logo, odm_ext_a. CE_FLASH/CE_STORAGE and the GPT are never touched. Modes: `--list`, `--verify-only` (read-only SHA1 check), `--dry-run`, `--ota` (full Android-side flash + reboot in one shot). The typical use case is "install a Ugoos OTA without leaving CE" — eMMC stays as a working CoreELEC install with a newer Android underneath. |
-| `aml_img.py` | USB-free Amlogic `.img` parser (AML_PACK_v2 format) + Android sparse-image stream decoder. Shared by `aml-dnl-burn.py` and `aml-emmc-burn.py`. Uses `mmap` so even a 1.6 GB OTA stays light on RAM. |
-
-### Amlogic file-format tools
-
-| File | Description |
-|------|-------------|
-| `aml-img-tool.py` | Inspect, unpack, and rebuild Amlogic USB Burning Tool `.img` archives (the format Ugoos ships for factory restores). Pure file-format tool — does not flash the device. Round-trip verified byte-identical against `AM9PRO_2.0.9.img`. |
-| `aml-logo-tool.py` | Unpack/repack the Amlogic AML_RES boot-logo container (p10). |
-| `aml-bootloader-tool.py` | Decode the `@AMLBOOT` manifest and unpack sections from `bootloader_a` (p7) — contents are encrypted at rest, so the unpacker yields encrypted blobs not directly disassemblable. |
-| `aml-keystore-tool.py` | Read the AMLNORMAL keystore from a `reserved` (p1) dump — dumps the header, lists every populated slot with name/attribute/type/value/hash, and extracts each slot's raw value to its own file. |
 
 ### Subdirectories
 
-| Path | Description |
-|------|-------------|
-| [`probes/`](probes/README.md) | One-off diagnostic & RE bring-up scripts used to map the ADNL protocol (DDR firmware load, firstsect, download, self-flash tests, capture analysis). Not user-facing; kept as reference. |
+| Path | What's in it |
+|------|--------------|
+| [`burn/`](burn/README.md) | The active flashers — `aml-dnl-burn.py` (USB DNL from a host), `aml-dnl-status.py` (read-only USB probe), and `aml-emmc-burn.py` (direct eMMC writes from inside CE). |
+| [`img-tools/`](img-tools/README.md) | Standalone file-format CLIs that operate on local files only: `aml-img-tool.py`, `aml-bootloader-tool.py`, `aml-keystore-tool.py`, `aml-logo-tool.py`. Used by `ce-emmc-install.sh` for identity / logo / bootloader inspection. |
+| [`probes/`](probes/README.md) | One-off diagnostic & RE bring-up scripts used to map the ADNL protocol. Not user-facing; kept as reference. |
 | [`scripts/`](scripts/README.md) | Small standalone utilities. Currently: `make-cfgload.py` (pure-Python `mkimage -T script` equivalent). |
 | [`docs/`](docs/) | Supporting reference documentation. |
 | [`aml-analysis/`](aml-analysis/README.md) | Reverse-engineering artifacts for the Windows `Aml_Burn_Tool.exe` + decryption of the embedded `usb_flow.aml` Lua scripts. |

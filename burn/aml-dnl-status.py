@@ -9,7 +9,7 @@ doing anything destructive.
 """
 import os, sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aml_dnl_proto import AmlogicDevice, AmlogicError, STAGE_BY_MODE
 from aml_dnl_ops import dump_chipinfo_pages
 

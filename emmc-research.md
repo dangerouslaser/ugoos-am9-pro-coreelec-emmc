@@ -366,7 +366,9 @@ The install script reads the stock cfgload from the SD card's `/flash`, performs
 
 The Python rebuilder is idempotent — running it on an already-patched cfgload prints "already patched" and exits 0. The output is byte-identical (modulo timestamp and header CRC) to what `mkimage -A arm64 -T script -O linux -C none -d <script> <out>` produces.
 
-With cfgload using `LABEL=CE_STORAGE`, the kernel cmdline gets `disk=LABEL=CE_STORAGE`, the initrd resolves the label via `blkid` to the actual partition device, and `mount_part` + `fsck` work the way they do for SD-card boots. No `mount-storage.sh` hook and no `nofsck` workaround required.
+With cfgload using `LABEL=CE_STORAGE`, the kernel cmdline gets `disk=LABEL=CE_STORAGE`, the initrd resolves the label via `blkid` to the actual partition device, and `mount_part` + `fsck` work the way they do for SD-card boots.
+
+**However**, this patch alone is not durable across CoreELEC's nightly auto-updates — see the [CE auto-update vs cfgload section](#ce-auto-update-vs-cfgload) below. The installer also installs `/flash/mount-storage.sh` and adds `nofsck` to `config.ini`'s `coreelec=` line, which together survive the updater and keep the device booting even when cfgload reverts to its stock form.
 
 ### Final working file layout on CE_FLASH (p28)
 
@@ -388,9 +390,13 @@ CE_FLASH/
     └── s6_s905x5_ugoos_am9_pro.dtb  (and all other DTBs)
 ```
 
-### Historical note: previous workarounds
+### CE auto-update vs cfgload
 
-The original install installed a `mount-storage.sh` hook (sourced by the initrd in place of `mount_part`) and added `nofsck` to `config.ini` to suppress a 10-second fsck retry loop caused by the missing `/dev/CE_STORAGE` device node. Both workarounds existed only because cfgload was left unmodified; they were superseded by the cfgload rebuild and are no longer produced by the install script.
+**Findings 2026-05-27:** CoreELEC's nightly self-updater unconditionally overwrites `/flash/cfgload` from its stock source (`/usr/share/bootloader/${DEVICE_CFGLOAD}`) on every update. The rebuild from the install step is reverted; the next eMMC boot fails because the stock cfgload sets `disk=FOLDER=/dev/CE_STORAGE` for `ce_on_emmc=yes` (a path intended for ceemmc dual-boot, which we don't have).
+
+An attempt at a `/flash/user-update.sh` post-update hook (also a CE-supported customization point) was tried and abandoned — the hook runs in the initramfs context where only `busybox`, `sh`, and `splash-image` are available, so a Python-based cfgload re-patcher crashed and bootlooped the device.
+
+The durable fix: the installer always installs `/flash/mount-storage.sh` (sourced by CE's `/init` `mount_storage()` in place of `mount_part`, so the broken `FOLDER=` cmdline never gets used) **and** adds `nofsck` to `coreelec=` in `config.ini` (suppresses the fsck retry loop against the bogus `/dev/CE_STORAGE` node). Both files are user-added and never touched by the updater. The cfgload rebuild becomes a clean-state nicety; the mount-storage.sh hook is what actually keeps the device booting across updates.
 
 ### Result
 

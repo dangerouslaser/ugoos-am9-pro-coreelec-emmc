@@ -541,6 +541,8 @@ supports, an open implementation needs:
 8. Acceptance that TPL is the entry state — `bl1_boot`/`bl2_boot` are
    not always needed; many flash operations work directly in TPL.
 
-Items 4-7 are implemented in the decrypted Lua and now ready to be
-ported to Python in this project (`aml_dnl_proto.py` and
-`aml_dnl_ops.py`). Items 1-3, 8 are insights to contribute upstream.
+Items 4-7 are now implemented in `aml_dnl_proto.py` + `aml_dnl_ops.py` —
+the full burner CLI lives at `burn/aml-dnl-burn.py` and has been verified
+end-to-end against a live AM9 Pro (1.6 GB full restore including sparse
+super, individual partition OTAs, and idempotent self-flashes). Items
+1-3, 8 are insights to contribute upstream.

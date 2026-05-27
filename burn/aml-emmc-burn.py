@@ -40,7 +40,7 @@ import stat
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aml_img import (
     AmlogicImage, ImgItem,
     is_sparse, unpack_sparse_size, iter_sparse_chunks,
