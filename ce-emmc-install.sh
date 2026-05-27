@@ -100,7 +100,7 @@ done
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 EMMC="/dev/mmcblk0"
-SD_FLASH="/flash"
+FLASH_DIR="/flash"
 
 # Supported boards — each entry is "<dtb-filename>|<friendly-name>". The
 # active /flash/dtb.img must md5-match one of these DTBs in
@@ -508,7 +508,7 @@ header "Preflight checks"
 [[ "$(id -u)" == "0" ]] || die "Must be run as root"
 
 # Board check — the active /flash/dtb.img must md5-match a supported DTB
-DTB_ACTIVE="${SD_FLASH}/dtb.img"
+DTB_ACTIVE="${FLASH_DIR}/dtb.img"
 [[ -f "$DTB_ACTIVE" ]] || die "Active dtb.img not found at $DTB_ACTIVE"
 HASH_ACTIVE=$(md5sum "$DTB_ACTIVE" | awk '{print $1}')
 
@@ -517,7 +517,7 @@ BOARD_DTB=""
 for entry in "${SUPPORTED_BOARDS[@]}"; do
     dtb_name="${entry%%|*}"
     friendly="${entry##*|}"
-    dtb_path="${SD_FLASH}/device_trees/${dtb_name}"
+    dtb_path="${FLASH_DIR}/device_trees/${dtb_name}"
     [[ -f "$dtb_path" ]] || continue
     if [[ "$(md5sum "$dtb_path" | awk '{print $1}')" == "$HASH_ACTIVE" ]]; then
         BOARD_NAME="$friendly"
@@ -730,8 +730,8 @@ header "Installing boot files"
 run mkdir -p "$MNT_FLASH"
 run mount "${EMMC}p28" "$MNT_FLASH"
 
-log "Copying files from ${SD_FLASH}..."
-run cp -a "${SD_FLASH}/." "${MNT_FLASH}/"
+log "Copying files from ${FLASH_DIR}..."
+run cp -a "${FLASH_DIR}/." "${MNT_FLASH}/"
 run rm -f "${MNT_FLASH}/fs-resize.log"
 
 if $REBUILD_CFGLOAD; then
