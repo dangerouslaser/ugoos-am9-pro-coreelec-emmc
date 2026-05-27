@@ -1,6 +1,7 @@
 #!/bin/bash
 # ce-emmc-restore.sh — Restore Android partition layout after CoreELEC eMMC install
-# Must be run from CoreELEC booted from SD card.
+# Must be run from CoreELEC booted off removable media (SD card or USB stick) —
+# anywhere except the eMMC itself, which we're about to repartition.
 # Requires backup files created by ce-emmc-install.sh in /storage.
 
 set -euo pipefail
@@ -146,12 +147,19 @@ header "Preflight checks"
 
 [[ "$(id -u)" == "0" ]] || die "Must be run as root"
 
-# Must be booting from SD card
+# /flash must NOT be on the eMMC we're about to repartition. SD card
+# (mmcblk1) and USB stick (sd*) are both fine.
 FLASH_SOURCE=$(awk '$2 == "/flash" {print $1}' /proc/mounts 2>/dev/null || true)
-[[ "$FLASH_SOURCE" == *"mmcblk1"* ]] || \
-    die "Not booting from SD card — /flash is on '${FLASH_SOURCE:-unknown}'. Insert SD card and reboot."
+[[ -n "$FLASH_SOURCE" ]] || die "Could not determine /flash mount source"
+[[ "$FLASH_SOURCE" == *"mmcblk0"* ]] && \
+    die "Cannot restore while booted from eMMC — /flash is on '$FLASH_SOURCE'. Boot from SD card or USB and re-run."
 
-log "Boot source: SD card ($FLASH_SOURCE)"
+case "$FLASH_SOURCE" in
+    *mmcblk1*) BOOT_MEDIA="SD card" ;;
+    /dev/sd*)  BOOT_MEDIA="USB stick" ;;
+    *)         BOOT_MEDIA="removable media" ;;
+esac
+log "Boot source: ${BOOT_MEDIA} (${FLASH_SOURCE})"
 
 [[ -b "$EMMC" ]] || die "eMMC not found at $EMMC"
 log "eMMC: $EMMC present"
@@ -214,10 +222,10 @@ This will restore the original Android partition layout on ${EMMC}:
   super (p27) is untouched — Android system images are intact.
   Partitions p1–p26 are NOT touched.
 
-After restore, boot Android via USB Burning Tool or by removing the SD card.
+After restore, boot Android via USB Burning Tool or by removing the ${BOOT_MEDIA}.
 WARNING: All CoreELEC data on CE_STORAGE will be permanently lost."
 
-tui_confirm_destructive "Restore Android — Ugoos AM9 Pro" "$CONFIRM_MSG" \
+tui_confirm_destructive "Restore Android" "$CONFIRM_MSG" \
     || { echo "Aborted."; exit 0; }
 
 # ── Restore ───────────────────────────────────────────────────────────────────
@@ -278,10 +286,10 @@ fi
 echo ""
 echo -e "${GREEN}${BOLD}Android partition layout restored.${NC}"
 echo ""
-echo "  Remove the SD card and reboot to boot Android."
+echo "  Remove the ${BOOT_MEDIA} and reboot to boot Android."
 echo "  On first boot Android will reinitialize the userdata partition."
 echo ""
-echo "  To verify restore before rebooting, the SD card can be left in —"
-echo "  CoreELEC will boot from SD while Android waits on eMMC."
+echo "  To verify restore before rebooting, the ${BOOT_MEDIA} can be left in —"
+echo "  CoreELEC will boot from it while Android waits on eMMC."
 echo ""
 $DRY_RUN && warn "DRY-RUN complete — no changes were made"

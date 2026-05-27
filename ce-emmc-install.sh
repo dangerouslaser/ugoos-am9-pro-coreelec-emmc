@@ -1,8 +1,13 @@
 #!/bin/bash
-# ce-emmc-install.sh — CoreELEC eMMC installer for Ugoos AM9 Pro
+# ce-emmc-install.sh — CoreELEC eMMC installer for Ugoos S905X5 boxes
 #
-# Workaround until ceemmc adds support for s6_s905x5_ugoos_am9_pro.
-# Must be run from CoreELEC booted off an SD card.
+# Workaround until ceemmc adds support for Ugoos S905X5 boards.
+# Originally written for Ugoos AM9 Pro (s6_s905x5_ugoos_am9_pro); the
+# Ugoos SK4 (s6_s905x5_ugoos_sk4) is also accepted because it ships the
+# same Amlogic partition layout. Add new boards to SUPPORTED_BOARDS below.
+#
+# Must be run from CoreELEC booted off removable media (SD card or USB
+# stick) — anywhere except the eMMC itself, which we're about to repartition.
 #
 # What this does:
 #   1. Verifies device identity by cross-checking the running cmdline's
@@ -16,7 +21,7 @@
 #   4. Keeps super (p27) — Android system images intact for potential restore
 #   5. Deletes rsv (p28) and userdata (p29)
 #   6. Creates CE_FLASH (512 MB FAT32) at p28 and CE_STORAGE (remaining space ext4) at p29
-#   7. Copies all boot files from the SD card's /flash to CE_FLASH
+#   7. Copies all boot files from /flash (the running CE media) to CE_FLASH
 #   8. Rebuilds cfgload to use disk=LABEL=CE_STORAGE (replaces the dual-boot
 #      ceemmc disk=FOLDER=/dev/CE_STORAGE path with standalone label resolution).
 #      Pass --no-cfgload-rebuild to skip this step if a future cfgload format
@@ -96,6 +101,15 @@ done
 
 EMMC="/dev/mmcblk0"
 SD_FLASH="/flash"
+
+# Supported boards — each entry is "<dtb-filename>|<friendly-name>". The
+# active /flash/dtb.img must md5-match one of these DTBs in
+# /flash/device_trees/. To add a new Ugoos S905X5 board with the same
+# partition layout, drop another line here.
+SUPPORTED_BOARDS=(
+    "s6_s905x5_ugoos_am9_pro.dtb|Ugoos AM9 Pro"
+    "s6_s905x5_ugoos_sk4.dtb|Ugoos SK4"
+)
 MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
 BACKUP_DIR="/storage"
@@ -461,26 +475,50 @@ header "Preflight checks"
 
 [[ "$(id -u)" == "0" ]] || die "Must be run as root"
 
-# Board check — verify the AM9 Pro DTB exists and is the active DTB
-DTB_DEVICE="${SD_FLASH}/device_trees/s6_s905x5_ugoos_am9_pro.dtb"
+# Board check — the active /flash/dtb.img must md5-match a supported DTB
 DTB_ACTIVE="${SD_FLASH}/dtb.img"
+[[ -f "$DTB_ACTIVE" ]] || die "Active dtb.img not found at $DTB_ACTIVE"
+HASH_ACTIVE=$(md5sum "$DTB_ACTIVE" | awk '{print $1}')
 
-[[ -f "$DTB_DEVICE" ]] || \
-    die "AM9 Pro DTB not found at $DTB_DEVICE — is this a Ugoos AM9 Pro?"
+BOARD_NAME=""
+BOARD_DTB=""
+for entry in "${SUPPORTED_BOARDS[@]}"; do
+    dtb_name="${entry%%|*}"
+    friendly="${entry##*|}"
+    dtb_path="${SD_FLASH}/device_trees/${dtb_name}"
+    [[ -f "$dtb_path" ]] || continue
+    if [[ "$(md5sum "$dtb_path" | awk '{print $1}')" == "$HASH_ACTIVE" ]]; then
+        BOARD_NAME="$friendly"
+        BOARD_DTB="$dtb_name"
+        break
+    fi
+done
 
-HASH_DEVICE=$(md5sum "$DTB_DEVICE" | awk '{print $1}')
-HASH_ACTIVE=$(md5sum "$DTB_ACTIVE"  | awk '{print $1}')
-[[ "$HASH_DEVICE" == "$HASH_ACTIVE" ]] || \
-    die "Active dtb.img doesn't match the AM9 Pro DTB. Check your DTB selection in config.ini."
+if [[ -z "$BOARD_NAME" ]]; then
+    msg="Active dtb.img doesn't match any supported board. Supported DTBs:"
+    for entry in "${SUPPORTED_BOARDS[@]}"; do
+        msg+=$'\n  - '"${entry%%|*}  (${entry##*|})"
+    done
+    msg+=$'\n''Check your DTB selection in config.ini, or add the board to SUPPORTED_BOARDS.'
+    die "$msg"
+fi
 
-log "Board: Ugoos AM9 Pro (s6_s905x5_ugoos_am9_pro)"
+log "Board: ${BOARD_NAME} (${BOARD_DTB%.dtb})"
 
-# Must be booting from SD card
+# /flash must NOT be on the eMMC we're about to repartition. SD card
+# (mmcblk1) and USB stick (sd*) are both fine — the installer just rsyncs
+# /flash → eMMC CE_FLASH, so any boot source other than the destination works.
 FLASH_SOURCE=$(awk '$2 == "/flash" {print $1}' /proc/mounts 2>/dev/null || true)
-[[ "$FLASH_SOURCE" == *"mmcblk1"* ]] || \
-    die "Not booting from SD card — /flash is on '${FLASH_SOURCE:-unknown}'. Insert SD card and reboot."
+[[ -n "$FLASH_SOURCE" ]] || die "Could not determine /flash mount source"
+[[ "$FLASH_SOURCE" == *"mmcblk0"* ]] && \
+    die "Cannot install while booted from eMMC — /flash is on '$FLASH_SOURCE'. Boot from SD card or USB and re-run."
 
-log "Boot source: SD card ($FLASH_SOURCE)"
+case "$FLASH_SOURCE" in
+    *mmcblk1*) BOOT_MEDIA="SD card" ;;
+    /dev/sd*)  BOOT_MEDIA="USB stick" ;;
+    *)         BOOT_MEDIA="removable media" ;;
+esac
+log "Boot source: ${BOOT_MEDIA} (${FLASH_SOURCE})"
 
 [[ -b "$EMMC" ]] || die "eMMC not found at $EMMC"
 log "eMMC: $EMMC present"
@@ -544,7 +582,7 @@ if [[ "$RSV_HAS_DATA" -gt 0 ]]; then
 fi
 
 CONFIRM_MSG="\
-CoreELEC eMMC Installer — Ugoos AM9 Pro
+CoreELEC eMMC Installer — ${BOARD_NAME}
 
   KEEP    p27  super       ${SUPER_HUMAN}  (Android system — untouched)
 
@@ -560,7 +598,7 @@ boot0/boot1 are hardware write-protected and safe.
 Android restore requires Amlogic USB Burning Tool on Windows via the
 USB-C OTG port using the official Ugoos factory image."
 
-tui_confirm_destructive "CoreELEC eMMC Installer — Ugoos AM9 Pro" "$CONFIRM_MSG" \
+tui_confirm_destructive "CoreELEC eMMC Installer — ${BOARD_NAME}" "$CONFIRM_MSG" \
     || { echo "Aborted."; exit 0; }
 
 # ── Backups ───────────────────────────────────────────────────────────────────
@@ -864,7 +902,7 @@ echo -e "${GREEN}${BOLD}══════════════════�
 echo -e "${GREEN}${BOLD}  Installation complete!${NC}"
 echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════${NC}"
 echo ""
-echo "  Remove the SD card and reboot. The device will boot"
+echo "  Remove the ${BOOT_MEDIA} and reboot. The device will boot"
 echo "  CoreELEC from internal eMMC automatically."
 echo ""
 echo "  On first eMMC boot, SSH host keys are regenerated."
