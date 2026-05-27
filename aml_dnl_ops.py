@@ -24,78 +24,7 @@ from aml_dnl_proto import (
     AmlogicDevice, AmlogicError, CBW, VENDOR_ID, PRODUCT_IDS,
     STAGE_BY_MODE, DEFAULT_CHUNK,
 )
-
-
-# ── .img file format ─────────────────────────────────────────────────────────
-# Verified empirically against AM9PRO_2.0.9.img and 2.1.0.img; same layout as
-# the upstream `aml_image_v2_packer`. See `aml-img-tool.py` for the full
-# format docs.
-
-_IMG_MAGIC_V2 = 0x27B51956
-_ITEM_TABLE_OFFSET = 0x40
-_ITEM_DESC_SIZE = 0x240
-_ITEM_OFFSET_OFF = 0x10
-_ITEM_SIZE_OFF = 0x18
-_ITEM_TYPE_OFF = 0x20
-_ITEM_TYPE_LEN = 32
-_ITEM_NAME_OFF = 0x120
-_ITEM_NAME_LEN = 32
-_HDR_ITEM_NUM_OFF = 0x18
-
-
-@dataclass(frozen=True)
-class ImgItem:
-    index: int
-    type: str
-    name: str
-    offset: int
-    size: int
-
-
-class AmlogicImage:
-    """Mmap-style accessor for an Amlogic `.img` archive."""
-
-    def __init__(self, path: str):
-        with open(path, "rb") as f:
-            self._data = f.read()
-        magic = struct.unpack_from("<I", self._data, 0x08)[0]
-        if magic != _IMG_MAGIC_V2:
-            raise ValueError(f"{path}: not a v2 Amlogic image (magic={magic:#x})")
-        item_num = struct.unpack_from("<I", self._data, _HDR_ITEM_NUM_OFF)[0]
-        items = []
-        for i in range(item_num):
-            base = _ITEM_TABLE_OFFSET + i * _ITEM_DESC_SIZE
-            type_b = self._data[base + _ITEM_TYPE_OFF: base + _ITEM_TYPE_OFF + _ITEM_TYPE_LEN]
-            name_b = self._data[base + _ITEM_NAME_OFF: base + _ITEM_NAME_OFF + _ITEM_NAME_LEN]
-            offset = struct.unpack_from("<Q", self._data, base + _ITEM_OFFSET_OFF)[0]
-            size = struct.unpack_from("<Q", self._data, base + _ITEM_SIZE_OFF)[0]
-            items.append(ImgItem(
-                index=i,
-                type=type_b.rstrip(b"\x00").decode("ascii", "replace"),
-                name=name_b.rstrip(b"\x00").decode("ascii", "replace"),
-                offset=offset,
-                size=size,
-            ))
-        self.items = items
-        self.path = path
-
-    def find(self, name: str, item_type: Optional[str] = None) -> ImgItem:
-        for it in self.items:
-            if it.name == name and (item_type is None or it.type == item_type):
-                return it
-        raise KeyError(
-            f"item not found: name={name!r} type={item_type!r} in {self.path}"
-        )
-
-    def blob(self, name: str, item_type: Optional[str] = None) -> bytes:
-        it = self.find(name, item_type)
-        return self._data[it.offset: it.offset + it.size]
-
-    def read_at(self, item: ImgItem, offset: int, size: int) -> bytes:
-        """Read `size` bytes from item starting at `offset` within the item."""
-        if offset < 0 or offset + size > item.size:
-            raise ValueError(f"read out of range for item {item.name}")
-        return self._data[item.offset + offset: item.offset + offset + size]
+from aml_img import AmlogicImage, ImgItem  # noqa: F401 — re-exported for callers
 
 
 # ── burnstep encoding ────────────────────────────────────────────────────────
