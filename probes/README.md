@@ -5,7 +5,7 @@ USB protocol. They're not part of the user-facing burner workflow — kept here
 as reference for protocol exploration, debugging, or extending the burner.
 
 All probes import the burner libraries (`aml_dnl_proto`, `aml_dnl_ops`,
-`aml_dnl_flows`) from the project root.
+`aml_dnl_flows`) from `../lib/`.
 
 | Script | Purpose |
 |--------|---------|
@@ -21,10 +21,10 @@ All probes import the burner libraries (`aml_dnl_proto`, `aml_dnl_ops`,
 
 ## Adding a new probe
 
-Copy any existing probe as a template; the sys.path line resolves the project
-root for library imports:
+Copy any existing probe as a template; the sys.path line resolves the
+project's `lib/` directory for library imports:
 
 ```python
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'lib'))
 from aml_dnl_proto import AmlogicDevice, AmlogicError
 ```

@@ -2,8 +2,8 @@
 
 Standalone CLIs for inspecting and (where applicable) repacking Amlogic-specific
 file formats. None of these tools talk to a device — they all operate on local
-files. None of them depend on the `aml_dnl_*` or `aml_img` libraries in the
-project root.
+files. None of them depend on the `aml_dnl_*` or `aml_img` libraries in
+`lib/`.
 
 | Tool | Format / partition | What it does |
 |------|--------------------|--------------|

@@ -11,7 +11,7 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'lib'))
 from aml_dnl_proto import AmlogicDevice, AmlogicError
 from aml_dnl_flows import (
     plan_android_slot_a_update, plan_full_restore, execute_plan,

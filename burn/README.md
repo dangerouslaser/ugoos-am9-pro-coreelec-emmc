@@ -6,7 +6,7 @@
 | [`aml-dnl-status.py`](aml-dnl-status.py) | Host (device in DNL mode) | Read-only DNL probe: identifies device, dumps chipinfo pages, prints stage/mode. Safe to run any time the device is in burn mode. |
 | [`aml-emmc-burn.py`](aml-emmc-burn.py) | On the AM9 Pro under CoreELEC | In-device eMMC flasher. Parses an AML `.img` and writes Android-side partitions directly to `/dev/mmcblk0pN`, bypassing USB. CE_FLASH/CE_STORAGE and the GPT are never touched. Modes: `--list`, `--verify-only`, `--dry-run`, `--ota` (full Android-side flash + reboot in one shot). Use case: "install a Ugoos OTA from CoreELEC without leaving CE." |
 
-All three import the shared libraries (`aml_dnl_proto`, `aml_dnl_ops`, `aml_dnl_flows`, `aml_img`) from the project root via a `sys.path` adjustment.
+All three import the shared libraries (`aml_dnl_proto`, `aml_dnl_ops`, `aml_dnl_flows`, `aml_img`) from `../lib/` via a `sys.path` adjustment.
 
 ## Quick reference
 

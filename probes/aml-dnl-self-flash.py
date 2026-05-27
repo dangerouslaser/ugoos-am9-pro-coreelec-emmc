@@ -12,7 +12,7 @@ import hashlib
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'lib'))
 from aml_dnl_proto import AmlogicDevice, AmlogicError
 from aml_dnl_ops import flash_partition
 

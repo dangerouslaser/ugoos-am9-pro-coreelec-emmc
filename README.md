@@ -3,7 +3,7 @@
 This repo contains two related pieces of tooling for the Ugoos AM9 Pro (Amlogic S6 / S905X5):
 
 1. **CoreELEC eMMC installer** (`ce-emmc-install.sh` / `ce-emmc-restore.sh`) — installs CoreELEC to internal eMMC while `ceemmc` does not yet support this board, with a parallel restore script back to stock Android
-2. **A native Linux/macOS Amlogic burner** (`aml-dnl-burn.py` + the `aml_dnl_*` library trio) — a port of the relevant subset of the Windows-only Amlogic USB Burning Tool, sufficient to OTA-flash and full-restore the AM9 Pro from a `.img` file without booting Windows. Required only when restoring stock Android over the USB-C OTG port; the eMMC installer itself runs entirely on the device.
+2. **A native Linux/macOS Amlogic burner** (`burn/aml-dnl-burn.py` + the `lib/aml_dnl_*` library trio) — a port of the relevant subset of the Windows-only Amlogic USB Burning Tool, sufficient to OTA-flash and full-restore the AM9 Pro from a `.img` file without booting Windows. Required only when restoring stock Android over the USB-C OTG port; the eMMC installer itself runs entirely on the device.
 
 ---
 
@@ -11,7 +11,7 @@ This repo contains two related pieces of tooling for the Ugoos AM9 Pro (Amlogic 
 
 **This installation method is not supported by CoreELEC. Any support request, bug report, or forum post related to a CoreELEC install performed this way will be rejected, closed, or removed by the CoreELEC team. Do not ask for help on the CoreELEC forums if something goes wrong.**
 
-**Tested on one physical Ugoos AM9 Pro across CoreELEC nightlies from `22.0-Piers_nightly_20260514` through `22.0-Piers_nightly_20260527`, including survival across the auto-update path (see the cfgload-vs-mount-storage.sh discussion in the technical notes). A different hardware revision or a future firmware build may behave differently — the installer could fail or produce a non-booting eMMC, particularly if CoreELEC changes the cfgload script format the rebuild step depends on or restructures the `mount_storage` init function in a way that bypasses `/flash/mount-storage.sh`. The device cannot be permanently bricked from a software install: `boot0`/`boot1` are hardware write-protected, and the Amlogic USB Burning Tool (or the bundled `aml-dnl-burn.py`) can always restore stock Android over the USB-C OTG port. Per-device identity is preserved across the install too — the installer does not touch the `reserved` partition (p1) where the ETH MAC and serial are stored, and the WLAN/BT MAC lives in the Wi-Fi chip's OTP entirely independent of the eMMC. A bad install means an SD-card recovery cycle, not a dead device. See [`factory-investigation.md`](factory-investigation.md) and the [Per-Device Identity Provenance](emmc-research.md#per-device-identity-provenance) section in the research notes for the verified analysis.**
+**Tested on one physical Ugoos AM9 Pro across CoreELEC nightlies from `22.0-Piers_nightly_20260514` through `22.0-Piers_nightly_20260527`, including survival across the auto-update path (see the cfgload-vs-mount-storage.sh discussion in the technical notes). A different hardware revision or a future firmware build may behave differently — the installer could fail or produce a non-booting eMMC, particularly if CoreELEC changes the cfgload script format the rebuild step depends on or restructures the `mount_storage` init function in a way that bypasses `/flash/mount-storage.sh`. The device cannot be permanently bricked from a software install: `boot0`/`boot1` are hardware write-protected, and the Amlogic USB Burning Tool (or the bundled `aml-dnl-burn.py`) can always restore stock Android over the USB-C OTG port. Per-device identity is preserved across the install too — the installer does not touch the `reserved` partition (p1) where the ETH MAC and serial are stored, and the WLAN/BT MAC lives in the Wi-Fi chip's OTP entirely independent of the eMMC. A bad install means an SD-card recovery cycle, not a dead device. See [`factory-investigation.md`](research/factory-investigation.md) and the [Per-Device Identity Provenance](research/emmc-research.md#per-device-identity-provenance) section in the research notes for the verified analysis.**
 
 **This process removes Android userdata and the rsv partition. Android can be restored — see [Restoring Android](#restoring-android) below.**
 
@@ -32,7 +32,7 @@ The Ugoos AM9 Pro runs an Amlogic S905X5 (S6) SoC. CoreELEC supports the hardwar
 
 These scripts document what was done to get a working eMMC install on one specific unit. They are published as a technical reference, not a recommendation.
 
-See [`emmc-research.md`](emmc-research.md) for the full research notes.
+See [`emmc-research.md`](research/emmc-research.md) for the full research notes.
 
 ---
 
@@ -161,7 +161,7 @@ The AM9 Pro can be fully restored to stock Android using the Amlogic USB Burning
 
 The official firmware image (`AM9PRO_2.0.9.img`) was fully parsed and confirmed to contain all required partitions: `super` (1507 MB, LP metadata + Android system images), `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the SoC DTB. The image also includes the GPT table itself, so a full flash restores the original 29-partition Android layout exactly.
 
-**Important:** The factory image restores Android to the state Ugoos shipped it — which includes **Magisk pre-installed** (root access). The device ships with an unlocked bootloader and Magisk patched into `init_boot_a`. The device is certified at Widevine L3 only (no L1 attestation path with an unlocked bootloader). Per-device identity is preserved across the burn because the factory image does not include the `reserved` partition (p1) where the ETH MAC and serial are stored — USB Burning Tool leaves p1 alone. The WLAN/BT MAC lives in the Broadcom chip's OTP and is entirely independent of the eMMC. See [`factory-investigation.md`](factory-investigation.md) for the underlying analysis.
+**Important:** The factory image restores Android to the state Ugoos shipped it — which includes **Magisk pre-installed** (root access). The device ships with an unlocked bootloader and Magisk patched into `init_boot_a`. The device is certified at Widevine L3 only (no L1 attestation path with an unlocked bootloader). Per-device identity is preserved across the burn because the factory image does not include the `reserved` partition (p1) where the ETH MAC and serial are stored — USB Burning Tool leaves p1 alone. The WLAN/BT MAC lives in the Broadcom chip's OTP and is entirely independent of the eMMC. See [`factory-investigation.md`](research/factory-investigation.md) for the underlying analysis.
 
 ---
 
@@ -211,14 +211,10 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 | `ce-emmc-install.sh` | CoreELEC eMMC installer |
 | `ce-emmc-restore.sh` | Android partition restore script |
 
-### Shared libraries (at project root)
+### Root files
 
 | File | Description |
 |------|-------------|
-| `aml_dnl_proto.py` | Layer 1 — USB transport + ADNL/DNL wire protocol (CBW, OUT/IN data acks, identify, getvar, oem, etc.). |
-| `aml_dnl_ops.py` | Layer 2 — partition flash, addsum verification, DDR firmware load, CBW-driven uboot upload. |
-| `aml_dnl_flows.py` | Layer 3 — composable flows (`plan_android_slot_a_update`, `plan_full_restore`, `execute_*`) built on Layers 1+2. |
-| `aml_img.py` | USB-free Amlogic `.img` parser (AML_PACK_v2 format) + Android sparse-image stream decoder. Shared by the host-side and in-device burners. Uses `mmap` so even a 1.6 GB OTA stays light on RAM. |
 | `am9pro-usb-restore.sh` | Bash wrapper that verifies a `.img`, sanity-checks the closed-source `adnl` binary if present, and (when device is in burn mode) confirms it identifies cleanly. Predates the native burner — kept for the closed-source verification path. **Read-only.** |
 
 ### Subdirectories
@@ -227,15 +223,8 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 |------|--------------|
 | [`burn/`](burn/README.md) | The active flashers — `aml-dnl-burn.py` (USB DNL from a host), `aml-dnl-status.py` (read-only USB probe), and `aml-emmc-burn.py` (direct eMMC writes from inside CE). |
 | [`img-tools/`](img-tools/README.md) | Standalone file-format CLIs that operate on local files only: `aml-img-tool.py`, `aml-bootloader-tool.py`, `aml-keystore-tool.py`, `aml-logo-tool.py`. Used by `ce-emmc-install.sh` for identity / logo / bootloader inspection. |
+| [`lib/`](lib/) | Shared Python libraries imported by the burners and probes: `aml_dnl_proto.py` (Layer 1 USB transport + ADNL/DNL wire protocol), `aml_dnl_ops.py` (Layer 2 partition flash + addsum + DDR load + CBW uboot upload), `aml_dnl_flows.py` (Layer 3 composable plans), `aml_img.py` (USB-free AML_PACK_v2 parser + Android sparse decoder, mmap-backed). |
 | [`probes/`](probes/README.md) | One-off diagnostic & RE bring-up scripts used to map the ADNL protocol. Not user-facing; kept as reference. |
 | [`scripts/`](scripts/README.md) | Small standalone utilities. Currently: `make-cfgload.py` (pure-Python `mkimage -T script` equivalent). |
-| [`docs/`](docs/) | Supporting reference documentation. |
+| [`research/`](research/README.md) | Technical research notes and frozen evidence snapshots — `emmc-research.md`, `factory-investigation.md`, `dnl-protocol-from-capture.md`, and the AM9PRO_2.1.0 factory snapshot data. |
 | [`aml-analysis/`](aml-analysis/README.md) | Reverse-engineering artifacts for the Windows `Aml_Burn_Tool.exe` + decryption of the embedded `usb_flow.aml` Lua scripts. |
-
-### Documentation
-
-| File | Description |
-|------|-------------|
-| `emmc-research.md` | Full technical research notes |
-| `factory-investigation.md` | Pre-first-boot investigation into where MAC/serial actually live |
-| `dnl-protocol-from-capture.md` | Wire-protocol decoding notes for the ADNL/DNL protocol used by the native burner |

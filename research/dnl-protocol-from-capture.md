@@ -7,7 +7,7 @@ Captured on 2026-05-26 via VFIO passthrough of the host's Intel Raptor Lake
 XHCI controller into a Windows VM. 186,543 USB frames / 1.13 GB / 215 s. The
 raw `.pcapng` is gitignored (`captures/burn-2.1.0-windows-full.pcapng`); the
 analyzer is `analyze-burn-capture.py`; the full transcript is at
-`docs/burn-protocol-decoded.txt`.
+`burn-protocol-decoded.txt`.
 
 This supersedes the speculation in `emmc-research.md` about the DNL protocol
 being a custom binary format. **The protocol is text-mode fastboot with
