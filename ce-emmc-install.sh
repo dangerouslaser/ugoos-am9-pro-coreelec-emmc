@@ -903,19 +903,28 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
     run mkdir -p "$MNT_STORAGE"
     run mount -t ext4 -o rw,noatime "${EMMC}p29" "$MNT_STORAGE"
 
-    # Check available space before migrating
-    STORAGE_USED=$(du -sb /storage 2>/dev/null | awk '{print $1}')
-    CE_FREE=$(df -B1 "$MNT_STORAGE" 2>/dev/null | awk 'NR==2{print $4}')
-    if (( STORAGE_USED > CE_FREE )); then
-        warn "Not enough space: /storage uses $(( STORAGE_USED/1024/1024 )) MB, CE_STORAGE has $(( CE_FREE/1024/1024 )) MB free"
-        run umount "$MNT_STORAGE"
-        warn "Migration skipped — CE_STORAGE will be initialized fresh on first eMMC boot"
+    if $DRY_RUN; then
+        # In dry-run the partition isn't actually mounted, so the size/free
+        # comparison would be meaningless. Skip the slow `du -sb /storage`
+        # walk and just stub the rsync.
+        echo -e "${YELLOW}[DRY-RUN]${NC} would compare \$(du -sb /storage) to free space on CE_STORAGE"
+        echo -e "${YELLOW}[DRY-RUN]${NC} rsync -ax --info=progress2 /storage/ ${MNT_STORAGE}/"
+        echo -e "${YELLOW}[DRY-RUN]${NC} umount ${MNT_STORAGE}"
     else
-        log "Rsyncing /storage → CE_STORAGE (this may take a few minutes)..."
-        run rsync -ax --info=progress2 /storage/ "$MNT_STORAGE/"
+        # Check available space before migrating
+        STORAGE_USED=$(du -sb /storage 2>/dev/null | awk '{print $1}')
+        CE_FREE=$(df -B1 "$MNT_STORAGE" 2>/dev/null | awk 'NR==2{print $4}')
+        if (( STORAGE_USED > CE_FREE )); then
+            warn "Not enough space: /storage uses $(( STORAGE_USED/1024/1024 )) MB, CE_STORAGE has $(( CE_FREE/1024/1024 )) MB free"
+            umount "$MNT_STORAGE"
+            warn "Migration skipped — CE_STORAGE will be initialized fresh on first eMMC boot"
+        else
+            log "Rsyncing /storage → CE_STORAGE (this may take a few minutes)..."
+            rsync -ax --info=progress2 /storage/ "$MNT_STORAGE/"
 
-        run umount "$MNT_STORAGE"
-        log "Migration complete"
+            umount "$MNT_STORAGE"
+            log "Migration complete"
+        fi
     fi
 fi
 
