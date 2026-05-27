@@ -1,6 +1,9 @@
-# CoreELEC eMMC Installer — Ugoos AM9 Pro
+# Ugoos AM9 Pro research & tooling
 
-A manual installer for CoreELEC to the internal eMMC of the Ugoos AM9 Pro, documented here for reference while `ceemmc` does not yet support this board.
+This repo contains two related pieces of tooling for the Ugoos AM9 Pro (Amlogic S6 / S905X5):
+
+1. **CoreELEC eMMC installer** (`ce-emmc-install.sh` / `ce-emmc-restore.sh`) — installs CoreELEC to internal eMMC while `ceemmc` does not yet support this board, with a parallel restore script back to stock Android
+2. **A native Linux/macOS Amlogic burner** (`aml-dnl-burn.py` + the `aml_dnl_*` library trio) — a port of the relevant subset of the Windows-only Amlogic USB Burning Tool, sufficient to OTA-flash and full-restore the AM9 Pro from a `.img` file without booting Windows. Required only when restoring stock Android over the USB-C OTG port; the eMMC installer itself runs entirely on the device.
 
 ---
 
@@ -8,7 +11,7 @@ A manual installer for CoreELEC to the internal eMMC of the Ugoos AM9 Pro, docum
 
 **This installation method is not supported by CoreELEC. Any support request, bug report, or forum post related to a CoreELEC install performed this way will be rejected, closed, or removed by the CoreELEC team. Do not ask for help on the CoreELEC forums if something goes wrong.**
 
-**Tested on one physical Ugoos AM9 Pro across CoreELEC nightlies `22.0-Piers_nightly_20260514` and `22.0-Piers_nightly_20260525`. A different hardware revision or a future firmware build may behave differently — the installer could fail or produce a non-booting eMMC, particularly if CoreELEC changes the cfgload script format the rebuild step depends on. The device cannot be permanently bricked from a software install: `boot0`/`boot1` are hardware write-protected, and the Amlogic USB Burning Tool can always restore stock Android over the USB-C OTG port. Per-device identity is preserved across the install too — the installer does not touch the `reserved` partition (p1) where the ETH MAC and serial are stored, and the WLAN/BT MAC lives in the Wi-Fi chip's OTP entirely independent of the eMMC. A bad install means an SD-card recovery cycle, not a dead device. See [`factory-investigation.md`](factory-investigation.md) and the [Per-Device Identity Provenance](emmc-research.md#per-device-identity-provenance) section in the research notes for the verified analysis.**
+**Tested on one physical Ugoos AM9 Pro across CoreELEC nightlies from `22.0-Piers_nightly_20260514` through `22.0-Piers_nightly_20260527`, including survival across the auto-update path (see the cfgload-vs-mount-storage.sh discussion in the technical notes). A different hardware revision or a future firmware build may behave differently — the installer could fail or produce a non-booting eMMC, particularly if CoreELEC changes the cfgload script format the rebuild step depends on or restructures the `mount_storage` init function in a way that bypasses `/flash/mount-storage.sh`. The device cannot be permanently bricked from a software install: `boot0`/`boot1` are hardware write-protected, and the Amlogic USB Burning Tool (or the bundled `aml-dnl-burn.py`) can always restore stock Android over the USB-C OTG port. Per-device identity is preserved across the install too — the installer does not touch the `reserved` partition (p1) where the ETH MAC and serial are stored, and the WLAN/BT MAC lives in the Wi-Fi chip's OTP entirely independent of the eMMC. A bad install means an SD-card recovery cycle, not a dead device. See [`factory-investigation.md`](factory-investigation.md) and the [Per-Device Identity Provenance](emmc-research.md#per-device-identity-provenance) section in the research notes for the verified analysis.**
 
 **This process removes Android userdata and the rsv partition. Android can be restored — see [Restoring Android](#restoring-android) below.**
 
@@ -63,9 +66,10 @@ See [`emmc-research.md`](emmc-research.md) for the full research notes.
    - `CE_FLASH` (p28, 512 MB, FAT32) — CoreELEC boot partition
    - `CE_STORAGE` (p29, ~53.9 GB, ext4) — CoreELEC storage
 9. Copies all boot files from the SD card's `/flash` to `CE_FLASH`
-10. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes). Pass `--no-cfgload-rebuild` to install the legacy `mount-storage.sh` + `nofsck` workarounds instead, as a fallback if a future CoreELEC build ships a cfgload format the rebuild step doesn't understand.
-11. With `--restore-logo PATH`: writes a custom boot logo to `p10` (the AML_RES container). PATH can be either a packed `.bin` (validated against the `AML_RES!` magic) or a directory of `NN_name.bmp` files produced by `aml-logo-tool.py unpack`.
-12. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
+10. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes). Pass `--no-cfgload-rebuild` to skip this step.
+11. **Always installs `/flash/mount-storage.sh` + adds `nofsck` to `config.ini`** — these are the durable rescue layer. CoreELEC's nightly updater unconditionally overwrites `cfgload` from its stock source, reverting the step-10 patch on every update. `mount-storage.sh` is a first-class CE init hook (line ~635 of `/init` sources it instead of `mount_part`) that bypasses the broken `FOLDER=` mount path entirely; `nofsck` suppresses the retry loop the missing `/dev/CE_STORAGE` node would otherwise cause. Both files are user-added and never touched by the updater, so the device boots cleanly through every nightly update.
+12. With `--restore-logo PATH`: writes a custom boot logo to `p10` (the AML_RES container). PATH can be either a packed `.bin` (validated against the `AML_RES!` magic) or a directory of `NN_name.bmp` files produced by `aml-logo-tool.py unpack`.
+13. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
 
 The installer also supports **`--info`** — a read-only diagnostic mode that prints the partition layout, eMMC chip details, U-Boot env summary, AMLNORMAL keystore contents, bootloader build version, current install state (with warnings if legacy workarounds are present), and the cmdline-vs-keystore identity check result. No backups, no writes, safe to run any time. Useful before committing to an install.
 
@@ -173,11 +177,24 @@ The original install approach placed CE_FLASH at p27 (replacing `super`). The cu
 
 `cfgload` is a compiled U-Boot script in mkimage format with two CRC32 fields in its header (one over the header itself, one over the data). Editing it with a text editor or `sed` changes the content but leaves the old CRCs in place — U-Boot verifies them on load and silently rejects the script, failing without any obvious error.
 
-The installer reads the stock cfgload from the SD card, performs the `FOLDER=/dev/CE_STORAGE` → `LABEL=CE_STORAGE` substitution in the inner script body, then rebuilds the mkimage container with correct CRCs. It does this in Python because `mkimage` is not installed on CoreELEC — the legacy-script format is straightforward to pack with `struct` and `zlib.crc32`. The result is byte-identical (modulo timestamp and header CRC) to what `mkimage -A arm64 -T script -O linux -C none -d <script> <out>` produces.
+The installer reads the stock cfgload from the SD card, performs the `FOLDER=/dev/CE_STORAGE` → `LABEL=CE_STORAGE` substitution in the inner script body, then rebuilds the mkimage container with correct CRCs. It does this in Python because `mkimage` is not installed on CoreELEC — the legacy-script format is straightforward to pack with `struct` and `zlib.crc32`. The result is byte-identical (modulo timestamp and header CRC) to what `mkimage -A arm64 -T script -O linux -C none -d <script> <out>` produces. The same packing logic is exposed as a standalone utility in [`scripts/make-cfgload.py`](scripts/make-cfgload.py).
 
 The rebuild step is idempotent: running it on an already-patched cfgload is a no-op.
 
-This is the same change `ceemmc` would make if it supported this board — `LABEL=`-based mounting goes through the initrd's standard `mount_part` path, no hook scripts or `nofsck` workarounds required.
+### Why mount-storage.sh + nofsck is also installed
+
+The cfgload patch above is one half of the story. The other half: **CoreELEC's nightly updater overwrites `cfgload` on every update** — `/usr/share/bootloader/update.sh` unconditionally does `cp -p /usr/share/bootloader/${DEVICE_CFGLOAD} /flash/cfgload`, reverting the rebuild. Without a second layer of defense, every nightly update would break eMMC boot until the user manually re-ran the patch.
+
+CoreELEC's `/init` already supports a post-update hook at `/flash/user-update.sh`, which runs after `update_bootloader` returns and before `do_reboot`. An earlier version of this installer used that hook to re-apply the cfgload patch. **It does not work**: the hook runs in the initramfs context where only `busybox`, `sh`, and `splash-image` are present — Python isn't available, so the hook crashes immediately and the device bootloops.
+
+The working solution: install two CE-supported customization files that live on `/flash` as user files (never touched by the updater):
+
+- **`/flash/mount-storage.sh`** — sourced by `/init`'s `mount_storage()` function instead of the default `mount_part "$disk" "/storage"`. It runs `mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage`, completely bypassing the broken `disk=FOLDER=/dev/CE_STORAGE` value in `bootargs`.
+- **`nofsck` in `coreelec=` config.ini** — appended via `setenv bootargs`, suppresses CE's fsck retry loop on the bogus `/dev/CE_STORAGE` node.
+
+The result: even if (when) a future CE nightly reverts cfgload back to its stock `FOLDER=/dev/CE_STORAGE` form, `mount-storage.sh` rescues the mount and the device keeps booting. The cfgload patch becomes a nice-to-have rather than survival-critical.
+
+This is the same outcome `ceemmc` would produce natively if it supported this board — `LABEL=`-based mounting through the standard `mount_part` path with no hook scripts needed. We can't get there without upstream support, so we ship the hook + nofsck as a stable workaround.
 
 ### Brick risk
 
@@ -187,14 +204,46 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 
 ## Files
 
+### CoreELEC eMMC installer
+
 | File | Description |
 |------|-------------|
 | `ce-emmc-install.sh` | CoreELEC eMMC installer |
 | `ce-emmc-restore.sh` | Android partition restore script |
-| `aml-logo-tool.py` | Unpack/repack the Amlogic AML_RES boot-logo container (p10) |
-| `aml-bootloader-tool.py` | Decode the `@AMLBOOT` manifest and unpack sections from `bootloader_a` (p7) — contents are encrypted at rest, so the unpacker yields encrypted blobs not directly disassemblable |
-| `aml-keystore-tool.py` | Read the AMLNORMAL keystore from a `reserved` (p1) dump — dumps the header, lists every populated slot with name/attribute/type/value/hash, and extracts each slot's raw value to its own file |
-| `aml-img-tool.py` | Inspect, unpack, and rebuild Amlogic USB Burning Tool `.img` archives (the format Ugoos ships for factory restores). Pure file-format tool — does not flash the device. Round-trip verified byte-identical against `AM9PRO_2.0.9.img` |
-| `am9pro-usb-restore.sh` | Phase 1 wrapper: verifies a `.img`, confirms the closed-source `adnl` (Amlogic DNL protocol) binary works, and (when the device is in burn mode) confirms it identifies cleanly. **Read-only** — no device writes. Phase 2 (the actual restore flow using `adnl bl1_boot`/`bl2_boot`/`partition`) is not yet implemented. |
+
+### Native Linux/macOS Amlogic burner
+
+| File | Description |
+|------|-------------|
+| `aml-dnl-burn.py` | CLI burner. Subcommands: `dry-run` (show flash plan), `ota-keep-ce` (update Android slot _a while preserving CE_FLASH/CE_STORAGE), `full-restore` (full USB-Burning-Tool-equivalent restore). Destructive operations gated by `--yes-i-mean-it`. Replaces the Windows-only Amlogic USB Burning Tool for the AM9 Pro. |
+| `aml-dnl-status.py` | Read-only DNL-mode status probe. Identifies device, dumps chipinfo pages, prints stage/mode. Safe to run any time the device is in burn mode. |
+| `aml_dnl_proto.py` | Layer 1 — USB transport + ADNL/DNL wire protocol (CBW, OUT/IN data acks, identify, getvar, oem, etc.). |
+| `aml_dnl_ops.py` | Layer 2 — partition flash, addsum verification, DDR firmware load, CBW-driven uboot upload, AML image parsing. |
+| `aml_dnl_flows.py` | Layer 3 — composable flows (`plan_android_slot_a_update`, `plan_full_restore`, `execute_*`) built on Layers 1+2. |
+| `am9pro-usb-restore.sh` | Bash wrapper that verifies a `.img`, sanity-checks the closed-source `adnl` binary if present, and (when device is in burn mode) confirms it identifies cleanly. Predates the native burner — kept for the closed-source verification path. **Read-only.** |
+
+### Amlogic file-format tools
+
+| File | Description |
+|------|-------------|
+| `aml-img-tool.py` | Inspect, unpack, and rebuild Amlogic USB Burning Tool `.img` archives (the format Ugoos ships for factory restores). Pure file-format tool — does not flash the device. Round-trip verified byte-identical against `AM9PRO_2.0.9.img`. |
+| `aml-logo-tool.py` | Unpack/repack the Amlogic AML_RES boot-logo container (p10). |
+| `aml-bootloader-tool.py` | Decode the `@AMLBOOT` manifest and unpack sections from `bootloader_a` (p7) — contents are encrypted at rest, so the unpacker yields encrypted blobs not directly disassemblable. |
+| `aml-keystore-tool.py` | Read the AMLNORMAL keystore from a `reserved` (p1) dump — dumps the header, lists every populated slot with name/attribute/type/value/hash, and extracts each slot's raw value to its own file. |
+
+### Subdirectories
+
+| Path | Description |
+|------|-------------|
+| [`probes/`](probes/README.md) | One-off diagnostic & RE bring-up scripts used to map the ADNL protocol (DDR firmware load, firstsect, download, self-flash tests, capture analysis). Not user-facing; kept as reference. |
+| [`scripts/`](scripts/README.md) | Small standalone utilities. Currently: `make-cfgload.py` (pure-Python `mkimage -T script` equivalent). |
+| [`docs/`](docs/) | Supporting reference documentation. |
+| [`aml-analysis/`](aml-analysis/README.md) | Reverse-engineering artifacts for the Windows `Aml_Burn_Tool.exe` + decryption of the embedded `usb_flow.aml` Lua scripts. |
+
+### Documentation
+
+| File | Description |
+|------|-------------|
 | `emmc-research.md` | Full technical research notes |
 | `factory-investigation.md` | Pre-first-boot investigation into where MAC/serial actually live |
+| `dnl-protocol-from-capture.md` | Wire-protocol decoding notes for the ADNL/DNL protocol used by the native burner |

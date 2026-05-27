@@ -19,11 +19,17 @@
 #   7. Copies all boot files from the SD card's /flash to CE_FLASH
 #   8. Rebuilds cfgload to use disk=LABEL=CE_STORAGE (replaces the dual-boot
 #      ceemmc disk=FOLDER=/dev/CE_STORAGE path with standalone label resolution).
-#      Pass --no-cfgload-rebuild to install the legacy mount-storage.sh hook +
-#      nofsck workarounds instead, as a fallback if the rebuild step doesn't
-#      handle a future cfgload format.
-#   9. Optionally writes a custom boot logo to p10 (--restore-logo PATH)
-#  10. Optionally migrates your current /storage to CE_STORAGE
+#      Pass --no-cfgload-rebuild to skip this step if a future cfgload format
+#      breaks the rebuilder.
+#   9. Always installs /flash/mount-storage.sh + adds nofsck to config.ini.
+#      These are user files CE's updater never touches, so they survive nightly
+#      auto-updates. mount-storage.sh is a first-class CE init hook that
+#      bypasses the broken FOLDER= mount path; nofsck prevents the retry loop
+#      from the bogus /dev/CE_STORAGE node. This is the durable rescue layer:
+#      even if step 8's cfgload patch gets reverted by a CE update, the device
+#      keeps booting.
+#  10. Optionally writes a custom boot logo to p10 (--restore-logo PATH)
+#  11. Optionally migrates your current /storage to CE_STORAGE
 #
 # Flags:
 #   --info              Read-only diagnostic mode — print everything we know
@@ -65,10 +71,12 @@ Options:
   --dry-run                  Show all commands without executing destructive ops.
                              Non-destructive reads (parted print, blkid, dd reads)
                              still run.
-  --no-cfgload-rebuild       Skip the cfgload rebuild and install the legacy
-                             mount-storage.sh hook + nofsck workarounds instead.
-                             Use this if a future CoreELEC build ships a cfgload
-                             format the rebuild step doesn't understand.
+  --no-cfgload-rebuild       Skip the cfgload rebuild (mount-storage.sh +
+                             nofsck are always installed regardless — those
+                             are the durable rescue layer that survives CE
+                             auto-updates). Use this if a future CoreELEC
+                             build ships a cfgload format the rebuild step
+                             doesn't understand.
   --restore-logo PATH        Write a custom boot logo to p10 during install.
                              PATH is either a packed AML_RES .bin (must start
                              with the AML_RES! magic) or a directory of
@@ -363,12 +371,16 @@ do_info() {
             warn "CoreELEC IS installed (CE_FLASH at p${ce_flash_p} — old-style install, super was deleted)"
         fi
         if [[ -f /flash/mount-storage.sh ]]; then
-            warn "  Legacy mount-storage.sh hook present (workaround-style install)"
+            log "  mount-storage.sh hook present (auto-update rescue)"
+        else
+            warn "  mount-storage.sh hook missing — eMMC boot will break after next CE update"
         fi
         # Match nofsck only inside the actual coreelec='...' setting, not
         # within documentation comments that list it as a valid option.
         if grep -qE "^coreelec=['\"][^'\"]*nofsck" /flash/config.ini 2>/dev/null; then
-            warn "  nofsck present in coreelec= setting (workaround-style install)"
+            log "  nofsck present in coreelec= setting"
+        else
+            warn "  nofsck missing from coreelec= setting — fsck retry loop may occur"
         fi
         if [[ -f /flash/cfgload ]]; then
             local cfg_size
@@ -736,27 +748,38 @@ print(f"rebuild_cfgload: {path}: {len(data)} → {HDR_SIZE + new_dsize} bytes "
 PYEOF
 fi
 
-else  # REBUILD_CFGLOAD = false — install the legacy workarounds instead
+fi  # end REBUILD_CFGLOAD branch
 
-# Legacy fallback path: install mount-storage.sh hook + nofsck in config.ini.
-# Use this if a future CoreELEC build ships a cfgload format the Python
-# rebuilder doesn't understand. The cfgload stays in its stock dual-boot
-# state with disk=FOLDER=/dev/CE_STORAGE in the cmdline; the hook bypasses
-# the resulting broken mount path, and nofsck suppresses the 10-second
-# retry loop the missing /dev/CE_STORAGE node would otherwise cause.
-warn "Using legacy workaround path (--no-cfgload-rebuild): mount-storage.sh + nofsck"
-
-log "Installing mount-storage.sh hook..."
-if ! $DRY_RUN; then
+# Always install /flash/mount-storage.sh + nofsck in config.ini — these are the
+# durable rescue path that survives CoreELEC's nightly auto-updates.
+#
+# Background: CE's updater unconditionally overwrites cfgload from
+# /usr/share/bootloader/${DEVICE_CFGLOAD}, which uses
+# disk=FOLDER=/dev/CE_STORAGE (intended for ceemmc dual-boot installs).
+# Even when we patch cfgload during install, every auto-update reverts it.
+# An earlier attempt at a /flash/user-update.sh post-update hook failed
+# because the hook runs in the initramfs context where python3 isn't
+# present (only busybox + sh).
+#
+# mount-storage.sh is a first-class CE hook (init line ~635: `if [ -f
+# /flash/mount-storage.sh ]; then . /flash/mount-storage.sh; fi`) that
+# completely bypasses the broken FOLDER= mount path. nofsck prevents the
+# retry loop that would otherwise occur when init checks the bogus
+# /dev/CE_STORAGE node. Both files are user-added and never touched by
+# the CE updater, so the device boots cleanly after every nightly.
+log "Installing /flash/mount-storage.sh hook..."
+if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY-RUN]${NC} write ${MNT_FLASH}/mount-storage.sh"
+else
     cat > "${MNT_FLASH}/mount-storage.sh" << 'EOF'
 mount -t ext4 -o rw,noatime LABEL=CE_STORAGE /storage
 EOF
-else
-    echo -e "${YELLOW}[DRY-RUN]${NC} write ${MNT_FLASH}/mount-storage.sh"
 fi
 
-log "Updating config.ini (adding nofsck)..."
-if ! $DRY_RUN; then
+log "Adding nofsck to ${MNT_FLASH}/config.ini coreelec= line..."
+if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY-RUN]${NC} update ${MNT_FLASH}/config.ini — add nofsck"
+else
     if grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
         if ! grep -q "nofsck" "${MNT_FLASH}/config.ini"; then
             sed -i "s/coreelec='\(.*\)'/coreelec='\1 nofsck'/" "${MNT_FLASH}/config.ini"
@@ -764,11 +787,7 @@ if ! $DRY_RUN; then
     else
         echo "coreelec='quiet nofsck'" >> "${MNT_FLASH}/config.ini"
     fi
-else
-    echo -e "${YELLOW}[DRY-RUN]${NC} update ${MNT_FLASH}/config.ini — add nofsck"
 fi
-
-fi  # end REBUILD_CFGLOAD branch
 
 run umount "$MNT_FLASH"
 log "CE_FLASH ready"

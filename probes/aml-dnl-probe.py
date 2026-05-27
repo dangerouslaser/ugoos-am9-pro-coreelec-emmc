@@ -7,7 +7,7 @@ their replies. Safe — issues no writes, no boots, no stage transitions.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aml_dnl_proto import AmlogicDevice, AmlogicError
 
 

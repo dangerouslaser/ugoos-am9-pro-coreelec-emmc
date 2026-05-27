@@ -18,7 +18,7 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aml_dnl_proto import AmlogicDevice, AmlogicError, STATUS_OKAY, STATUS_DATA
 from aml_dnl_ops import reboot_to_romusb, AmlogicImage
 
