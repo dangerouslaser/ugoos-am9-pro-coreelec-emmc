@@ -898,6 +898,7 @@ MIGRATE_MSG="  The eMMC install is ready. CE_STORAGE is currently empty —
   addons, media metadata) to CE_STORAGE now."
 
 if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
+    log "Migration: user accepted prompt"
     header "Migrating /storage to CE_STORAGE"
 
     run mkdir -p "$MNT_STORAGE"
@@ -909,23 +910,77 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
         # walk and just stub the rsync.
         echo -e "${YELLOW}[DRY-RUN]${NC} would compare \$(du -sb /storage) to free space on CE_STORAGE"
         echo -e "${YELLOW}[DRY-RUN]${NC} rsync -ax --info=progress2 /storage/ ${MNT_STORAGE}/"
+        echo -e "${YELLOW}[DRY-RUN]${NC} would verify dest size matches source"
         echo -e "${YELLOW}[DRY-RUN]${NC} umount ${MNT_STORAGE}"
     else
-        # Check available space before migrating
+        # Source and free size — also logged so a transcript shows the
+        # space accounting that drove the migrate/skip decision.
         STORAGE_USED=$(du -sb /storage 2>/dev/null | awk '{print $1}')
+        STORAGE_FILES=$(find /storage -mindepth 1 2>/dev/null | wc -l)
         CE_FREE=$(df -B1 "$MNT_STORAGE" 2>/dev/null | awk 'NR==2{print $4}')
+        log "Source /storage:  $(( STORAGE_USED/1024/1024 )) MB across ${STORAGE_FILES} entries"
+        log "CE_STORAGE free:  $(( CE_FREE/1024/1024 )) MB"
+
         if (( STORAGE_USED > CE_FREE )); then
             warn "Not enough space: /storage uses $(( STORAGE_USED/1024/1024 )) MB, CE_STORAGE has $(( CE_FREE/1024/1024 )) MB free"
             umount "$MNT_STORAGE"
             warn "Migration skipped — CE_STORAGE will be initialized fresh on first eMMC boot"
         else
             log "Rsyncing /storage → CE_STORAGE (this may take a few minutes)..."
-            rsync -ax --info=progress2 /storage/ "$MNT_STORAGE/"
+            rsync_rc=0
+            rsync -ax --info=progress2 /storage/ "$MNT_STORAGE/" || rsync_rc=$?
+
+            # Verify what actually landed on disk before we unmount. Compare
+            # apparent size (du -sb is content-bytes, not block usage, so a
+            # clean rsync should produce a near-identical dest size) and
+            # entry count. A big shortfall means rsync silently dropped
+            # things — surface it loudly so the user can recover before
+            # rebooting.
+            DEST_USED=$(du -sb "$MNT_STORAGE" 2>/dev/null | awk '{print $1}')
+            DEST_FILES=$(find "$MNT_STORAGE" -mindepth 1 2>/dev/null | wc -l)
+            log "Migration result:"
+            log "  source: $(( STORAGE_USED/1024/1024 )) MB / ${STORAGE_FILES} entries"
+            log "  dest:   $(( DEST_USED/1024/1024 )) MB / ${DEST_FILES} entries"
+
+            verify_failed=false
+            if (( rsync_rc != 0 )); then
+                warn "rsync exited with status ${rsync_rc} — migration likely incomplete"
+                verify_failed=true
+            fi
+            if (( STORAGE_USED >= 1048576 )); then
+                # Source has >=1 MB of real data — sanity-check the copy.
+                # Allow a small (<5%) shortfall for things like lost+found
+                # on a fresh ext4 dest that doesn't exist on the source.
+                if (( DEST_USED * 100 < STORAGE_USED * 95 )); then
+                    warn "Dest is significantly smaller than source ($(( DEST_USED/1024/1024 )) MB vs $(( STORAGE_USED/1024/1024 )) MB)"
+                    verify_failed=true
+                fi
+                if (( DEST_FILES * 100 < STORAGE_FILES * 95 )); then
+                    warn "Dest has fewer entries than source (${DEST_FILES} vs ${STORAGE_FILES})"
+                    verify_failed=true
+                fi
+            elif (( STORAGE_USED > 0 )); then
+                log "Source was nearly empty ($(( STORAGE_USED/1024 )) KB) — no meaningful verification possible"
+            fi
 
             umount "$MNT_STORAGE"
-            log "Migration complete"
+
+            if $verify_failed; then
+                warn ""
+                warn "Migration verification FAILED. After install completes you can"
+                warn "recover by mounting your old boot media and rsyncing manually:"
+                warn "  mkdir -p /tmp/oldstorage"
+                warn "  mount -o ro <old-storage-device> /tmp/oldstorage"
+                warn "  systemctl stop kodi"
+                warn "  rsync -ax --delete /tmp/oldstorage/ /storage/"
+                warn "  reboot"
+            else
+                log "Migration verified"
+            fi
         fi
     fi
+else
+    log "Migration: skipped (user declined or dismissed prompt)"
 fi
 
 # ── Post-install partition layout ─────────────────────────────────────────────
