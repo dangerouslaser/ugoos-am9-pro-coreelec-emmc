@@ -14,7 +14,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from aml_dnl_proto import AmlogicDevice, AmlogicError
 from aml_dnl_flows import (
-    plan_android_slot_a_update, execute_plan, dry_run, AmlogicImage,
+    plan_android_slot_a_update, plan_full_restore, execute_plan,
+    execute_full_restore, dry_run, AmlogicImage,
 )
 
 
@@ -37,6 +38,10 @@ def cmd_ota_keep_ce(args):
         include_super=args.include_super,
         include_gpt=args.include_gpt,
         include_bootloader=not args.no_bootloader,
+        # We never call disk_initial in OTA, so we don't need DTB/GPT
+        # in mem — which is good because mem writes are blocked under
+        # secure boot when we're entered via TPL.
+        include_mem_loads=False,
     )
     print(f"prepared {len(plan)} writes from {args.img}")
     try:
@@ -70,6 +75,54 @@ def cmd_ota_keep_ce(args):
     return 0
 
 
+def cmd_full_restore(args):
+    img = AmlogicImage(args.img)
+    plan = plan_full_restore(img)
+    total = sum(s.size for s in plan)
+    print(f"FULL RESTORE plan from {args.img}")
+    print(f"  {len(plan)} writes, total payload: {total:,} bytes "
+          f"({total / 1024 / 1024:.1f} MiB)")
+    print(f"  + oem disk_initial {args.disk_initial} (erases CE_FLASH/CE_STORAGE)")
+    print(f"  + oem save_setting at end")
+    print()
+    for step in plan:
+        print(step)
+    print()
+    if not args.yes_i_mean_it:
+        print("refusing to flash without --yes-i-mean-it")
+        print("re-run with --yes-i-mean-it to actually execute")
+        return 0
+
+    try:
+        dev = AmlogicDevice.find()
+    except AmlogicError as e:
+        print(f"FAIL: {e}", file=sys.stderr); return 1
+    ident = dev.identify()
+    print(f"\nconnected: {dev.describe()}")
+    if ident.stage != "tpl":
+        print(f"ABORT: stage={ident.stage!r}", file=sys.stderr); dev.close(); return 3
+
+    last = {"name": "", "pct": -1}
+    def progress(name, sent, total):
+        pct = sent * 100 // total if total else 100
+        if name != last["name"] or pct - last["pct"] >= 5 or sent == total:
+            print(f"  {name:<18}  {sent:>11}/{total} ({pct:>3}%)")
+            last["name"], last["pct"] = name, pct
+
+    try:
+        execute_full_restore(dev, img, plan, on_progress=progress,
+                              disk_initial=args.disk_initial)
+    except AmlogicError as e:
+        print(f"\nFAIL during restore: {e}", file=sys.stderr); dev.close(); return 4
+
+    dev.close()
+    print("\n✓ FULL RESTORE complete.")
+    print("  Power-cycle the device to boot stock Android.")
+    print("  To return to CoreELEC: insert your CE SD card, hold reset, "
+          "plug in power, release after ~3s; then run ce-emmc-install.sh.")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="Amlogic S6 burner (Linux/Mac).")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -93,6 +146,17 @@ def main():
     po.add_argument("--yes-i-mean-it", action="store_true",
                     help="required — actually run the writes")
     po.set_defaults(func=cmd_ota_keep_ce)
+
+    pf = sub.add_parser("full-restore",
+                        help="Full USB-Burning-Tool-equivalent restore "
+                             "(includes super + disk_initial — erases CE!)")
+    pf.add_argument("img", help="path to AML_PACK .img file")
+    pf.add_argument("--disk-initial", type=int, default=1,
+                    dest="disk_initial",
+                    help="0=keep, 1=erase user (default), 2=erase incl keys")
+    pf.add_argument("--yes-i-mean-it", action="store_true",
+                    help="required — actually run the writes")
+    pf.set_defaults(func=cmd_full_restore)
 
     args = p.parse_args()
     sys.exit(args.func(args))

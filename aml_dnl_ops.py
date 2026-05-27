@@ -371,9 +371,12 @@ def flash_partition(dev: AmlogicDevice, part_name: str, blob: bytes, *,
         verify_cmd: e.g. "verify sha1sum HEX...". If provided, `oem` is
             prepended automatically. Leave as None to skip post-write verify.
     """
-    if file_fmt == "sparse":
-        raise NotImplementedError("sparse upload not yet ported")
-    if file_fmt != "normal":
+    # The host doesn't need to decode sparse format — Amlogic's bootloader
+    # does that itself when the `sparse` keyword is in the mwrite command.
+    # We just hand it the raw bytes from the .img and the device unpacks
+    # chunks while writing to the partition. Verified empirically: same
+    # CBW-driven addsum loop as `normal`, just with `sparse` in the cmd.
+    if file_fmt not in ("normal", "sparse"):
         raise ValueError(f"unknown file_fmt {file_fmt!r}")
     if media not in ("store", "mem", "key"):
         raise ValueError(f"invalid media {media!r}")

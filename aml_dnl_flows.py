@@ -71,14 +71,25 @@ class WriteStep:
 
 def _verify_cmd_for(img: AmlogicImage, partition_name: str,
                     main_type: str = "PARTITION") -> Optional[str]:
-    """Look up the matching VERIFY item and pull out its `sha1sum HEX` text."""
+    """Look up the matching VERIFY item and pull out its verify command.
+
+    The .img typically stores just `sha1sum HEX` (without the `verify`
+    prefix the bootloader needs). We add `verify ` if it's missing —
+    the bootloader's whitelist requires the full `verify sha1sum HEX`
+    invocation; sending bare `sha1sum HEX` fails with "cmd sha1sum not
+    in secure boot white list" on a secure-boot device.
+    """
     try:
         v = img.find(partition_name, item_type="VERIFY")
     except KeyError:
         return None
     blob = img._data[v.offset: v.offset + v.size]  # noqa: SLF001
     text = blob.split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
-    return text or None
+    if not text:
+        return None
+    if not text.startswith("verify "):
+        text = "verify " + text
+    return text
 
 
 def _resolve_source(img: AmlogicImage, item: ImgItem) -> ImgItem:
@@ -101,6 +112,7 @@ def plan_android_slot_a_update(
     include_super: bool = False,
     include_gpt: bool = False,
     include_bootloader: bool = True,
+    include_mem_loads: bool = True,
 ) -> list[WriteStep]:
     """Build the list of writes for an OTA-style Android update that keeps
     CoreELEC on eMMC.
@@ -120,20 +132,26 @@ def plan_android_slot_a_update(
     plan: list[WriteStep] = []
 
     # Sub-pass 1: mem-loaded helpers (dtb to mem, optionally gpt to mem,
-    # optionally sheader to mem). These don't touch eMMC.
-    try:
-        meson_dtb = img.find("meson1", item_type="dtb")
-        plan.append(WriteStep(item=meson_dtb, media="mem", file_fmt="normal",
-                              verify_cmd=None))
-    except KeyError:
-        pass
-    if include_gpt:
+    # optionally sheader to mem). These don't touch eMMC but DO require
+    # the device to allow `mem`-media writes. On a secure-boot device
+    # entered via TPL (no BL1→BL2→TPL chain), the bootloader rejects
+    # these with "partition memory not allowed if secure boot en". Pass
+    # include_mem_loads=False to omit them — fine if you're not doing
+    # disk_initial (which depends on the freshly-loaded DTB).
+    if include_mem_loads:
         try:
-            gpt = img.find("gpt", item_type="bin")
-            plan.append(WriteStep(item=gpt, media="mem", file_fmt="normal",
-                                  verify_cmd=None))
+            meson_dtb = img.find("meson1", item_type="dtb")
+            plan.append(WriteStep(item=meson_dtb, media="mem",
+                                   file_fmt="normal", verify_cmd=None))
         except KeyError:
             pass
+        if include_gpt:
+            try:
+                gpt = img.find("gpt", item_type="bin")
+                plan.append(WriteStep(item=gpt, media="mem",
+                                       file_fmt="normal", verify_cmd=None))
+            except KeyError:
+                pass
 
     # Sub-pass 2: PARTITION items, in two halves — non-bootloader first.
     deferred_bootloader: list[WriteStep] = []
@@ -180,6 +198,109 @@ def plan_android_slot_a_update(
 
 
 # ── executors ────────────────────────────────────────────────────────────────
+
+def plan_full_restore(img: AmlogicImage) -> list[WriteStep]:
+    """Build the write plan for a complete USB-Burning-Tool-equivalent
+    restore — INCLUDING super (sparse) AND triggering disk_initial.
+
+    THIS ERASES CE_FLASH/CE_STORAGE on a CoreELEC-on-eMMC device. The
+    partition table is recreated from the .img's gpt item, so any
+    user-created partitions disappear.
+
+    The disk_initial command is not part of the plan list — it's an
+    executor-level concern. The plan is just the writes themselves.
+
+    Matches the order in `usb_flow_dnl.lua::tpl_flow`, including the
+    gpt-to-store write that the slot_a-update plan deliberately skips.
+    """
+    plan = plan_android_slot_a_update(
+        img,
+        include_super=True,
+        include_gpt=True,
+        include_bootloader=True,
+    )
+    # The official flow ALSO writes gpt to eMMC (in addition to loading
+    # to mem). plan_android_slot_a_update doesn't do this — it can't,
+    # since for OTA-keep-CE we explicitly do NOT want to rewrite the
+    # partition table. For full restore we do, so add gpt→store right
+    # after the _aml_dtb→store entry, before the bulk partition writes.
+    try:
+        gpt = img.find("gpt", item_type="bin")
+    except KeyError:
+        return plan
+    gpt_to_store = WriteStep(item=gpt, media="store", file_fmt="normal",
+                             verify_cmd=None)
+    # Find where _aml_dtb sits and insert just after it. If not present,
+    # insert right after the last mem entry.
+    insert_at = 0
+    for i, step in enumerate(plan):
+        if step.media == "mem":
+            insert_at = i + 1
+        elif step.item.name == "_aml_dtb":
+            insert_at = i + 1
+            break
+    plan.insert(insert_at, gpt_to_store)
+    return plan
+
+
+def execute_full_restore(dev: AmlogicDevice, img: AmlogicImage, plan: list[WriteStep],
+                         *, on_progress: Optional[Callable[[str, int, int], None]] = None,
+                         disk_initial: int = 1) -> None:
+    """Execute a full restore: dtb to mem → disk_initial → all partition
+    writes → save_setting.
+
+    `disk_initial` value (per usb_flow_dnl.lua):
+        0 = keep existing partitions (so don't use here)
+        1 = erase user partitions, keep keystore (typical OEM-restore default)
+        2 = erase everything including keys (rarely needed)
+
+    On exit the device is still in DNL mode; caller is responsible for
+    triggering a reboot (oem reboot or power-cycle).
+    """
+    ident = dev.identify()
+    if ident.stage != "tpl":
+        raise AmlogicError(
+            f"execute_full_restore: device in {ident.stage!r}, need tpl"
+        )
+
+    # First flash any "mem" entries (dtb, optionally gpt-to-mem and
+    # sheader-to-mem). disk_initial wants dtb already loaded so the
+    # bootloader knows the eMMC layout it's about to recreate.
+    set_burnstep(dev, "tpl", TPL_STEP_DOWN_DTB)
+    mem_steps = [s for s in plan if s.media == "mem"]
+    store_steps = [s for s in plan if s.media != "mem"]
+    for step in mem_steps:
+        blob_item = step.source_item or step.item
+        blob = img._data[blob_item.offset: blob_item.offset + blob_item.size]  # noqa: SLF001
+        cb = (lambda n=step.item.name: (lambda s, t: on_progress and on_progress(n, s, t)))()
+        flash_partition(dev, step.item.name, blob,
+                        media=step.media, file_fmt=step.file_fmt,
+                        verify_cmd=step.verify_cmd, on_progress=cb)
+
+    # disk_initial — this is the destructive step that erases user
+    # partitions and recreates the partition table from the loaded DTB.
+    set_burnstep(dev, "tpl", 0x31)  # TPL_STEP_DISK_INIT
+    dev.oem(f"disk_initial {disk_initial}", timeout_ms=300_000)
+
+    # All the actual partition writes.
+    set_burnstep(dev, "tpl", TPL_STEP_DOWN_PART)
+    for step in store_steps:
+        blob_item = step.source_item or step.item
+        blob = img._data[blob_item.offset: blob_item.offset + blob_item.size]  # noqa: SLF001
+        cb = (lambda n=step.item.name: (lambda s, t: on_progress and on_progress(n, s, t)))()
+        flash_partition(dev, step.item.name, blob,
+                        media=step.media, file_fmt=step.file_fmt,
+                        verify_cmd=step.verify_cmd, on_progress=cb)
+
+    # Commit env changes (matches `usbDev:OemCmd('save_setting')` at the
+    # end of tpl_flow).
+    try:
+        dev.oem("save_setting", timeout_ms=10_000)
+    except AmlogicError as e:
+        # save_setting can fail on some firmware versions; don't kill
+        # the restore over it.
+        print(f"WARN: save_setting failed (continuing): {e}")
+
 
 def execute_plan(dev: AmlogicDevice, img: AmlogicImage, plan: list[WriteStep],
                  *, set_steps: bool = True,
@@ -234,7 +355,7 @@ def dry_run(img_path: str, **kwargs) -> None:
     print()
     skipped = []
     if not kwargs.get("include_super"):
-        skipped.append("super (sparse, not yet supported)")
+        skipped.append("super (sparse — pass --include-super to flash)")
     if not kwargs.get("include_gpt"):
         skipped.append("gpt (would repartition eMMC, may erase CE)")
     skipped.append("CE_FLASH / CE_STORAGE (CoreELEC on eMMC)")
