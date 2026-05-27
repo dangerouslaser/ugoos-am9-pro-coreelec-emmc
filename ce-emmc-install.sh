@@ -162,6 +162,31 @@ run() {
     fi
 }
 
+# parted on Amlogic eMMC sometimes fails BLKRRPART after a successful on-disk
+# write (kernel can't refresh its partition view because something on the device
+# is held open). The disk has been written correctly; we just need to fall back
+# to partx -u for the kernel-side reconciliation. This wrapper runs parted with
+# both streams merged so the user still sees parted's output, and treats the
+# BLKRRPART warning as non-fatal so set -e doesn't kill the script.
+run_parted() {
+    if $DRY_RUN; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} parted $*"
+        return 0
+    fi
+    local out rc=0
+    out=$(parted "$@" 2>&1) || rc=$?
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    if (( rc != 0 )); then
+        if grep -q "unable to inform the kernel" <<<"$out"; then
+            warn "parted: BLKRRPART failed (kernel can't refresh partition table)"
+            warn "  — on-disk write succeeded; will reconcile with partx -u"
+            return 0
+        fi
+        return $rc
+    fi
+    return 0
+}
+
 $DRY_RUN && warn "DRY-RUN mode — no changes will be made"
 
 # (--info and --restore-logo validation run after all helper functions are
@@ -235,9 +260,16 @@ make_emmc_nodes() {
 
 # After repartitioning, ask the kernel to re-read the partition table and
 # create /dev nodes for the new partitions using sysfs-reported major:minor.
+#
+# We try partprobe first (full BLKRRPART reread — fine when nothing on the
+# device is held open), then fall back to partx -u which uses per-partition
+# BLKPG_* ioctls and works even when something on the device is open. On
+# Amlogic eMMC, BLKRRPART has been observed to fail (e.g. on Ugoos SK4 CE 22
+# Piers nightly) while partx -u succeeds.
 reread_and_make_nodes() {
     local parts=("$@")
     partprobe "$EMMC" 2>/dev/null || true
+    command -v partx >/dev/null 2>&1 && partx -u "$EMMC" 2>/dev/null || true
 
     for part in "${parts[@]}"; do
         local sysfs_dev="/sys/block/mmcblk0/mmcblk0p${part}/dev"
@@ -667,13 +699,13 @@ RSV_START_MIB=$((RSV_START_B / 1024 / 1024))
 CE_FLASH_END_MIB=$((RSV_START_MIB + 512))
 
 log "Deleting partitions 28 (rsv) and 29 (userdata)..."
-run parted -s "$EMMC" rm 29 rm 28
+run_parted -s "$EMMC" rm 29 rm 28
 
 log "Creating CE_FLASH (${RSV_START_MIB}MiB – ${CE_FLASH_END_MIB}MiB)..."
-run parted -s "$EMMC" mkpart CE_FLASH fat32 "${RSV_START_MIB}MiB" "${CE_FLASH_END_MIB}MiB"
+run_parted -s "$EMMC" mkpart CE_FLASH fat32 "${RSV_START_MIB}MiB" "${CE_FLASH_END_MIB}MiB"
 
 log "Creating CE_STORAGE (${CE_FLASH_END_MIB}MiB – 100%)..."
-run parted -s "$EMMC" mkpart CE_STORAGE ext4 "${CE_FLASH_END_MIB}MiB" "100%"
+run_parted -s "$EMMC" mkpart CE_STORAGE ext4 "${CE_FLASH_END_MIB}MiB" "100%"
 
 # Ask the kernel to re-read the partition table, then create device nodes
 # using sysfs-reported major:minor numbers (not assumed sequential values)

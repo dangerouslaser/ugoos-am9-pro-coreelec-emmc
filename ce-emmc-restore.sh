@@ -62,6 +62,27 @@ run() {
     fi
 }
 
+# Tolerate parted's BLKRRPART warning — see ce-emmc-install.sh:run_parted for
+# the full explanation. The on-disk write succeeds; partx -u reconciles the
+# kernel-side view downstream.
+run_parted() {
+    if $DRY_RUN; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} parted $*"
+        return 0
+    fi
+    local out rc=0
+    out=$(parted "$@" 2>&1) || rc=$?
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    if (( rc != 0 )); then
+        if grep -q "unable to inform the kernel" <<<"$out"; then
+            warn "parted: BLKRRPART failed; on-disk write succeeded, partx -u will reconcile"
+            return 0
+        fi
+        return $rc
+    fi
+    return 0
+}
+
 $DRY_RUN && warn "DRY-RUN mode — no changes will be made"
 
 # ── TUI detection ─────────────────────────────────────────────────────────────
@@ -119,6 +140,7 @@ make_emmc_nodes() {
 reread_and_make_nodes() {
     local parts=("$@")
     partprobe "$EMMC" 2>/dev/null || true
+    command -v partx >/dev/null 2>&1 && partx -u "$EMMC" 2>/dev/null || true
 
     for part in "${parts[@]}"; do
         local sysfs_dev="/sys/block/mmcblk0/mmcblk0p${part}/dev"
@@ -231,14 +253,14 @@ tui_confirm_destructive "Restore Android" "$CONFIRM_MSG" \
 # ── Restore ───────────────────────────────────────────────────────────────────
 
 header "Removing CoreELEC partitions"
-run parted -s "$EMMC" rm 29 rm 28
+run_parted -s "$EMMC" rm 29 rm 28
 log "CE_STORAGE (p29) and CE_FLASH (p28) removed"
 
 header "Restoring original partitions"
-run parted -s "$EMMC" mkpart "$P28_NAME" "${P28_START_B}B" "${P28_END_B}B"
+run_parted -s "$EMMC" mkpart "$P28_NAME" "${P28_START_B}B" "${P28_END_B}B"
 log "p28 ${P28_NAME} restored"
 
-run parted -s "$EMMC" mkpart "$P29_NAME" "${P29_START_B}B" "${P29_END_B}B"
+run_parted -s "$EMMC" mkpart "$P29_NAME" "${P29_START_B}B" "${P29_END_B}B"
 log "p29 ${P29_NAME} restored (empty — Android will initialize on first boot)"
 
 if ! $DRY_RUN; then
