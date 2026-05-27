@@ -321,12 +321,226 @@ SDK changes long-term or contribute the algorithm back to pyamlboot.
 The wire captures from this session (`captures/round{1,2,3,4}.pcap`) are
 saved for direct comparison against the working Windows pcap.
 
-## Open questions for follow-up captures
+## RESOLVED — full protocol decoded from decrypted Lua
 
-- What does `getvar:cbw` actually return? (Issued repeatedly during U-Boot
-  load — looks like a polling/handshake mechanism.)
-- The 4 `setvar:checksum` writes correspond to checkpoint commits — what
-  exactly is being committed? (Probably the per-block addsum from the
-  preceding `mwrite:verify=addsum` stream.)
-- What are the chipinfo page contents? (Decode payload of `OKAY` replies
-  to `getvar:getchipinfo-N`. Page 5 is new for S6.)
+Several earlier sections in this doc are now superseded. Final answer
+based on the AES-decrypted `usb_flow.aml` Lua scripts (see
+`aml-analysis/README.md` for the decryption + extraction):
+
+### Stage / mode naming
+
+The `identify` reply's byte 4 (mode) maps to a stage name per
+`aml_mod_fastboot_dev.lua::usbStages`:
+
+```lua
+usbStages = { [0] = 'romboot', [8] = 'spl', [12] = 'bl2e', [16] = 'tpl' }
+```
+
+So our AM9 Pro, which returns `06 00 00 10 00 00 00 00` on identify,
+is in mode 16 = **`tpl` (U-Boot already running)**. Our earlier
+"stage 14" labeling in this repo was wrong — the device boots into
+TPL stage directly when it enters DNL mode. The S6 BootROM transitions
+through romboot → spl → tpl automatically before the host first sees
+it on USB. That's the protocol-6 difference vs S5.
+
+Implication: **most flash operations don't need to traverse the
+romcode→bl2 chain**. We can issue `oem mwrite` directly in TPL stage
+and get the result. The Khadas adnl tool's hardcoded check "byte 3
+must == 0" is therefore wrong for S6 — they're checking for the OLD
+behavior where the device shows up in romboot mode.
+
+### The "blob transformation" (resolved)
+
+It was never a transformation. From `usb_flow_dnl.lua::romcode_flow`:
+
+```lua
+local infData = bufMan.subBuf(0, 4096)         -- 4 KB working buffer
+hItem.item_read(infData)                        -- read first 4 KB of bootloader
+usbDev:FirstSect(infData, isS7dRva)             -- device asks for N bytes,
+                                                --   send first N from infData
+hItem.item_seek(4096)                           -- *** SEEK PAST 4 KB ***
+local _, result = usbDev:GetVar("downloadsize") -- device tells us bl2Size
+local bl2Size = tonumber(result.info[1])
+... -- then Download(bl2Size bytes) starting from offset 4096
+```
+
+The ~0x1000-byte shift between the `.img` `DDR.USB` blob and what
+Windows actually uploads is just `item.seek(4096)`. Bytes 0x400..0x1000
+inside the @AML container are zero-padding before the next signed
+sub-block aligned at 0x1000; the burn tool reads them but never
+uploads them. The "duplicate @AML at offset 0x110" we noticed was
+just the inner signed sub-block at file offset 0x110 of the @AML
+container.
+
+Already applied in `aml_dnl_ops.py::load_ddr_firmware`.
+
+### Wire format of every command
+
+Captured from `aml_mod_fastboot_dev.lua` + `libamlfastboot.dll`. All
+commands are ASCII text on bulk OUT, responses are 4-byte ASCII status
+on bulk IN followed by optional payload.
+
+**Standard fastboot:**
+
+| Command | Behavior |
+|---------|----------|
+| `getvar:NAME` | OKAY + value, or FAIL |
+| `download:HHHHHHHH` | DATA<size>, then host streams `size` bytes, then OKAY |
+| `setvar:NAME` | DATA00000004, then host streams 4 bytes (u32 LE), then OKAY |
+| `boot` | OKAY (device may re-enumerate) |
+| `reboot-romusb` | OKAY then device re-enumerates into romboot stage |
+
+**Amlogic-specific:**
+
+| Command | Notes |
+|---------|-------|
+| `firstsect` | Special: device replies DATA<size>+OKAY; host MUST upload `size` bytes between them. S6 always asks for 1024 (0x400). |
+| `getvar:cbw` | Returns the 24-byte CBW struct (see below). Only valid in spl/bl2e/tpl stages. |
+| `getvar:identify` | 8-byte response. Layout: `[proto, minor, ?, mode, ?, needPwd, pwdOk, pagesMap]` |
+| `getvar:getchipinfo-N` | N = 0..7 page index. 64-byte response. Page 0 = INDX magic + pagemap; page 1 = CHIP info; page 2 = CID; page 3 = SGVR; page 5 = security bits (new on S6). |
+| `getvar:serialno` | Chip die serial (NOT board serial). |
+| `getvar:downloadsize` | Returns hex string like "0x00042800". |
+| `oem CMD` | Generic OEM command channel. Many subcommands; see below. |
+
+**OEM commands (all sent as `oem <subcmd>`):**
+
+| Subcmd | Purpose |
+|--------|---------|
+| `disk_initial N` | Initialize partition table. N=0 keep, N>0 erase. |
+| `get_bootloaderversion` | Return version string |
+| `env_get NAME` | Read U-Boot env var |
+| `save_setting` | Persist env to eMMC |
+| `setvar burnsteps 0xVALUE` | Progress checkpoint. Encoding: `0xC004 << 16 \| fwVer << 8 \| part` |
+| `sheader_need` | Returns OKAY if device wants sheader pre-write |
+| `verify sha1sum HEX` | Verify last-written partition against SHA1 |
+| `mwrite SIZE_HEX (normal\|sparse) (store\|mem) PARTNAME` | Begin partition write; followed by `mwrite:verify=addsum` rounds |
+| `mread ...` | Partition read-back (mread:status=request/upload/finish) |
+| `rpmb_init` | Initialize RPMB (Replay Protected Memory Block) |
+
+**Burnsteps encoding** (from `usb_cmd_setvar_burnstep`):
+
+```
+steps = (0xC004 << 16) | (fwVer << 8) | part
+```
+
+Where `fwVer` is the stage number from usbStages (0/8/12/16) and
+`part` is the per-stage step index. In our burn capture we saw
+0xc0041030, 0xc0041031, 0xc0041032 — that's stage 16 (tpl), parts
+0x30 (DownDtb), 0x31 (DiskInit), 0x32 (DownLgcPart) — per `TplSteps`.
+
+### CBW (Control Block Word) structure
+
+The device-driven burn protocol used in spl/bl2e/tpl stages. Per
+`aml_mod_fastboot_dev.lua::usb_cmd_get_cbw`:
+
+```
+offset  size  field
+ 0      4     magic "AMLC"
+ 4      4     transferSequence  (u32 LE)
+ 8      4     transferSize      (u32 LE)
+12      4     startOffset       (u32 LE — file offset to read from)
+16      1     flags             (bit 0: needCheckSum if 0)
+17      1     direction         (bit 7: bulk-IN/upload if set)
+18      1     requestType       (0=normal data, 1=end, 0xFF=wait, else=error)
+19+     ...   (unused, total 24 bytes typical)
+```
+
+So `usbDev:GetCbw()` returns a struct:
+
+```python
+{
+    'sequence': transferSequence,
+    'transferSize': transferSize,
+    'startOffset': startOffset,
+    'needCheckSum': (flags & 1) == 0,
+    'isUpload': (direction & 0x80) != 0,
+    'theEnd': requestType == 1,
+    'waitContinue': requestType == 0xFF,
+}
+```
+
+Error if `requestType > 1` (and not 0xFF).
+
+### Response parser nuances (`usb_check_cmd`)
+
+The first 4 bytes are status; "INFO" responses can be sent
+ASYNCHRONOUSLY by the bootloader (e.g. progress messages) and the host
+MUST drain them until it sees a terminal `OKAY`/`FAIL`/`DATA`. There's
+a 25-retry busy limit.
+
+DATA payload format:
+
+- `DATA<8hex>` → host should send `dataSize` bytes
+- `DATA OUT <hex> <hex>` → explicit OUT direction, dataSize + fileOffset
+- `DATA IN <hex> <hex>` → device wants to send to host (upload)
+
+This means our existing `download()` in aml_dnl_proto.py is over-
+specialized — should be generalized to parse all three DATA formats.
+
+### Burn flow summary
+
+```
+ENTRY (TPL stage, mode=16, S6 boots directly here)
+  ↓ if doing full restore:
+reboot-romusb → wait for re-enum into romboot
+  ↓
+romcode_flow:
+  GetVar(identify), DumpFeats (all chipinfo pages),
+  SecureBoot check,
+  SetSteps(rom, Init),
+  SetSteps(rom, PreBl2Down),
+  read 4 KB → FirstSect, item.seek(4096),
+  GetVar(downloadsize) → bl2Size,
+  Download(bl2Size bytes from offset 4096),
+  SetSteps(rom, Bl2boot),
+  boot
+  ↓ device re-enumerates into spl stage (mode 8)
+bl2_boot:
+  Identify, SocType, SetSteps(spl, ?),
+  loop:
+    GetCbw → {sequence, transferSize, startOffset, needCheckSum, theEnd}
+    if theEnd: break
+    if waitContinue: sleep 500ms, Identify, GetCbw again
+    seek to startOffset in UBOOT item
+    read+Download in 16KB chunks (compute addsum)
+    if needCheckSum: SetVar(checksum, addsum)
+  ↓ device re-enumerates into tpl stage (mode 16) — already here on S6
+tpl_flow:
+  SecureBoot check,
+  SetSteps(tpl, DownDtb),
+  flash dtb to mem,
+  flash gpt to mem,
+  (optional) flash sheader to mem,
+  OemCmd("disk_initial N"),
+  SetSteps(tpl, DiskInit),
+  SetSteps(tpl, DownLgcPart),
+  for each partition (in burnParts order, bootloader LAST):
+    OemCmd("mwrite SIZE (normal|sparse) (store|mem) NAME"),
+    fb_mwrite_data: addsum-tracked download loop,
+    OemCmd(verify cmd) — usually "verify sha1sum HEX"
+  OemCmd("save_setting")
+  if RPMB needed: OemCmd("rpmb_init")
+  burn keys from img if present
+  done
+```
+
+### What every protocol-6 burn tool needs
+
+To talk to an S6 device beyond what pyamlboot/Khadas adnl currently
+supports, an open implementation needs:
+
+1. Identify-byte mapping: `mode=16` → `tpl` (currently rejected as
+   "illegle device mode" by Khadas).
+2. The `firstsect` command in non-S7d form (sent as bare `firstsect`
+   without size suffix; device replies DATA<size>).
+3. The `item.seek(4096)` between firstsect and download.
+4. Proper INFO-message draining in the response parser (`usb_check_cmd`).
+5. The CBW protocol with the 24-byte struct above.
+6. The `setvar` binary 4-byte upload path (vs `oem setvar` hex string).
+7. Burnsteps encoding `(0xC004 << 16) | (fwVer << 8) | part`.
+8. Acceptance that TPL is the entry state — `bl1_boot`/`bl2_boot` are
+   not always needed; many flash operations work directly in TPL.
+
+Items 4-7 are implemented in the decrypted Lua and now ready to be
+ported to Python in this project (`aml_dnl_proto.py` and
+`aml_dnl_ops.py`). Items 1-3, 8 are insights to contribute upstream.

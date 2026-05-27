@@ -1,10 +1,14 @@
 """Layer 2 — operations on top of the raw protocol.
 
-Composes Layer 1's `cmd()` / `download()` primitives into atomic operations:
-parsing a `.img` file, transitioning the device between burn stages, writing
-to named partitions. Knows what an Amlogic image is and what a burn stage is;
-doesn't know about specific flows (full restore vs OTA vs single-partition) —
-those are Layer 3.
+Composes Layer 1's primitives into atomic operations: parsing a `.img` file,
+transitioning the device between burn stages, the CBW-driven U-Boot upload
+loop, partition writes. Knows about the Amlogic image format and what a
+burn stage is; doesn't know about specific *flows* (full restore vs OTA vs
+single-partition) — those are Layer 3.
+
+Functions here are direct ports of (named after) the AES-decrypted
+`usb_flow.aml` Lua scripts in `aml-analysis/usb_flow_decrypted/`, mostly
+from `usb_flow_dnl.lua` and `aml_mod_fastboot_dev.lua`.
 """
 from __future__ import annotations
 
@@ -12,11 +16,15 @@ import os
 import struct
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import usb.core
 
-from aml_dnl_proto import AmlogicDevice, AmlogicError, VENDOR_ID, PRODUCT_IDS
+from aml_dnl_proto import (
+    AmlogicDevice, AmlogicError, CBW, VENDOR_ID, PRODUCT_IDS,
+    STAGE_BY_MODE, DEFAULT_CHUNK,
+)
+
 
 # ── .img file format ─────────────────────────────────────────────────────────
 # Verified empirically against AM9PRO_2.0.9.img and 2.1.0.img; same layout as
@@ -26,14 +34,12 @@ from aml_dnl_proto import AmlogicDevice, AmlogicError, VENDOR_ID, PRODUCT_IDS
 _IMG_MAGIC_V2 = 0x27B51956
 _ITEM_TABLE_OFFSET = 0x40
 _ITEM_DESC_SIZE = 0x240
-# Per aml-img-tool.py (verified against AM9PRO_2.0.9.img):
 _ITEM_OFFSET_OFF = 0x10
 _ITEM_SIZE_OFF = 0x18
 _ITEM_TYPE_OFF = 0x20
 _ITEM_TYPE_LEN = 32
 _ITEM_NAME_OFF = 0x120
 _ITEM_NAME_LEN = 32
-# Header item-count field — at 0x18, not 0x1C:
 _HDR_ITEM_NUM_OFF = 0x18
 
 
@@ -85,89 +91,53 @@ class AmlogicImage:
         it = self.find(name, item_type)
         return self._data[it.offset: it.offset + it.size]
 
+    def read_at(self, item: ImgItem, offset: int, size: int) -> bytes:
+        """Read `size` bytes from item starting at `offset` within the item."""
+        if offset < 0 or offset + size > item.size:
+            raise ValueError(f"read out of range for item {item.name}")
+        return self._data[item.offset + offset: item.offset + offset + size]
+
+
+# ── burnstep encoding ────────────────────────────────────────────────────────
+
+# Per `usb_flow_decrypted/aml_mod_fastboot_dev.lua::usb_cmd_setvar_burnstep`:
+#   steps = (0xc004 << 16) | (fwVer << 8) | part
+# fwVer is the mode (0=romboot, 8=spl, 12=bl2e, 16=tpl) and `part` is a
+# per-stage step index from RomSteps / TplSteps.
+
+_FWVER_BY_STAGE = {v: k for k, v in STAGE_BY_MODE.items()}
+
+# Step constants from usb_flow_dnl.lua
+ROM_STEP_INIT          = 0
+ROM_STEP_PRE_BL2_DOWN  = 1
+ROM_STEP_AFTER_BL2     = 2
+ROM_STEP_BL2_BOOT      = 3
+
+TPL_STEP_DOWN_DTB      = 0x30
+TPL_STEP_DISK_INIT     = 0x31
+TPL_STEP_DOWN_PART     = 0x32
+
+
+def encode_burnstep(stage: str, part: int) -> int:
+    """`(0xc004 << 16) | (fwVer << 8) | part` per the Lua impl."""
+    if stage not in _FWVER_BY_STAGE:
+        raise ValueError(f"unknown stage {stage!r}; expected one of {list(_FWVER_BY_STAGE)}")
+    if not 0 <= part <= 0xFF:
+        raise ValueError(f"burnstep part {part} out of range [0..255]")
+    return (0xc004 << 16) | (_FWVER_BY_STAGE[stage] << 8) | part
+
+
+def set_burnstep(dev: AmlogicDevice, stage: str, part: int) -> None:
+    """`setvar burnsteps <encoded>` (binary in romboot/spl, hex string via
+    `oem setvar burnsteps 0x..` in tpl)."""
+    val = encode_burnstep(stage, part)
+    if stage == "tpl":
+        dev.oem(f"setvar burnsteps {val:#x}")
+    else:
+        dev.setvar("burnsteps", val)
+
 
 # ── stage transitions ────────────────────────────────────────────────────────
-
-def firstsect(dev: AmlogicDevice, header_bytes: bytes,
-              *, timeout_ms: int = 5000) -> None:
-    """Run the `firstsect` handshake (S6-family bootloader-load preamble).
-
-    Stage-15 quirk: before any normal `download:`, the device wants the
-    first 1024 bytes of the @AML boot blob uploaded via a separate command.
-    Protocol:
-
-        host → "firstsect"
-        dev  → "DATA00000400"   (always 1024 bytes)
-        host → <1024 bytes>
-        dev  → "OKAY"
-
-    Raises AmlogicError on any framing mismatch. `header_bytes` must be at
-    least 1024 bytes (caller passes the front of the DDR/UBOOT blob; only
-    the first 1024 are sent).
-    """
-    status, body = dev.cmd("firstsect", timeout_ms=timeout_ms)
-    if status != "DATA":
-        raise AmlogicError(f"firstsect: expected DATA, got {status} {body!r}")
-    try:
-        wanted = int(body[:8].decode("ascii"), 16)
-    except (UnicodeDecodeError, ValueError):
-        raise AmlogicError(f"firstsect: bad DATA payload {body!r}")
-    if wanted != 0x400:
-        # Defensive — the capture always shows 0x400. If the device ever
-        # asks for something else we want to know loudly.
-        raise AmlogicError(f"firstsect: device wants {wanted:#x} bytes, expected 0x400")
-    if len(header_bytes) < wanted:
-        raise AmlogicError(
-            f"firstsect: need {wanted} bytes of header, got {len(header_bytes)}"
-        )
-    dev._write(header_bytes[:wanted], timeout_ms=timeout_ms)  # noqa: SLF001
-    reply = dev._read(64, timeout_ms=timeout_ms)               # noqa: SLF001
-    if not reply.startswith(b"OKAY"):
-        raise AmlogicError(
-            f"firstsect: expected OKAY after upload, got {reply!r}"
-        )
-
-
-def load_ddr_firmware(dev: AmlogicDevice, ddr_blob: bytes,
-                      ddr_size: int = 0x42800) -> None:
-    """Upload the DDR init portion of a bootloader blob (stage 15).
-
-    Combines `firstsect` (first 1024 bytes) + `download:` (next `ddr_size`
-    bytes) and leaves the device ready to receive `boot`. Does NOT send
-    `boot` — caller does that after deciding whether to continue.
-
-    `ddr_blob` is the full @AML blob (e.g. from `AmlogicImage.blob("DDR")`).
-    `ddr_size` is the bytes-after-header to download; 0x42800 matches the
-    Windows tool for AM9 Pro on AM9PRO_2.x.y images.
-    """
-    # Per the Lua flow we decrypted from usb_flow.aml::usb_flow_dnl.lua
-    # `romcode_flow`:
-    #
-    #   infData = read(4096 bytes)              -- 4 KB working buffer
-    #   firstsect(infData)                      -- device asks for N bytes,
-    #                                              we send first N from this
-    #   item.seek(4096)                         -- !!! SKIP TO 0x1000 !!!
-    #   bl2Size = getvar('downloadsize')
-    #   download(item.read(bl2Size))            -- sends bytes [0x1000:]
-    #
-    # The "transformation" we measured on the wire (0x1000-byte shift, zero
-    # padding stripped) is just this seek-and-skip — bytes [0x400..0x1000]
-    # are never uploaded. They're typically zero-padding inside the @AML
-    # outer header anyway, since the next signed sub-block is aligned at
-    # offset 0x1000.
-    SECT_BUF = 0x1000          # 4 KB working buffer the OEM tool uses
-    if len(ddr_blob) < SECT_BUF + ddr_size:
-        raise AmlogicError(
-            f"DDR blob too short: need {SECT_BUF + ddr_size}, "
-            f"have {len(ddr_blob)}"
-        )
-    firstsect(dev, ddr_blob[:SECT_BUF])
-    try:
-        dev.cmd("getvar:downloadsize", timeout_ms=2000)
-    except AmlogicError:
-        pass
-    dev.download(ddr_blob[SECT_BUF : SECT_BUF + ddr_size])
-
 
 def reboot_to_romusb(dev: AmlogicDevice, *, timeout_s: float = 20.0,
                      poll_s: float = 0.2) -> AmlogicDevice:
@@ -189,18 +159,14 @@ def reboot_to_romusb(dev: AmlogicDevice, *, timeout_s: float = 20.0,
     accept either.
     """
     try:
-        status, body = dev.cmd("reboot-romusb", timeout_ms=2000)
+        dev.cmd("reboot-romusb", timeout_ms=2000)
     except (AmlogicError, usb.core.USBError):
-        # Acceptable — some devices drop the connection before sending OKAY.
         pass
     try:
         dev.close()
     except Exception:
         pass
-
-    # The device may take a few seconds to come back. Sleep first so we
-    # don't immediately reconnect to the OLD handle (libusb sometimes
-    # caches stale device descriptors briefly on macOS).
+    # Settle. libusb caches descriptors briefly after a USB unplug on macOS.
     time.sleep(1.0)
 
     deadline = time.monotonic() + timeout_s
@@ -212,9 +178,8 @@ def reboot_to_romusb(dev: AmlogicDevice, *, timeout_s: float = 20.0,
             last_error = str(e)
             time.sleep(poll_s)
             continue
-        # Probe — if we can identify, the handle is real.
         try:
-            new_dev.cmd("getvar:identify", timeout_ms=2000)
+            new_dev.identify(timeout_ms=2000)
             return new_dev
         except (AmlogicError, usb.core.USBError) as e:
             last_error = str(e)
@@ -224,6 +189,235 @@ def reboot_to_romusb(dev: AmlogicDevice, *, timeout_s: float = 20.0,
                 pass
             time.sleep(poll_s)
     raise AmlogicError(
-        f"device did not re-enumerate within {timeout_s}s after "
-        f"reboot-romusb (last error: {last_error})"
+        f"device did not re-enumerate within {timeout_s}s after reboot-romusb "
+        f"(last error: {last_error})"
     )
+
+
+def load_ddr_firmware(dev: AmlogicDevice, ddr_blob: bytes,
+                      ddr_size: Optional[int] = None) -> int:
+    """Upload the DDR init portion of a bootloader blob (romboot stage).
+
+    Ports `usb_flow_dnl.lua::romcode_flow`'s DDR-load sub-sequence:
+
+        infData = read(4096 bytes)              -- 4 KB working buffer
+        firstsect(infData)                      -- device asks for N bytes
+        item.seek(4096)                         -- !!! skip to 0x1000 !!!
+        bl2Size = getvar('downloadsize')
+        download(item.read(bl2Size))            -- sends [0x1000 : 0x1000+bl2Size]
+
+    The ~0x1000 byte shift between the on-disk `DDR.USB` blob and what hits
+    the wire is just that seek — bytes [0x400..0x1000] are zero-padding inside
+    the @AML container before the next signed sub-block at 0x1000, and the
+    burn tool never uploads them. No content transformation is done.
+
+    If `ddr_size` is None, the size is queried from the device via
+    `getvar:downloadsize` (which is what the OEM tool does). Pass an
+    explicit `ddr_size` only to override.
+
+    Returns the actual bytes-after-firstsect that were downloaded.
+    """
+    SECT_BUF = 0x1000
+    if len(ddr_blob) < SECT_BUF:
+        raise AmlogicError(f"DDR blob too short: need >= {SECT_BUF}, have {len(ddr_blob)}")
+
+    dev.firstsect(ddr_blob[:SECT_BUF])
+
+    if ddr_size is None:
+        # `getvar:downloadsize` returns a string like "0x00042800"
+        try:
+            sz_str = dev.getvar_str("downloadsize")
+            ddr_size = int(sz_str, 16) if sz_str.startswith("0x") else int(sz_str, 16)
+        except (AmlogicError, ValueError) as e:
+            raise AmlogicError(f"could not query downloadsize: {e}") from e
+
+    if len(ddr_blob) < SECT_BUF + ddr_size:
+        raise AmlogicError(
+            f"DDR blob too short for ddr_size {ddr_size:#x}: "
+            f"need {SECT_BUF + ddr_size}, have {len(ddr_blob)}"
+        )
+    dev.download(ddr_blob[SECT_BUF: SECT_BUF + ddr_size])
+    return ddr_size
+
+
+# ── CBW-driven U-Boot load (spl → tpl) ───────────────────────────────────────
+
+def _aml_addsum(data: bytes) -> int:
+    """Per `aml_mod_util.lua::addsum` — sum of every byte, u32 wrap.
+
+    Used as the checksum word that `bl2_boot` sends after each CBW round."""
+    return sum(data) & 0xFFFFFFFF
+
+
+def load_uboot_via_cbw(dev: AmlogicDevice, uboot_blob: bytes, *,
+                       chunk_size: int = DEFAULT_CHUNK,
+                       resend_attempts: int = 3,
+                       on_progress: Optional[Callable[[int, int], None]] = None
+                       ) -> None:
+    """Port of `usb_flow_dnl.lua::bl2_boot` — the device-driven U-Boot upload.
+
+    In spl/bl2e stages the device tells us via `getvar:cbw` which bytes from
+    the UBOOT item to upload. Loop until the CBW signals `the_end`. After
+    each round, if `need_checksum` is set, send the running addsum via
+    `setvar checksum`.
+
+    `uboot_blob` is the entire UBOOT item (typically same blob as DDR.USB —
+    the bootloader carries both stages, but the device requests different
+    offset windows for each).
+
+    `on_progress(bytes_sent, total_bytes)` is called between chunks if given.
+    """
+    total = 0
+    while True:
+        cbw = dev.get_cbw(timeout_ms=5000)
+        if cbw is None:
+            raise AmlogicError("load_uboot_via_cbw: device returned no CBW")
+        if cbw.wait_continue:
+            time.sleep(0.5)
+            ident = dev.identify(timeout_ms=2000)
+            if ident.stage != "spl":
+                raise AmlogicError(
+                    f"load_uboot_via_cbw: stage degraded to {ident.stage!r} during wait"
+                )
+            continue
+        if cbw.the_end:
+            return
+        if cbw.is_upload:
+            raise AmlogicError(
+                "load_uboot_via_cbw: CBW asked for upload (device→host); "
+                "not supported by this routine"
+            )
+        if cbw.start_offset + cbw.transfer_size > len(uboot_blob):
+            raise AmlogicError(
+                f"CBW asks for [{cbw.start_offset:#x}..{cbw.start_offset + cbw.transfer_size:#x}] "
+                f"but blob is {len(uboot_blob):#x}"
+            )
+
+        # Try up to resend_attempts times; the Lua does the same.
+        for attempt in range(1, resend_attempts + 1):
+            offset = cbw.start_offset
+            remaining = cbw.transfer_size
+            addsum = 0
+            while remaining > 0:
+                this = min(remaining, chunk_size)
+                buf = uboot_blob[offset: offset + this]
+                addsum = (addsum + _aml_addsum(buf)) & 0xFFFFFFFF
+                dev.download(buf)
+                offset += this
+                remaining -= this
+                total += this
+                if on_progress:
+                    on_progress(total, len(uboot_blob))
+            if not cbw.need_checksum:
+                break
+            try:
+                dev.setvar("checksum", addsum)
+                break  # success
+            except AmlogicError as e:
+                if attempt >= resend_attempts:
+                    raise AmlogicError(
+                        f"CBW seq {cbw.sequence}: checksum FAIL after {attempt} tries: {e}"
+                    ) from e
+
+
+# ── partition write (tpl stage) ──────────────────────────────────────────────
+
+# fileFmt values per `AmlogicImage` `file_type` (per aml-img-tool docs):
+#   0x00 = "normal" (raw bytes)
+#   0xfe = "sparse" (Android sparse image format)
+def flash_partition(dev: AmlogicDevice, part_name: str, blob: bytes, *,
+                    media: str = "store",
+                    file_fmt: str = "normal",
+                    verify_cmd: Optional[str] = None,
+                    chunk_size: int = DEFAULT_CHUNK,
+                    on_progress: Optional[Callable[[int, int], None]] = None
+                    ) -> None:
+    """Port of `usb_flow_dnl.lua::tpl_flashOnePartition` for the `normal`
+    (non-sparse) case.
+
+    Wire flow (per `libamlfastboot.dll::fb_mwrite_data` + the Lua):
+
+        host → "oem mwrite SIZE_HEX normal store PARTNAME"
+        dev  → DATA<size>
+        host → <blob bytes in chunks>
+        dev  → OKAY ("mwrite finish")
+        (optional) host → verify_cmd via oem
+        dev  → OKAY
+
+    Args:
+        media: 'store' (eMMC), 'mem' (DRAM only), or 'key' (RPMB).
+        file_fmt: 'normal' or 'sparse'. Only 'normal' supported here for now.
+        verify_cmd: e.g. "verify sha1sum HEX...". If provided, `oem` is
+            prepended automatically.
+    """
+    if file_fmt == "sparse":
+        raise NotImplementedError("sparse upload not yet ported")
+    if file_fmt != "normal":
+        raise ValueError(f"unknown file_fmt {file_fmt!r}")
+    if media not in ("store", "mem", "key"):
+        raise ValueError(f"invalid media {media!r}")
+
+    size = len(blob)
+    cmd = f"mwrite {size:#x} {file_fmt} {media} {part_name}"
+    # oem() handles the OKAY round-trip; for mwrite the device replies DATA
+    # not OKAY, so we use cmd() directly to capture the DATA.
+    dev._write(f"oem {cmd}".encode("ascii"))  # noqa: SLF001
+    status, body, ack = dev._read_response(timeout_ms=30_000)  # noqa: SLF001
+    if status != "DATA":
+        raise AmlogicError(
+            f"oem mwrite {part_name}: expected DATA, got {status} {body!r}"
+        )
+    expected = ack.size
+    if expected != size:
+        raise AmlogicError(
+            f"oem mwrite {part_name}: device wants {expected:#x} bytes, host has {size:#x}"
+        )
+
+    # Stream the payload in chunk_size pieces; this mirrors fb_mwrite_data's
+    # behavior. The cumulative addsum could be SetVar'd between chunks but
+    # for `normal` partitions the post-write verify is via `oem verify
+    # sha1sum`, not the running addsum.
+    offset = 0
+    while offset < size:
+        this = min(chunk_size, size - offset)
+        dev._write(blob[offset: offset + this])  # noqa: SLF001
+        offset += this
+        if on_progress:
+            on_progress(offset, size)
+
+    status, body, _ = dev._read_response(timeout_ms=30_000)  # noqa: SLF001
+    if status != "OKAY":
+        raise AmlogicError(
+            f"oem mwrite {part_name}: expected OKAY after data, got {status} {body!r}"
+        )
+
+    if verify_cmd:
+        # Pre-strip "oem " if caller included it.
+        v = verify_cmd[4:] if verify_cmd.startswith("oem ") else verify_cmd
+        dev.oem(v)
+
+
+# ── identity / state helpers ─────────────────────────────────────────────────
+
+def dump_chipinfo_pages(dev: AmlogicDevice) -> dict[int, bytes]:
+    """Read all chipinfo pages (0..7), respecting page 0's pageMap bitfield.
+
+    Page 0 has magic "INDX" + a u8 pageMap; bit N of pageMap means page N
+    is populated. Returns a dict mapping populated page index to its 64
+    raw bytes.
+    """
+    out: dict[int, bytes] = {}
+    page0 = dev.getchipinfo(0)
+    if len(page0) < 5 or page0[:4] != b"INDX":
+        raise AmlogicError(f"page0 magic missing or short: {page0[:8].hex()}")
+    if not (page0[4] & 1):
+        raise AmlogicError(f"page0 pageMap (0x{page0[4]:02x}) doesn't claim page 0")
+    out[0] = page0
+    pages_map = page0[4]
+    for n in range(1, 8):
+        if pages_map & (1 << n):
+            try:
+                out[n] = dev.getchipinfo(n)
+            except AmlogicError:
+                continue
+    return out

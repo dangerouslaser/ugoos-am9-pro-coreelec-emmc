@@ -19,3 +19,4 @@ aml-analysis/*.dll
 aml-analysis/*.exe
 aml-analysis/*.aml
 aml-analysis/usb_flow_decrypted/
+aml-analysis/embedded_decrypted/
