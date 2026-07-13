@@ -46,18 +46,21 @@ See [`emmc-research.md`](research/emmc-research.md) for the full research notes.
 
 ## What the installer does
 
-1. Verifies you're on the right board and booting from SD
+1. Verifies you're on the right board and booting from SD, and that the eMMC still has the expected Android layout — partition **names** (`super`/`rsv`/`userdata`) are checked, not just numbers, so a partially-completed previous run is caught here instead of poisoning the backups below
 2. Reads actual partition sizes from the live GPT for the confirmation screen
 3. Checks whether `rsv` (p28) contains data and notes it in the confirmation
 4. **Cross-checks device identity** — confirms the running `androidboot.serialno` and `mac=` on the kernel cmdline agree with the AMLNORMAL keystore values stored in `reserved` (p1). Aborts if they disagree (would indicate tampering or partial-flash state)
-5. Backs up to `/storage` (on the SD card):
+5. Backs up to `/storage/emmc-backup` (on the SD card — the installer refuses to run if that directory already exists non-empty, so a rerun can never clobber a previous backup set):
    - `partition_layout.txt` — the full partition table, needed by the restore script
+   - `gpt_primary.bin` / `gpt_secondary.bin` — the raw GPT tables (the parted text dump captures geometry and names; the raw tables also preserve type GUIDs, unique GUIDs, and attribute flags for an exact restore if ever needed)
    - `rsv_backup.bin` — the rsv partition (64 MB)
    - `env_backup.bin` — U-Boot environment (p2)
-   - `bootloader_a_backup.bin` — bootloader (p7, 8 MB)
+   - `bootloader_a_backup.bin` — bootloader (p7, 8 MB), plus `bootloader_b_backup.bin` if the layout has one
    - `reserved_backup.bin` — `reserved` partition (p1, 64 MB), which holds the Amlogic UKS keystore with the device's ETH MAC and serial. The installer doesn't write to p1, but the backup is cheap insurance because the factory image doesn't include p1 either — if it were ever wiped, USB Burning Tool restore would NOT bring it back. **The backup is verified after writing**: if `aml-keystore-tool.py info` doesn't see a valid AMLNORMAL header + populated slot count, the install aborts before any destructive operations.
    - `frp_backup.bin` — `frp` partition (p3, 2 MB) — contains 36 bytes of unit-unique anti-rollback / FRP signing material
    - `param_backup.bin` — `param` partition (p15, 16 MB) — ext4 filesystem with the TV picture-quality DB (`pq.db`, `TV_PICTURE`), likely tuned per-device at the factory
+
+   Every `dd` backup is size-verified against its partition (catches silent short reads), and the whole set is `sync`'d to the SD card before the first destructive operation.
 6. **Keeps `super` (p27) untouched** — Android system images remain on the eMMC
 7. Deletes two Android partitions:
    - `rsv` (p28, ~64 MB) — reserved partition, unknown purpose, backed up first
@@ -69,7 +72,7 @@ See [`emmc-research.md`](research/emmc-research.md) for the full research notes.
 10. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot `disk=FOLDER=/dev/CE_STORAGE` path, with correct mkimage CRCs (see technical notes). Pass `--no-cfgload-rebuild` to skip this step.
 11. **Always installs `/flash/mount-storage.sh` + adds `nofsck` to `config.ini`** — these are the durable rescue layer. CoreELEC's nightly updater unconditionally overwrites `cfgload` from its stock source, reverting the step-10 patch on every update. `mount-storage.sh` is a first-class CE init hook (line ~635 of `/init` sources it instead of `mount_part`) that bypasses the broken `FOLDER=` mount path entirely; `nofsck` suppresses the retry loop the missing `/dev/CE_STORAGE` node would otherwise cause. Both files are user-added and never touched by the updater, so the device boots cleanly through every nightly update.
 12. With `--restore-logo PATH`: writes a custom boot logo to `p10` (the AML_RES container). PATH can be either a packed `.bin` (validated against the `AML_RES!` magic) or a directory of `NN_name.bmp` files produced by `aml-logo-tool.py unpack`.
-13. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE`, with a free-space check before proceeding
+13. Optionally migrates your existing `/storage` (settings, addons, media) to `CE_STORAGE` — with a free-space check before proceeding, Kodi stopped during the copy so its local SQLite databases aren't copied hot, and a size/entry-count verification of the result afterwards (a failed verification prints manual recovery steps instead of silently proceeding)
 
 The installer also supports **`--info`** — a read-only diagnostic mode that prints the partition layout, eMMC chip details, U-Boot env summary, AMLNORMAL keystore contents, bootloader build version, current install state (with warnings if legacy workarounds are present), and the cmdline-vs-keystore identity check result. No backups, no writes, safe to run any time. Useful before committing to an install.
 
@@ -95,7 +98,7 @@ bash /storage/ce-emmc-install.sh --dry-run
 bash /storage/ce-emmc-install.sh
 ```
 
-The script will walk you through confirmation prompts before making any changes. If `whiptail` is available and the terminal is large enough, it will use a simple TUI for the confirmation dialogs; otherwise it falls back to plain text with a typed `YES` confirmation.
+The script will walk you through confirmation prompts before making any changes. If `whiptail` is available and the terminal is large enough, it will use a simple TUI for the confirmation dialogs; otherwise it falls back to plain text. Either way, the destructive step requires typing `YES` — a single keypress is deliberately not enough to delete partitions.
 
 When it's done, remove the SD card and reboot — the device will boot CoreELEC from eMMC automatically.
 
@@ -115,7 +118,7 @@ There are two restore paths depending on whether the backup files from the insta
 
 ### Option 1 — Restore script (recommended, no Windows PC required)
 
-If you have the backup files that `ce-emmc-install.sh` saved to the SD card's `/storage`, you can restore the original Android partition layout directly:
+If you have the backup files that `ce-emmc-install.sh` saved to the SD card's `/storage/emmc-backup` (older installer versions wrote them flat into `/storage` — the restore script finds either layout automatically), you can restore the original Android partition layout directly:
 
 ```bash
 # Boot CoreELEC from the SD card, then:
@@ -127,7 +130,7 @@ The restore script:
 2. Deletes CE_FLASH and CE_STORAGE
 3. Recreates the original `rsv` and `userdata` partitions at their exact original positions
 4. Restores `rsv` content from `rsv_backup.bin`
-5. Restores `env` and `bootloader_a` from their backups
+5. Restores `env` and `bootloader_a` from their backups (plus `frp`, `param`, and `bootloader_b` if those backups exist)
 6. Leaves `super` (p27) untouched — it was never modified
 
 Android's `userdata` partition is recreated empty. Android will reinitialize it on first boot from the system images in `super`. The device will boot as if from a factory reset — you will go through Android setup again, but the OS is intact.
