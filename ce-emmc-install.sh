@@ -13,9 +13,13 @@
 #   1. Verifies device identity by cross-checking the running cmdline's
 #      `androidboot.serialno` and `mac=` against the AMLNORMAL keystore on
 #      `reserved` (p1) using aml-keystore-tool.py — aborts if they disagree
-#   2. Backs up partition layout, rsv (p28), env (p2), bootloader_a (p7),
+#   2. Backs up partition layout (parted text + raw GPT primary/secondary),
+#      rsv (p28), env (p2), bootloader_a (p7, plus bootloader_b if present),
 #      reserved (p1, the AMLNORMAL keystore with MAC/serial), frp (p3, anti-
-#      rollback nonce), and param (p15, TV picture-quality DB) to /storage
+#      rollback nonce), and param (p15, TV picture-quality DB) to
+#      /storage/emmc-backup. Every dd backup is size-verified against the
+#      partition, and the whole set is fsync'd before any destructive op.
+#      Refuses to clobber an existing backup set (move it aside to re-run).
 #   3. After backup, verifies the p1 backup is a valid AMLNORMAL keystore
 #      (correct magic + at least 2 populated slots) — aborts on failure
 #   4. Keeps super (p27) — Android system images intact for potential restore
@@ -64,7 +68,9 @@ while [[ $# -gt 0 ]]; do
         --info)                INFO_MODE=true; shift ;;
         --dry-run)             DRY_RUN=true; shift ;;
         --no-cfgload-rebuild)  REBUILD_CFGLOAD=false; shift ;;
-        --restore-logo)        LOGO_PATH="$2"; shift 2 ;;
+        --restore-logo)
+            [[ $# -ge 2 ]] || { echo "--restore-logo requires a PATH argument (try --help)" >&2; exit 1; }
+            LOGO_PATH="$2"; shift 2 ;;
         --restore-logo=*)      LOGO_PATH="${1#--restore-logo=}"; shift ;;
         --help)
             cat <<EOF
@@ -112,7 +118,10 @@ SUPPORTED_BOARDS=(
 )
 MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
-BACKUP_DIR="/storage"
+# Backups go in a dedicated subdirectory so a rerun can never silently clobber
+# a previous backup set (rsv_backup.bin is the only path back to Android).
+# Preflight refuses to proceed if this directory already exists non-empty.
+BACKUP_DIR="/storage/emmc-backup"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Locate the aml-*-tool.py helpers. We accept either the legacy layout
@@ -201,11 +210,18 @@ if command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
     [[ $_cols -ge 60 && $_rows -ge 20 ]] && USE_TUI=true
 fi
 
-# tui_confirm_destructive — main confirm dialog (requires typing YES in text mode)
+# tui_confirm_destructive — main confirm dialog. Both modes require typing
+# YES: a whiptail --yesno alone is a single keypress, which is too little
+# deliberateness for an operation that deletes partitions.
 tui_confirm_destructive() {
     local title="$1" msg="$2"
     if $USE_TUI; then
-        whiptail --title "$title" --yesno "$msg" 22 72 3>&1 1>&2 2>&3
+        whiptail --title "$title" --yesno "$msg" 22 72 3>&1 1>&2 2>&3 || return 1
+        local ans
+        ans=$(whiptail --title "$title" --inputbox \
+            "Final confirmation — type YES (all caps) to proceed:" 10 60 \
+            3>&1 1>&2 2>&3) || return 1
+        [[ "$ans" == "YES" ]]
     else
         echo -e "$msg"
         echo ""
@@ -258,6 +274,20 @@ make_emmc_nodes() {
     done
 }
 
+# Locate the sysfs directory for eMMC partition N, whichever naming style the
+# kernel used (mmcblk0pN from a GPT scan, partition label under Amlogic's
+# driver — same duality make_emmc_nodes handles). Echoes the directory path
+# (with trailing /) on success.
+find_part_sysfs() {
+    local want="$1" dir partnum
+    for dir in /sys/block/mmcblk0/*/; do
+        [[ -f "${dir}partition" ]] || continue
+        partnum=$(cat "${dir}partition" 2>/dev/null) || continue
+        [[ "$partnum" == "$want" ]] && { echo "$dir"; return 0; }
+    done
+    return 1
+}
+
 # After repartitioning, ask the kernel to re-read the partition table and
 # create /dev nodes for the new partitions using sysfs-reported major:minor.
 #
@@ -272,15 +302,14 @@ reread_and_make_nodes() {
     command -v partx >/dev/null 2>&1 && partx -u "$EMMC" 2>/dev/null || true
 
     for part in "${parts[@]}"; do
-        local sysfs_dev="/sys/block/mmcblk0/mmcblk0p${part}/dev"
-        local waited=0
-        while [[ ! -f "$sysfs_dev" ]] && (( waited < 10 )); do
+        local sysfs_dir="" waited=0
+        until sysfs_dir=$(find_part_sysfs "$part") || (( waited >= 10 )); do
             sleep 1
             (( waited++ )) || true
         done
-        if [[ -f "$sysfs_dev" ]]; then
+        if [[ -n "$sysfs_dir" && -f "${sysfs_dir}dev" ]]; then
             local devnum maj min
-            read -r devnum < "$sysfs_dev"
+            read -r devnum < "${sysfs_dir}dev"
             maj="${devnum%%:*}"
             min="${devnum##*:}"
             rm -f "/dev/mmcblk0p${part}" 2>/dev/null || true
@@ -299,7 +328,35 @@ part_size_mib() {
         | awk -F: -v p="$1" '$1==p{gsub(/MiB/,"",$4); printf "%.0f",$4}'
 }
 
+part_size_bytes() {
+    parted -sm "$EMMC" unit B print 2>/dev/null \
+        | awk -F: -v p="$1" '$1==p{gsub(/B/,"",$4); print $4}'
+}
+
 human_mib() { awk -v m="$1" 'BEGIN{if(m>=1024)printf "%.1f GB",m/1024; else printf "%d MB",m}'; }
+
+# ── Backup helper ─────────────────────────────────────────────────────────────
+
+# dd one partition to a backup file, then verify the file size matches the
+# partition size exactly. dd reports success on a short read from a flaky
+# device, and set -e would never notice — a truncated rsv_backup.bin would
+# poison the eventual Android restore, so catch it here while the source
+# partition is still intact.
+backup_part() {
+    local part="$1" file="$2" label="$3"
+    if $DRY_RUN; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} dd if=${EMMC}p${part} of=${file} bs=1M"
+        return 0
+    fi
+    dd if="${EMMC}p${part}" of="$file" bs=1M status=none
+    local expected actual
+    expected=$(part_size_bytes "$part")
+    actual=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file")
+    if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+        die "${label} (p${part}) backup size mismatch: file is ${actual:-?} bytes, partition is ${expected:-?} bytes"
+    fi
+    log "${label} (p${part}) → ${file} (${actual} bytes, size verified)"
+}
 
 # ── Keystore / identity helpers ──────────────────────────────────────────────
 
@@ -572,15 +629,29 @@ if blkid "${EMMC}p27" 2>/dev/null | grep -q "CE_FLASH"; then
     die "Old-style CoreELEC install detected on p27. Restore Android via USB Burning Tool first."
 fi
 
-# Check for expected Android partition layout
-parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^27:" || \
-    die "Partition 27 (super) not found — unexpected layout. Has this already been modified?"
-parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^28:" || \
-    die "Partition 28 (rsv) not found — unexpected layout."
-parted -sm "$EMMC" unit B print 2>/dev/null | grep -q "^29:" || \
-    die "Partition 29 (userdata) not found — unexpected layout."
+# Check for expected Android partition layout — numbers AND names. Verifying
+# names catches a partially-completed previous run: if parted recreated
+# p28/p29 as CE_FLASH/CE_STORAGE but mkfs never ran, the blkid checks above
+# find no filesystem label and pass, and a number-only check would let the
+# backup phase dd the empty CE_FLASH partition over a good rsv_backup.bin.
+LAYOUT_B=$(parted -sm "$EMMC" unit B print 2>/dev/null)
+for spec in "27:super" "28:rsv" "29:userdata"; do
+    pnum="${spec%%:*}"
+    pname="${spec##*:}"
+    have=$(awk -F: -v p="$pnum" '$1==p{print $6; exit}' <<<"$LAYOUT_B")
+    [[ -n "$have" ]] || \
+        die "Partition ${pnum} (${pname}) not found — unexpected layout. Has this already been modified?"
+    [[ "$have" == "$pname" ]] || \
+        die "Partition ${pnum} is named '${have}', expected '${pname}' — looks like a partial previous install. Restore Android first (ce-emmc-restore.sh or USB Burning Tool)."
+done
 
-log "Partition layout: 29-partition Android layout confirmed"
+log "Partition layout: 29-partition Android layout confirmed (super/rsv/userdata names verified)"
+
+# Refuse to clobber an existing backup set — rsv_backup.bin is the only path
+# back to Android, so a rerun must never overwrite it.
+if [[ -d "$BACKUP_DIR" && -n "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
+    die "Backup directory $BACKUP_DIR already exists and is not empty — refusing to overwrite a previous backup set. Move it aside first: mv $BACKUP_DIR ${BACKUP_DIR}.old"
+fi
 
 # Cross-check device identity vs the AMLNORMAL keystore in p1 — aborts on
 # mismatch. Catches the case where someone has been modifying state, or the
@@ -604,13 +675,21 @@ CE_STORAGE_HUMAN=$(human_mib "$CE_STORAGE_SIZE_MIB")
 # Read rsv before the confirm screen so the result can be included in the
 # confirm message. The backup happens after the user confirms.
 
-RSV_HAS_DATA=$(dd if="${EMMC}p28" bs=512 count=1 2>/dev/null | tr -d '\0' | wc -c)
+# Scan the whole partition (rsv is small) — data anywhere in it counts.
+RSV_HAS_DATA=$(dd if="${EMMC}p28" bs=1M 2>/dev/null | tr -d '\0' | wc -c)
 
 # ── Confirm ───────────────────────────────────────────────────────────────────
 
 RSV_NOTE=""
 if [[ "$RSV_HAS_DATA" -gt 0 ]]; then
     RSV_NOTE="  [contains data — will be backed up]"
+fi
+
+LOGO_LINE=""
+UNTOUCHED_NOTE="Partitions p1–p26 and super (p27) are NOT touched."
+if [[ -n "$LOGO_BIN" ]]; then
+    LOGO_LINE=$'\n'"  WRITE   p10  logo        custom boot logo (--restore-logo)"
+    UNTOUCHED_NOTE="Partitions p1–p26 (except the p10 logo write above) and super (p27) are NOT touched."
 fi
 
 CONFIRM_MSG="\
@@ -622,9 +701,9 @@ CoreELEC eMMC Installer — ${BOARD_NAME}
   DELETE  p29  userdata    ${USERDATA_HUMAN}  (encrypted — unrecoverable)
 
   CREATE  p28  CE_FLASH    512 MB  FAT32  (CoreELEC boot)
-  CREATE  p29  CE_STORAGE  ${CE_STORAGE_HUMAN}  ext4   (CoreELEC storage)
+  CREATE  p29  CE_STORAGE  ${CE_STORAGE_HUMAN}  ext4   (CoreELEC storage)${LOGO_LINE}
 
-Partitions p1–p26 and super (p27) are NOT touched.
+${UNTOUCHED_NOTE}
 boot0/boot1 are hardware write-protected and safe.
 
 Android restore requires Amlogic USB Burning Tool on Windows via the
@@ -637,23 +716,41 @@ tui_confirm_destructive "CoreELEC eMMC Installer — ${BOARD_NAME}" "$CONFIRM_MS
 
 header "Backing up critical partitions"
 
+run mkdir -p "$BACKUP_DIR"
+
 # Save the current partition layout — required by ce-emmc-restore.sh to
-# reconstruct the original p28/p29 boundaries exactly.
+# reconstruct the original p28/p29 boundaries exactly. LAYOUT_B was captured
+# during preflight, before anything could have changed.
 if ! $DRY_RUN; then
-    parted -sm "$EMMC" unit B print > "${BACKUP_DIR}/partition_layout.txt"
+    printf '%s\n' "$LAYOUT_B" > "${BACKUP_DIR}/partition_layout.txt"
     log "Partition layout → ${BACKUP_DIR}/partition_layout.txt"
 else
     echo -e "${YELLOW}[DRY-RUN]${NC} parted -sm $EMMC unit B print > ${BACKUP_DIR}/partition_layout.txt"
 fi
 
-run dd if="${EMMC}p28" of="${BACKUP_DIR}/rsv_backup.bin" bs=1M status=none
-log "rsv (p28) → ${BACKUP_DIR}/rsv_backup.bin"
+# Raw GPT tables (primary: LBA 0–33, secondary: last 33 LBAs). The restore
+# script recreates p28/p29 via parted from partition_layout.txt, which gets
+# geometry and names right but not the original type GUIDs, unique GUIDs, or
+# attribute flags. The raw tables make an exact restore possible if ever
+# needed. ~34 KB total.
+SECTORS_TOTAL=$(cat /sys/block/mmcblk0/size)
+run dd if="$EMMC" of="${BACKUP_DIR}/gpt_primary.bin" bs=512 count=34 status=none
+log "GPT primary (LBA 0–33) → ${BACKUP_DIR}/gpt_primary.bin"
+run dd if="$EMMC" of="${BACKUP_DIR}/gpt_secondary.bin" bs=512 skip=$((SECTORS_TOTAL - 33)) count=33 status=none
+log "GPT secondary (last 33 LBAs) → ${BACKUP_DIR}/gpt_secondary.bin"
 
-run dd if="${EMMC}p2" of="${BACKUP_DIR}/env_backup.bin" bs=1M status=none
-log "env (p2) → ${BACKUP_DIR}/env_backup.bin"
+backup_part 28 "${BACKUP_DIR}/rsv_backup.bin"          "rsv"
+backup_part 2  "${BACKUP_DIR}/env_backup.bin"          "env"
+backup_part 7  "${BACKUP_DIR}/bootloader_a_backup.bin" "bootloader_a"
 
-run dd if="${EMMC}p7" of="${BACKUP_DIR}/bootloader_a_backup.bin" bs=1M status=none
-log "bootloader_a (p7) → ${BACKUP_DIR}/bootloader_a_backup.bin"
+# bootloader_b — present on A/B layouts. Back it up too if the table has one,
+# so the backup set is symmetric with what a factory restore would expect.
+BL_B_PART=$(awk -F: '$6=="bootloader_b"{print $1; exit}' <<<"$LAYOUT_B")
+if [[ -n "$BL_B_PART" ]]; then
+    backup_part "$BL_B_PART" "${BACKUP_DIR}/bootloader_b_backup.bin" "bootloader_b"
+else
+    log "No bootloader_b partition in layout — skipping"
+fi
 
 # Back up p1 reserved — it holds the Amlogic UKS keystore (AMLNORMAL magic at
 # offset 0x4000, with a redundant copy at 0x44000). On this SoC family the
@@ -661,8 +758,7 @@ log "bootloader_a (p7) → ${BACKUP_DIR}/bootloader_a_backup.bin"
 # does not touch p1, but a wipe of this partition would lose eMMC-stored
 # identity and the factory image does not include it, so USB Burning Tool
 # restore would not recover the values. Cheap insurance.
-run dd if="${EMMC}p1" of="${BACKUP_DIR}/reserved_backup.bin" bs=1M status=none
-log "reserved (p1) → ${BACKUP_DIR}/reserved_backup.bin"
+backup_part 1 "${BACKUP_DIR}/reserved_backup.bin" "reserved"
 
 # Verify the p1 backup actually contains a valid AMLNORMAL keystore. If the
 # dd read silently produced zeros or the keystore is corrupt, we want to know
@@ -676,14 +772,18 @@ fi
 # Back up frp (p3) — contains 36 bytes of unit-unique anti-rollback / FRP
 # signing material at offset 0. The install doesn't touch p3 either; this is
 # defensive in case of future destructive operations on the partition table.
-run dd if="${EMMC}p3" of="${BACKUP_DIR}/frp_backup.bin" bs=1M status=none
-log "frp (p3) → ${BACKUP_DIR}/frp_backup.bin"
+backup_part 3 "${BACKUP_DIR}/frp_backup.bin" "frp"
 
 # Back up param (p15) — ext4 filesystem mounted at /mnt/vendor/param in
 # Android, containing the TV picture-quality DB (pq.db, pq_ext.db) which
 # is likely tuned per-device at the factory. Same defensive rationale.
-run dd if="${EMMC}p15" of="${BACKUP_DIR}/param_backup.bin" bs=1M status=none
-log "param (p15) → ${BACKUP_DIR}/param_backup.bin"
+backup_part 15 "${BACKUP_DIR}/param_backup.bin" "param"
+
+# Flush the whole backup set to the boot media before the first destructive
+# op — the backups exist precisely for the crash/power-loss case, so they
+# must be durable on disk (not page cache) when the cutting starts.
+run sync
+log "Backup set flushed to disk"
 
 # ── Repartition ───────────────────────────────────────────────────────────────
 
@@ -901,6 +1001,17 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
     log "Migration: user accepted prompt"
     header "Migrating /storage to CE_STORAGE"
 
+    # Quiesce Kodi so its local SQLite databases (Textures13.db, addon DBs)
+    # aren't being written mid-copy — rsyncing a hot database can land a torn
+    # copy on the destination. Also keeps the source stable for the du-based
+    # verification below.
+    KODI_STOPPED=false
+    if ! $DRY_RUN && systemctl is-active --quiet kodi 2>/dev/null; then
+        log "Stopping Kodi for a quiescent copy..."
+        systemctl stop kodi
+        KODI_STOPPED=true
+    fi
+
     run mkdir -p "$MNT_STORAGE"
     run mount -t ext4 -o rw,noatime "${EMMC}p29" "$MNT_STORAGE"
 
@@ -915,8 +1026,10 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
     else
         # Source and free size — also logged so a transcript shows the
         # space accounting that drove the migrate/skip decision.
+        # Entry counts via -print0 so filenames containing newlines can't
+        # skew the tally.
         STORAGE_USED=$(du -sb /storage 2>/dev/null | awk '{print $1}')
-        STORAGE_FILES=$(find /storage -mindepth 1 2>/dev/null | wc -l)
+        STORAGE_FILES=$(find /storage -mindepth 1 -print0 2>/dev/null | tr -dc '\0' | wc -c)
         CE_FREE=$(df -B1 "$MNT_STORAGE" 2>/dev/null | awk 'NR==2{print $4}')
         log "Source /storage:  $(( STORAGE_USED/1024/1024 )) MB across ${STORAGE_FILES} entries"
         log "CE_STORAGE free:  $(( CE_FREE/1024/1024 )) MB"
@@ -937,7 +1050,7 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
             # things — surface it loudly so the user can recover before
             # rebooting.
             DEST_USED=$(du -sb "$MNT_STORAGE" 2>/dev/null | awk '{print $1}')
-            DEST_FILES=$(find "$MNT_STORAGE" -mindepth 1 2>/dev/null | wc -l)
+            DEST_FILES=$(find "$MNT_STORAGE" -mindepth 1 -print0 2>/dev/null | tr -dc '\0' | wc -c)
             log "Migration result:"
             log "  source: $(( STORAGE_USED/1024/1024 )) MB / ${STORAGE_FILES} entries"
             log "  dest:   $(( DEST_USED/1024/1024 )) MB / ${DEST_FILES} entries"
@@ -979,6 +1092,11 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
             fi
         fi
     fi
+
+    if $KODI_STOPPED; then
+        log "Restarting Kodi..."
+        systemctl start kodi || warn "Kodi failed to restart — it will come back on reboot"
+    fi
 else
     log "Migration: skipped (user declined or dismissed prompt)"
 fi
@@ -992,6 +1110,9 @@ if ! $DRY_RUN; then
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
+
+# Final flush — the very next thing the user does is pull the boot media.
+run sync
 
 echo ""
 echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════${NC}"
@@ -1007,9 +1128,10 @@ echo "    ssh-keygen -R <device-ip>"
 echo ""
 echo "  Backups saved to ${BACKUP_DIR}:"
 echo "    partition_layout.txt   (needed by ce-emmc-restore.sh)"
+echo "    gpt_primary.bin / gpt_secondary.bin  (raw GPT tables)"
 echo "    rsv_backup.bin"
 echo "    env_backup.bin"
-echo "    bootloader_a_backup.bin"
+echo "    bootloader_a_backup.bin (+ bootloader_b_backup.bin if present)"
 echo "    reserved_backup.bin    (Amlogic UKS keystore — MAC/serial)"
 echo "    frp_backup.bin         (anti-rollback / FRP nonce)"
 echo "    param_backup.bin       (Amlogic TV picture-quality DB)"

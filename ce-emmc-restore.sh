@@ -2,7 +2,8 @@
 # ce-emmc-restore.sh — Restore Android partition layout after CoreELEC eMMC install
 # Must be run from CoreELEC booted off removable media (SD card or USB stick) —
 # anywhere except the eMMC itself, which we're about to repartition.
-# Requires backup files created by ce-emmc-install.sh in /storage.
+# Requires backup files created by ce-emmc-install.sh in /storage/emmc-backup
+# (or flat in /storage, the layout older installer versions used).
 
 set -euo pipefail
 
@@ -27,7 +28,13 @@ done
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 EMMC="/dev/mmcblk0"
-BACKUP_DIR="/storage"
+# Current installer writes backups to /storage/emmc-backup; older versions
+# wrote them flat into /storage. Prefer the subdirectory when it has a set.
+if [[ -f "/storage/emmc-backup/partition_layout.txt" ]]; then
+    BACKUP_DIR="/storage/emmc-backup"
+else
+    BACKUP_DIR="/storage"
+fi
 MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
 
@@ -104,11 +111,18 @@ tui_msg() {
     fi
 }
 
-# tui_confirm_destructive — main confirm dialog (requires typing YES in text mode)
+# tui_confirm_destructive — main confirm dialog. Both modes require typing
+# YES: a whiptail --yesno alone is a single keypress, which is too little
+# deliberateness for an operation that deletes partitions.
 tui_confirm_destructive() {
     local title="$1" msg="$2"
     if $USE_TUI; then
-        whiptail --title "$title" --yesno "$msg" 22 72 3>&1 1>&2 2>&3
+        whiptail --title "$title" --yesno "$msg" 22 72 3>&1 1>&2 2>&3 || return 1
+        local ans
+        ans=$(whiptail --title "$title" --inputbox \
+            "Final confirmation — type YES (all caps) to proceed:" 10 60 \
+            3>&1 1>&2 2>&3) || return 1
+        [[ "$ans" == "YES" ]]
     else
         echo -e "$msg"
         echo ""
@@ -120,19 +134,38 @@ tui_confirm_destructive() {
 
 # ── eMMC node helpers ─────────────────────────────────────────────────────────
 
-# Create /dev nodes for eMMC partitions the kernel already knows about,
-# reading major:minor from sysfs rather than assuming sequential numbering.
+# Create /dev nodes for eMMC partitions the kernel already knows about.
+# Handles both kernel naming styles (mmcblk0pN from a GPT scan, partition
+# label under Amlogic's driver) — same logic as ce-emmc-install.sh.
 make_emmc_nodes() {
-    for sysfs_dev in /sys/block/mmcblk0/mmcblk0p*/dev; do
-        [[ -f "$sysfs_dev" ]] || continue
-        local partname
-        partname=$(basename "$(dirname "$sysfs_dev")")
-        local devnum maj min
-        read -r devnum < "$sysfs_dev"
+    for dir in /sys/block/mmcblk0/*/; do
+        [[ -f "${dir}partition" ]] || continue
+        local partnum devnum maj min
+        partnum=$(cat "${dir}partition" 2>/dev/null) || continue
+        [[ -n "$partnum" ]] || continue
+        [[ -f "${dir}dev" ]] || continue
+        read -r devnum < "${dir}dev"
         maj="${devnum%%:*}"
         min="${devnum##*:}"
-        mknod "/dev/${partname}" b "$maj" "$min" 2>/dev/null || true
+        mknod "/dev/mmcblk0p${partnum}" b "$maj" "$min" 2>/dev/null || true
+        local label
+        label=$(basename "$dir")
+        if [[ "$label" != mmcblk0p* ]]; then
+            mknod "/dev/${label}" b "$maj" "$min" 2>/dev/null || true
+        fi
     done
+}
+
+# Locate the sysfs directory for eMMC partition N, whichever naming style the
+# kernel used. Echoes the directory path (with trailing /) on success.
+find_part_sysfs() {
+    local want="$1" dir partnum
+    for dir in /sys/block/mmcblk0/*/; do
+        [[ -f "${dir}partition" ]] || continue
+        partnum=$(cat "${dir}partition" 2>/dev/null) || continue
+        [[ "$partnum" == "$want" ]] && { echo "$dir"; return 0; }
+    done
+    return 1
 }
 
 # After repartitioning, ask the kernel to re-read the partition table and
@@ -143,15 +176,14 @@ reread_and_make_nodes() {
     command -v partx >/dev/null 2>&1 && partx -u "$EMMC" 2>/dev/null || true
 
     for part in "${parts[@]}"; do
-        local sysfs_dev="/sys/block/mmcblk0/mmcblk0p${part}/dev"
-        local waited=0
-        while [[ ! -f "$sysfs_dev" ]] && (( waited < 10 )); do
+        local sysfs_dir="" waited=0
+        until sysfs_dir=$(find_part_sysfs "$part") || (( waited >= 10 )); do
             sleep 1
             (( waited++ )) || true
         done
-        if [[ -f "$sysfs_dev" ]]; then
+        if [[ -n "$sysfs_dir" && -f "${sysfs_dir}dev" ]]; then
             local devnum maj min
-            read -r devnum < "$sysfs_dev"
+            read -r devnum < "${sysfs_dir}dev"
             maj="${devnum%%:*}"
             min="${devnum##*:}"
             rm -f "/dev/mmcblk0p${part}" 2>/dev/null || true
@@ -295,6 +327,17 @@ else
     warn "param_backup.bin not present (older install) — skipping p15 restore"
 fi
 
+if [[ -f "${BACKUP_DIR}/bootloader_b_backup.bin" ]]; then
+    BL_B_PART=$(parted -sm "$EMMC" unit B print 2>/dev/null \
+        | awk -F: '$6=="bootloader_b"{print $1; exit}')
+    if [[ -n "$BL_B_PART" ]]; then
+        run dd if="${BACKUP_DIR}/bootloader_b_backup.bin" of="${EMMC}p${BL_B_PART}" bs=1M status=none
+        log "bootloader_b (p${BL_B_PART}) restored from backup"
+    else
+        warn "bootloader_b_backup.bin present but no bootloader_b partition found — skipping"
+    fi
+fi
+
 # ── Post-restore partition layout ─────────────────────────────────────────────
 
 header "Final eMMC partition layout"
@@ -304,6 +347,9 @@ if ! $DRY_RUN; then
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
+
+# Flush the restored partition contents before the user pulls the boot media.
+run sync
 
 echo ""
 echo -e "${GREEN}${BOLD}Android partition layout restored.${NC}"
