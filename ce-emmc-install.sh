@@ -177,6 +177,14 @@ run() {
 # to partx -u for the kernel-side reconciliation. This wrapper runs parted with
 # both streams merged so the user still sees parted's output, and treats the
 # BLKRRPART warning as non-fatal so set -e doesn't kill the script.
+#
+# IMPORTANT: pass exactly ONE parted command per invocation. parted -s stops
+# executing its command list at the first commit that fails to reach the
+# kernel, so a tolerated warning on a chained call can also mean "the later
+# commands never ran". GitHub issue #1: of `rm 29 rm 28` only `rm 29`
+# executed, and the CE_FLASH mkpart then collided with the surviving rsv.
+# Every destructive invocation must be followed by verify_part_absent /
+# verify_part_present to confirm the on-disk table actually changed.
 run_parted() {
     if $DRY_RUN; then
         echo -e "${YELLOW}[DRY-RUN]${NC} parted $*"
@@ -194,6 +202,50 @@ run_parted() {
         return $rc
     fi
     return 0
+}
+
+# On-disk GPT row / name for partition N, read fresh from disk via parted —
+# reflects reality even when the kernel's partition view is stale. Empty
+# output from ondisk_part_row means the partition does not exist on disk.
+ondisk_part_row()  { parted -sm "$EMMC" unit B print 2>/dev/null | awk -F: -v p="$1" '$1==p{print; exit}'; }
+ondisk_part_name() { ondisk_part_row "$1" | awk -F: '{print $6}'; }
+
+# If the on-disk table ends up half-changed (delete verified but a later step
+# failed), neither the install preflight nor the restore script will accept
+# the layout. The raw GPT backup taken before any destructive op is the way
+# back to the original Android table — partition contents are untouched by
+# table edits, so restoring the GPT fully undoes the repartition.
+repartition_recovery_hint() {
+    local sectors
+    sectors=$(cat /sys/block/mmcblk0/size)
+    cat <<EOF
+To return to the original Android partition table, restore the GPT saved in
+your backup set and reboot:
+  dd if=${BACKUP_DIR}/gpt_primary.bin of=${EMMC} bs=512 count=34
+  dd if=${BACKUP_DIR}/gpt_secondary.bin of=${EMMC} bs=512 seek=$((sectors - 33))
+  sync && reboot
+Then move ${BACKUP_DIR} aside and re-run this installer.
+EOF
+}
+
+verify_part_absent() {
+    $DRY_RUN && return 0
+    local part="$1"
+    [[ -z "$(ondisk_part_row "$part")" ]] && return 0
+    die "Partition ${part} is still present in the on-disk GPT after 'parted rm' —
+the kernel likely refused the table update (a partition was in use) and
+parted stopped before finishing.
+$(repartition_recovery_hint)"
+}
+
+verify_part_present() {
+    $DRY_RUN && return 0
+    local part="$1" want="$2" have
+    have=$(ondisk_part_name "$part")
+    [[ "$have" == "$want" ]] && return 0
+    die "Partition ${part} is '${have:-absent}' in the on-disk GPT, expected '${want}' —
+'parted mkpart' did not take effect.
+$(repartition_recovery_hint)"
 }
 
 $DRY_RUN && warn "DRY-RUN mode — no changes will be made"
@@ -640,7 +692,10 @@ for spec in "27:super" "28:rsv" "29:userdata"; do
     pname="${spec##*:}"
     have=$(awk -F: -v p="$pnum" '$1==p{print $6; exit}' <<<"$LAYOUT_B")
     [[ -n "$have" ]] || \
-        die "Partition ${pnum} (${pname}) not found — unexpected layout. Has this already been modified?"
+        die "Partition ${pnum} (${pname}) not found — unexpected layout. Has this already been modified?
+If a previous install attempt stopped during repartitioning, restore the
+original GPT from that run's backup set (gpt_primary.bin / gpt_secondary.bin
+— see the recovery commands in the README), reboot, and re-run."
     [[ "$have" == "$pname" ]] || \
         die "Partition ${pnum} is named '${have}', expected '${pname}' — looks like a partial previous install. Restore Android first (ce-emmc-restore.sh or USB Burning Tool)."
 done
@@ -789,6 +844,19 @@ log "Backup set flushed to disk"
 
 header "Repartitioning eMMC"
 
+# Nothing from the eMMC may be mounted while its table is rewritten — the
+# kernel refuses the update for in-use partitions, and that's what triggers
+# the parted stop-early failure described at run_parted (issue #1). CE's
+# automounter can grab mountable eMMC partitions under /media, so sweep and
+# unmount them. (/flash is guaranteed off-eMMC by preflight.)
+EMMC_MOUNTPOINTS=$(awk -v d="$EMMC" 'index($1, d) == 1 {print $2}' /proc/mounts)
+if [[ -n "$EMMC_MOUNTPOINTS" ]]; then
+    while IFS= read -r mnt; do
+        warn "eMMC partition mounted at ${mnt} — unmounting"
+        run umount "$mnt" || die "Could not unmount ${mnt} — close whatever is using it (or reboot) and re-run"
+    done <<< "$EMMC_MOUNTPOINTS"
+fi
+
 # Find where p28 (rsv) starts — CE_FLASH will occupy the same starting position
 RSV_START_B=$(parted -sm "$EMMC" unit B print 2>/dev/null \
     | awk -F: '/^28:/{gsub(/B/,""); print $2}')
@@ -798,14 +866,21 @@ RSV_START_B=$(parted -sm "$EMMC" unit B print 2>/dev/null \
 RSV_START_MIB=$((RSV_START_B / 1024 / 1024))
 CE_FLASH_END_MIB=$((RSV_START_MIB + 512))
 
-log "Deleting partitions 28 (rsv) and 29 (userdata)..."
-run_parted -s "$EMMC" rm 29 rm 28
+log "Deleting partition 29 (userdata)..."
+run_parted -s "$EMMC" rm 29
+verify_part_absent 29
+
+log "Deleting partition 28 (rsv)..."
+run_parted -s "$EMMC" rm 28
+verify_part_absent 28
 
 log "Creating CE_FLASH (${RSV_START_MIB}MiB – ${CE_FLASH_END_MIB}MiB)..."
 run_parted -s "$EMMC" mkpart CE_FLASH fat32 "${RSV_START_MIB}MiB" "${CE_FLASH_END_MIB}MiB"
+verify_part_present 28 CE_FLASH
 
 log "Creating CE_STORAGE (${CE_FLASH_END_MIB}MiB – 100%)..."
 run_parted -s "$EMMC" mkpart CE_STORAGE ext4 "${CE_FLASH_END_MIB}MiB" "100%"
+verify_part_present 29 CE_STORAGE
 
 # Ask the kernel to re-read the partition table, then create device nodes
 # using sysfs-reported major:minor numbers (not assumed sequential values)

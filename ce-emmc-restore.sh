@@ -72,6 +72,11 @@ run() {
 # Tolerate parted's BLKRRPART warning — see ce-emmc-install.sh:run_parted for
 # the full explanation. The on-disk write succeeds; partx -u reconciles the
 # kernel-side view downstream.
+#
+# IMPORTANT: one parted command per invocation — parted -s stops executing
+# its command list at the first commit that fails to reach the kernel, so a
+# chained call can silently skip its later commands (install issue #1).
+# Follow every destructive invocation with verify_part_absent/present.
 run_parted() {
     if $DRY_RUN; then
         echo -e "${YELLOW}[DRY-RUN]${NC} parted $*"
@@ -88,6 +93,29 @@ run_parted() {
         return $rc
     fi
     return 0
+}
+
+# On-disk GPT row / name for partition N, read fresh from disk via parted —
+# reflects reality even when the kernel's partition view is stale. Empty
+# output from ondisk_part_row means the partition does not exist on disk.
+ondisk_part_row()  { parted -sm "$EMMC" unit B print 2>/dev/null | awk -F: -v p="$1" '$1==p{print; exit}'; }
+ondisk_part_name() { ondisk_part_row "$1" | awk -F: '{print $6}'; }
+
+verify_part_absent() {
+    $DRY_RUN && return 0
+    [[ -z "$(ondisk_part_row "$1")" ]] && return 0
+    die "Partition $1 is still present in the on-disk GPT after 'parted rm' —
+the kernel likely refused the table update (a partition was in use).
+Reboot and re-run ce-emmc-restore.sh; completed steps are skipped on re-run."
+}
+
+verify_part_present() {
+    $DRY_RUN && return 0
+    local have
+    have=$(ondisk_part_name "$1")
+    [[ "$have" == "$2" ]] && return 0
+    die "Partition $1 is '${have:-absent}' in the on-disk GPT, expected '$2' —
+'parted mkpart' did not take effect. Reboot and re-run ce-emmc-restore.sh."
 }
 
 $DRY_RUN && warn "DRY-RUN mode — no changes will be made"
@@ -226,18 +254,27 @@ log "Required tools: all present"
 # Create device nodes from sysfs for partitions the kernel already knows about
 make_emmc_nodes
 
-# CE_FLASH must exist on p28 — confirms this is a CE install to restore from
-if ! blkid "${EMMC}p28" 2>/dev/null | grep -q "CE_FLASH"; then
-    die "CE_FLASH not found on p28 — is CoreELEC installed on eMMC?"
-fi
-log "CE_FLASH confirmed on p28"
-
 # All backup files must exist before proceeding
 for f in partition_layout.txt rsv_backup.bin env_backup.bin bootloader_a_backup.bin; do
     [[ -f "${BACKUP_DIR}/${f}" ]] || \
         die "Backup file not found: ${BACKUP_DIR}/${f} — run ce-emmc-install.sh first"
 done
 log "Backup files: all present in ${BACKUP_DIR}"
+
+# CE_FLASH must exist on p28 — confirms this is a CE install to restore from.
+# Also accept the partial states a run interrupted mid-repartition leaves
+# behind (p28 absent, p28 already recreated under its original Android name,
+# or CE_FLASH created but never formatted) — the repartition steps below
+# skip whatever is already done, so a re-run resumes cleanly.
+P28_ONDISK_NAME=$(ondisk_part_name 28)
+P28_ORIG_NAME=$(awk -F: '/^28:/{print $6}' "${BACKUP_DIR}/partition_layout.txt")
+if blkid "${EMMC}p28" 2>/dev/null | grep -q "CE_FLASH"; then
+    log "CE_FLASH confirmed on p28"
+elif [[ -z "$P28_ONDISK_NAME" || "$P28_ONDISK_NAME" == "$P28_ORIG_NAME" || "$P28_ONDISK_NAME" == "CE_FLASH" ]]; then
+    warn "p28 is ${P28_ONDISK_NAME:-absent} on disk with no CE_FLASH filesystem — resuming an interrupted install/restore"
+else
+    die "CE_FLASH not found on p28 — is CoreELEC installed on eMMC?"
+fi
 
 # ── Parse original partition layout ───────────────────────────────────────────
 
@@ -285,15 +322,53 @@ tui_confirm_destructive "Restore Android" "$CONFIRM_MSG" \
 # ── Restore ───────────────────────────────────────────────────────────────────
 
 header "Removing CoreELEC partitions"
-run_parted -s "$EMMC" rm 29 rm 28
-log "CE_STORAGE (p29) and CE_FLASH (p28) removed"
+
+# Nothing from the eMMC may be mounted while its table is rewritten — an
+# in-use partition makes the kernel refuse the update and parted stop early
+# (install issue #1). CE's automounter grabs CE_STORAGE/CE_FLASH under
+# /media when booted from removable media, so sweep and unmount.
+EMMC_MOUNTPOINTS=$(awk -v d="$EMMC" 'index($1, d) == 1 {print $2}' /proc/mounts)
+if [[ -n "$EMMC_MOUNTPOINTS" ]]; then
+    while IFS= read -r mnt; do
+        warn "eMMC partition mounted at ${mnt} — unmounting"
+        run umount "$mnt" || die "Could not unmount ${mnt} — close whatever is using it (or reboot) and re-run"
+    done <<< "$EMMC_MOUNTPOINTS"
+fi
+
+# Delete a CE partition unless it is already gone or already recreated under
+# its original Android name (interrupted-restore resume).
+restore_rm_ce_part() {
+    local part="$1" orig="$2" name
+    name=$(ondisk_part_name "$part")
+    if [[ -z "$name" ]]; then
+        log "p${part} already absent — skipping delete"
+    elif [[ "$name" == "$orig" ]]; then
+        log "p${part} already restored as ${orig} — skipping delete"
+    else
+        run_parted -s "$EMMC" rm "$part"
+        verify_part_absent "$part"
+        log "p${part} (${name}) removed"
+    fi
+}
+restore_rm_ce_part 29 "$P29_NAME"
+restore_rm_ce_part 28 "$P28_NAME"
 
 header "Restoring original partitions"
-run_parted -s "$EMMC" mkpart "$P28_NAME" "${P28_START_B}B" "${P28_END_B}B"
-log "p28 ${P28_NAME} restored"
+if [[ "$(ondisk_part_name 28)" == "$P28_NAME" ]]; then
+    log "p28 already ${P28_NAME} — skipping create"
+else
+    run_parted -s "$EMMC" mkpart "$P28_NAME" "${P28_START_B}B" "${P28_END_B}B"
+    verify_part_present 28 "$P28_NAME"
+    log "p28 ${P28_NAME} restored"
+fi
 
-run_parted -s "$EMMC" mkpart "$P29_NAME" "${P29_START_B}B" "${P29_END_B}B"
-log "p29 ${P29_NAME} restored (empty — Android will initialize on first boot)"
+if [[ "$(ondisk_part_name 29)" == "$P29_NAME" ]]; then
+    log "p29 already ${P29_NAME} — skipping create"
+else
+    run_parted -s "$EMMC" mkpart "$P29_NAME" "${P29_START_B}B" "${P29_END_B}B"
+    verify_part_present 29 "$P29_NAME"
+    log "p29 ${P29_NAME} restored (empty — Android will initialize on first boot)"
+fi
 
 if ! $DRY_RUN; then
     reread_and_make_nodes 28 29

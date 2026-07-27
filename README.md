@@ -143,6 +143,24 @@ Use `--dry-run` to preview what will happen before committing:
 bash /storage/ce-emmc-restore.sh --dry-run
 ```
 
+### If a script stops during repartitioning
+
+Both scripts verify the on-disk partition table after every `parted` step and abort immediately if a step did not take effect. The usual cause is the kernel refusing the table update because something still had an eMMC partition in use (see [issue #1](https://github.com/dangerouslaser/ugoos-am9-pro-coreelec-emmc/issues/1)); both scripts now unmount any auto-mounted eMMC partitions before repartitioning, but other holders (a shell sitting in a mounted path, an unfinished device scan) can still trigger it.
+
+Recovery options, in order of preference:
+
+1. **Reboot and re-run `ce-emmc-restore.sh`.** The restore script recognizes a half-repartitioned table and skips whatever is already done, returning the device to the original Android layout. From there you can re-run the installer (move `/storage/emmc-backup` aside first).
+2. **Restore the raw GPT from the backup set.** Partition-table edits never touch partition contents, so before any formatting has happened this returns the eMMC to exactly its pre-install state:
+
+   ```bash
+   SECTORS=$(cat /sys/block/mmcblk0/size)
+   dd if=/storage/emmc-backup/gpt_primary.bin of=/dev/mmcblk0 bs=512 count=34
+   dd if=/storage/emmc-backup/gpt_secondary.bin of=/dev/mmcblk0 bs=512 seek=$((SECTORS - 33))
+   sync && reboot
+   ```
+
+   Then move `/storage/emmc-backup` aside and re-run the installer.
+
 ### Option 2 — Amlogic USB Burning Tool (backup files not available)
 
 The AM9 Pro can be fully restored to stock Android using the Amlogic USB Burning Tool. This works because `boot0` (the BL2 first-stage bootloader) is hardware write-protected and cannot be touched by anything running in Linux — the device can always enter USB burn mode.
