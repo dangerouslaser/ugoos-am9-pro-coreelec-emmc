@@ -8,6 +8,13 @@
 # only verifies that the pieces fit together — it does NOT flash anything.
 # Phase 2 (--unsafe-flash, the actual restore flow) is not yet built.
 #
+# Scope: the CoreELEC eMMC installer in this repo is tested on AM9 Pro,
+# SK4, and SK4 Pro, but this USB restore path has only been exercised
+# against AM9 Pro factory images on AM9 Pro hardware. The DNL protocol is
+# SoC-generic, so it should work with an SK4/SK4 Pro factory .img, but
+# that is untested — and the burn-mode button/port steps below are the
+# AM9 Pro's physical layout. Check your model's before following them.
+#
 # Usage:
 #   am9pro-usb-restore.sh <image.img> [options]
 #

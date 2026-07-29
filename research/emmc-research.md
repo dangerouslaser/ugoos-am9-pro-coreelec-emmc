@@ -9,6 +9,18 @@
 **CoreELEC:** 22.0-Piers_nightly_20260514  
 **Kernel:** 5.15.196  
 
+> **Applicability.** This is a single-device record: every figure below was
+> measured on the AM9 Pro described in this header. The installer these notes
+> produced (`ce-emmc-install.sh`) is now also tested on the Ugoos SK4 and SK4
+> Pro, which run S905X5M (S7D) silicon under `s7d_s905x5m_ugoos_sk4`. Those
+> boards share the Amlogic 29-partition Android layout this document maps —
+> `super`/`rsv`/`userdata` at p27/p28/p29, AMLNORMAL keystore in `reserved`
+> (p1), U-Boot env at p2 — which is why one installer covers all three, and the
+> installer re-verifies that layout by partition name at runtime rather than
+> trusting it. Everything else here (SoC/CPU/GPU identification, eMMC chip
+> details, exact partition sizes, byte offsets, factory image contents, the
+> DNL/USB findings) is AM9 Pro-specific and was not re-derived on the SK4.
+
 ---
 
 ## Claims Provenance — Device Truth vs CoreELEC Observation

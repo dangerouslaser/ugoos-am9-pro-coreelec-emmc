@@ -4,6 +4,18 @@ The investigative writeups and frozen evidence files that the tooling in
 the rest of the repo was built from. Kept alongside the code so the
 "why" behind each design decision stays discoverable.
 
+> **Scope: this is AM9 Pro evidence.** Every measurement, dump, hex offset,
+> partition map, and USB capture in this directory was taken from one physical
+> Ugoos AM9 Pro (`s6_s905x5_ugoos_am9_pro`). The eMMC installer built on top of
+> it is separately tested on the SK4 and SK4 Pro (`s7d_s905x5m_ugoos_sk4`), and
+> the structural conclusions that installer depends on — the 29-partition layout
+> with `super`/`rsv`/`userdata` at p27/p28/p29, the AMLNORMAL keystore in
+> `reserved` (p1), the U-Boot env at p2 — hold on those boards too, because the
+> installer verifies them at runtime and refuses to proceed otherwise. Nothing
+> else here was re-derived on S905X5M silicon. Treat byte offsets, chip IDs,
+> partition sizes, and factory-image contents as AM9 Pro figures unless a
+> document says otherwise.
+
 | File | What's in it |
 |------|--------------|
 | [`emmc-research.md`](emmc-research.md) | Main research notes — eMMC hardware, partition layout, encryption, identity provenance, U-Boot env, the manual install method, the CE auto-update interaction with cfgload, USB burn-mode protocol findings. The reference document for the project. |

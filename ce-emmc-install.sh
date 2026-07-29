@@ -2,9 +2,9 @@
 # ce-emmc-install.sh — CoreELEC eMMC installer for Ugoos S905X5 boxes
 #
 # Workaround until ceemmc adds support for Ugoos S905X5 boards.
-# Originally written for Ugoos AM9 Pro (s6_s905x5_ugoos_am9_pro); the
-# Ugoos SK4 (s7d_s905x5m_ugoos_sk4) is also accepted because it ships the
-# same Amlogic partition layout. Add new boards to SUPPORTED_BOARDS below.
+# Tested on Ugoos AM9 Pro (s6_s905x5_ugoos_am9_pro) and on the Ugoos SK4
+# and SK4 Pro, which both boot s7d_s905x5m_ugoos_sk4 and ship the same
+# Amlogic partition layout. Add new boards to SUPPORTED_BOARDS below.
 #
 # Must be run from CoreELEC booted off removable media (SD card or USB
 # stick) — anywhere except the eMMC itself, which we're about to repartition.
@@ -114,7 +114,7 @@ FLASH_DIR="/flash"
 # partition layout, drop another line here.
 SUPPORTED_BOARDS=(
     "s6_s905x5_ugoos_am9_pro.dtb|Ugoos AM9 Pro"
-    "s7d_s905x5m_ugoos_sk4.dtb|Ugoos SK4"
+    "s7d_s905x5m_ugoos_sk4.dtb|Ugoos SK4 / SK4 Pro"
 )
 MNT_FLASH="/var/ce_flash"
 MNT_STORAGE="/var/ce_storage"
