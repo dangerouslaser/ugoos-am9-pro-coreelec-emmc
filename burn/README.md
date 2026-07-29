@@ -1,12 +1,23 @@
 # burn/ — active flashers
 
+> **Scope: AM9 Pro only.** The CoreELEC eMMC installer at the repo root is tested
+> on AM9 Pro, SK4, and SK4 Pro, but everything in this directory was built and
+> exercised against AM9 Pro hardware and `AM9PRO_*.img` factory images. The
+> ADNL/DNL protocol is SoC-generic and the S905X5M in the SK4 / SK4 Pro should
+> speak it identically, but that is inference, not a test result. If you point
+> these at an SK4, start with `aml-dnl-status.py` and `dry-run`, and treat a
+> `full-restore` as unverified.
+
 | Tool | Where it runs | What it does |
 |------|--------------|--------------|
-| [`aml-dnl-burn.py`](aml-dnl-burn.py) | Host (Linux/macOS, device in DNL/burn mode over USB-C OTG) | The native Amlogic burner — replaces the Windows-only USB Burning Tool for the AM9 Pro. Subcommands: `dry-run`, `ota-keep-ce` (update Android slot _a, preserve CE_FLASH/CE_STORAGE), `full-restore`. Destructive ops gated by `--yes-i-mean-it`. |
+| [`aml-dnl-burn.py`](aml-dnl-burn.py) | Host (Linux/macOS, device in DNL/burn mode over USB-C OTG) | The native Amlogic burner — replaces the Windows-only USB Burning Tool. Subcommands: `dry-run`, `ota-keep-ce` (update Android slot _a, preserve CE_FLASH/CE_STORAGE), `full-restore`. Destructive ops gated by `--yes-i-mean-it`. |
 | [`aml-dnl-status.py`](aml-dnl-status.py) | Host (device in DNL mode) | Read-only DNL probe: identifies device, dumps chipinfo pages, prints stage/mode. Safe to run any time the device is in burn mode. |
-| [`aml-emmc-burn.py`](aml-emmc-burn.py) | On the AM9 Pro under CoreELEC | In-device eMMC flasher. Parses an AML `.img` and writes Android-side partitions directly to `/dev/mmcblk0pN`, bypassing USB. CE_FLASH/CE_STORAGE and the GPT are never touched. Modes: `--list`, `--verify-only`, `--dry-run`, `--ota` (full Android-side flash + reboot in one shot). Use case: "install a Ugoos OTA from CoreELEC without leaving CE." |
+| [`aml-emmc-burn.py`](aml-emmc-burn.py) | On the device under CoreELEC | In-device eMMC flasher. Parses an AML `.img` and writes Android-side partitions directly to `/dev/mmcblk0pN`, bypassing USB. CE_FLASH/CE_STORAGE and the GPT are never touched. Modes: `--list`, `--verify-only`, `--dry-run`, `--ota` (full Android-side flash + reboot in one shot). Use case: "install a Ugoos OTA from CoreELEC without leaving CE." |
 
 All three import the shared libraries (`aml_dnl_proto`, `aml_dnl_ops`, `aml_dnl_flows`, `aml_img`) from `../lib/` via a `sys.path` adjustment.
+
+Factory images are per-model and not interchangeable — flash only the `.img`
+that matches the box in front of you.
 
 ## Quick reference
 
