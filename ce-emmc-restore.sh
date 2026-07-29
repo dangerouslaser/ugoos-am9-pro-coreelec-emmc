@@ -70,8 +70,8 @@ run() {
 }
 
 # Tolerate parted's BLKRRPART warning — see ce-emmc-install.sh:run_parted for
-# the full explanation. The on-disk write succeeds; partx -u reconciles the
-# kernel-side view downstream.
+# the full explanation. The on-disk write succeeds; reread_and_make_nodes
+# reconciles the kernel-side view downstream.
 #
 # IMPORTANT: one parted command per invocation — parted -s stops executing
 # its command list at the first commit that fails to reach the kernel, so a
@@ -87,7 +87,7 @@ run_parted() {
     [[ -n "$out" ]] && printf '%s\n' "$out"
     if (( rc != 0 )); then
         if grep -q "unable to inform the kernel" <<<"$out"; then
-            warn "parted: BLKRRPART failed; on-disk write succeeded, partx -u will reconcile"
+            warn "parted: BLKRRPART failed; on-disk write succeeded, device nodes will be rebuilt from sysfs"
             return 0
         fi
         return $rc
@@ -198,10 +198,15 @@ find_part_sysfs() {
 
 # After repartitioning, ask the kernel to re-read the partition table and
 # create /dev nodes for the new partitions using sysfs-reported major:minor.
+#
+# partprobe is the only table-reread tool CoreELEC ships — util-linux's
+# partx/addpart and blockdev/sfdisk/sgdisk are all absent, so the `partx -u`
+# fallback this used to attempt was dead code that never ran. When BLKRRPART
+# doesn't take, sysfs still reports the new partitions; the loop below reads
+# major:minor from there and creates the nodes directly.
 reread_and_make_nodes() {
     local parts=("$@")
     partprobe "$EMMC" 2>/dev/null || true
-    command -v partx >/dev/null 2>&1 && partx -u "$EMMC" 2>/dev/null || true
 
     for part in "${parts[@]}"; do
         local sysfs_dir="" waited=0
@@ -223,6 +228,39 @@ reread_and_make_nodes() {
     done
 }
 
+# ── Device-identity helpers ───────────────────────────────────────────────────
+
+# Everything that asks "is this thing on the eMMC?" must compare device
+# numbers, never name strings. CoreELEC mounts partitions from label-named
+# nodes (/dev/CE_FLASH, /dev/CE_STORAGE) which are real block devices carrying
+# mmcblk0's major:minor with no "mmcblk0" in the name. Name matching silently
+# misses them, defeating both the booted-from-eMMC guard and the unmount sweep.
+
+# major:minor for a path, or empty. stat reports hex; /proc/* is decimal.
+dev_majmin() {
+    local hexmm
+    hexmm=$(stat -c '%t:%T' "$1" 2>/dev/null) || return 0
+    [[ -n "$hexmm" && "$hexmm" != ":" ]] || return 0
+    printf '%d:%d\n' "0x${hexmm%%:*}" "0x${hexmm##*:}"
+}
+
+# Every major:minor belonging to the eMMC — whole disk plus all partitions.
+emmc_majmins() { awk '$4 ~ /^mmcblk0/ {print $1":"$2}' /proc/partitions; }
+
+# Kernel device name for a major:minor ("mmcblk0p28"), or empty.
+name_for_majmin() { awk -v mm="$1" '$1":"$2 == mm {print $4; exit}' /proc/partitions; }
+
+# Mountpoints whose backing device is on the eMMC, however they were named.
+emmc_mountpoints() {
+    local known src mnt mm
+    known=" $(emmc_majmins | tr '\n' ' ') "
+    while read -r src mnt _; do
+        [[ -b "$src" ]] || continue
+        mm=$(dev_majmin "$src")
+        [[ -n "$mm" && "$known" == *" $mm "* ]] && printf '%s\n' "$mnt"
+    done < /proc/mounts
+}
+
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
 header "Preflight checks"
@@ -231,15 +269,35 @@ header "Preflight checks"
 
 # /flash must NOT be on the eMMC we're about to repartition. SD card
 # (mmcblk1) and USB stick (sd*) are both fine.
+#
+# Match on device numbers, not name strings — /flash is routinely mounted from
+# a label-named node (/dev/CE_FLASH) that carries mmcblk0's major:minor with
+# no "mmcblk0" in its name, so the old glob left this guard defeated on
+# exactly the eMMC-booted boxes it exists to stop.
 FLASH_SOURCE=$(awk '$2 == "/flash" {print $1}' /proc/mounts 2>/dev/null || true)
 [[ -n "$FLASH_SOURCE" ]] || die "Could not determine /flash mount source"
-[[ "$FLASH_SOURCE" == *"mmcblk0"* ]] && \
-    die "Cannot restore while booted from eMMC — /flash is on '$FLASH_SOURCE'. Boot from SD card or USB and re-run."
 
-case "$FLASH_SOURCE" in
-    *mmcblk1*) BOOT_MEDIA="SD card" ;;
-    /dev/sd*)  BOOT_MEDIA="USB stick" ;;
-    *)         BOOT_MEDIA="removable media" ;;
+FLASH_MAJMIN=""
+FLASH_REALNAME=""
+if [[ -b "$FLASH_SOURCE" ]]; then
+    FLASH_MAJMIN=$(dev_majmin "$FLASH_SOURCE")
+    [[ -n "$FLASH_MAJMIN" ]] && FLASH_REALNAME=$(name_for_majmin "$FLASH_MAJMIN")
+fi
+
+if [[ -n "$FLASH_MAJMIN" ]]; then
+    if [[ " $(emmc_majmins | tr '\n' ' ') " == *" ${FLASH_MAJMIN} "* ]]; then
+        die "Cannot restore while booted from eMMC — /flash is ${FLASH_SOURCE} (${FLASH_REALNAME:-$FLASH_MAJMIN}), which is on ${EMMC}. Boot from SD card or USB and re-run."
+    fi
+else
+    warn "Could not resolve ${FLASH_SOURCE} to a device number — falling back to name matching"
+    [[ "$FLASH_SOURCE" == *"mmcblk0"* ]] && \
+        die "Cannot restore while booted from eMMC — /flash is on '$FLASH_SOURCE'. Boot from SD card or USB and re-run."
+fi
+
+case "${FLASH_REALNAME:-$FLASH_SOURCE}" in
+    *mmcblk1*)      BOOT_MEDIA="SD card" ;;
+    sd*|/dev/sd*)   BOOT_MEDIA="USB stick" ;;
+    *)              BOOT_MEDIA="removable media" ;;
 esac
 log "Boot source: ${BOOT_MEDIA} (${FLASH_SOURCE})"
 
@@ -327,12 +385,34 @@ header "Removing CoreELEC partitions"
 # in-use partition makes the kernel refuse the update and parted stop early
 # (install issue #1). CE's automounter grabs CE_STORAGE/CE_FLASH under
 # /media when booted from removable media, so sweep and unmount.
-EMMC_MOUNTPOINTS=$(awk -v d="$EMMC" 'index($1, d) == 1 {print $2}' /proc/mounts)
+# emmc_mountpoints() matches by device number, so the label-named nodes CE
+# actually mounts these from are caught too.
+EMMC_MOUNTPOINTS=$(emmc_mountpoints)
 if [[ -n "$EMMC_MOUNTPOINTS" ]]; then
     while IFS= read -r mnt; do
         warn "eMMC partition mounted at ${mnt} — unmounting"
         run umount "$mnt" || die "Could not unmount ${mnt} — close whatever is using it (or reboot) and re-run"
     done <<< "$EMMC_MOUNTPOINTS"
+fi
+
+# Unmounting isn't always enough. Android's `super` (p27) is a logical-partition
+# container: if anything has mapped its sub-partitions, device-mapper holds the
+# underlying eMMC partition open and the kernel still refuses the table update,
+# with the same stop-early symptom as a live mount. dmsetup is present on
+# CoreELEC even though partx et al are not, so sweep for maps backed by this
+# disk and tear them down. Nothing we create uses device-mapper, so any map on
+# mmcblk0 here is Android-side and safe to remove.
+if command -v dmsetup >/dev/null 2>&1; then
+    EMMC_MAJOR=$(emmc_majmins | head -1); EMMC_MAJOR="${EMMC_MAJOR%%:*}"
+    while IFS= read -r dm; do
+        [[ -n "$dm" ]] || continue
+        deps=$(dmsetup deps "$dm" 2>/dev/null | tr -d ' ' || true)
+        if [[ -n "$EMMC_MAJOR" && "$deps" == *"(${EMMC_MAJOR},"* ]]; then
+            warn "device-mapper target '${dm}' is backed by the eMMC — removing"
+            run dmsetup remove "$dm" \
+                || die "Could not remove device-mapper target '${dm}' — reboot and re-run"
+        fi
+    done < <(dmsetup ls 2>/dev/null | awk '$1 != "No" {print $1}')
 fi
 
 # Delete a CE partition unless it is already gone or already recreated under

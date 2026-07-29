@@ -173,10 +173,11 @@ run() {
 
 # parted on Amlogic eMMC sometimes fails BLKRRPART after a successful on-disk
 # write (kernel can't refresh its partition view because something on the device
-# is held open). The disk has been written correctly; we just need to fall back
-# to partx -u for the kernel-side reconciliation. This wrapper runs parted with
-# both streams merged so the user still sees parted's output, and treats the
-# BLKRRPART warning as non-fatal so set -e doesn't kill the script.
+# is held open). The disk has been written correctly; reread_and_make_nodes
+# reconciles the kernel-side view afterwards by reading the new partitions out
+# of sysfs and creating their device nodes directly. This wrapper runs parted
+# with both streams merged so the user still sees parted's output, and treats
+# the BLKRRPART warning as non-fatal so set -e doesn't kill the script.
 #
 # IMPORTANT: pass exactly ONE parted command per invocation. parted -s stops
 # executing its command list at the first commit that fails to reach the
@@ -196,7 +197,7 @@ run_parted() {
     if (( rc != 0 )); then
         if grep -q "unable to inform the kernel" <<<"$out"; then
             warn "parted: BLKRRPART failed (kernel can't refresh partition table)"
-            warn "  — on-disk write succeeded; will reconcile with partx -u"
+            warn "  — on-disk write succeeded; device nodes will be rebuilt from sysfs"
             return 0
         fi
         return $rc
@@ -343,15 +344,16 @@ find_part_sysfs() {
 # After repartitioning, ask the kernel to re-read the partition table and
 # create /dev nodes for the new partitions using sysfs-reported major:minor.
 #
-# We try partprobe first (full BLKRRPART reread — fine when nothing on the
-# device is held open), then fall back to partx -u which uses per-partition
-# BLKPG_* ioctls and works even when something on the device is open. On
-# Amlogic eMMC, BLKRRPART has been observed to fail (e.g. on Ugoos SK4 CE 22
-# Piers nightly) while partx -u succeeds.
+# partprobe (full BLKRRPART reread) is the only table-reread tool CoreELEC
+# ships. util-linux's partx/addpart, and blockdev/sfdisk/sgdisk, are all
+# absent — an earlier version of this function called `partx -u` as a
+# fallback for when BLKRRPART fails, which was dead code on this OS and
+# never once ran. The real fallback is below: when BLKRRPART doesn't take,
+# sysfs still reports the new partitions, so we read major:minor from there
+# and mknod the device nodes ourselves.
 reread_and_make_nodes() {
     local parts=("$@")
     partprobe "$EMMC" 2>/dev/null || true
-    command -v partx >/dev/null 2>&1 && partx -u "$EMMC" 2>/dev/null || true
 
     for part in "${parts[@]}"; do
         local sysfs_dir="" waited=0
@@ -373,6 +375,41 @@ reread_and_make_nodes() {
     done
 }
 
+# ── Device-identity helpers ───────────────────────────────────────────────────
+
+# Everything that asks "is this thing on the eMMC?" must compare device
+# numbers, never name strings. CoreELEC mounts partitions from label-named
+# nodes — /dev/CE_FLASH, /dev/CE_STORAGE, both created by this installer —
+# which are real block devices carrying mmcblk0's major:minor with no
+# "mmcblk0" anywhere in the name. Name matching silently misses them, which
+# defeated both the booted-from-eMMC guard and the pre-repartition unmount
+# sweep on exactly the boxes that needed them.
+
+# major:minor for a path, or empty. stat reports hex; /proc/* is decimal.
+dev_majmin() {
+    local hexmm
+    hexmm=$(stat -c '%t:%T' "$1" 2>/dev/null) || return 0
+    [[ -n "$hexmm" && "$hexmm" != ":" ]] || return 0
+    printf '%d:%d\n' "0x${hexmm%%:*}" "0x${hexmm##*:}"
+}
+
+# Every major:minor belonging to the eMMC — whole disk plus all partitions.
+emmc_majmins() { awk '$4 ~ /^mmcblk0/ {print $1":"$2}' /proc/partitions; }
+
+# Kernel device name for a major:minor ("mmcblk0p28"), or empty.
+name_for_majmin() { awk -v mm="$1" '$1":"$2 == mm {print $4; exit}' /proc/partitions; }
+
+# Mountpoints whose backing device is on the eMMC, however they were named.
+emmc_mountpoints() {
+    local known src mnt mm
+    known=" $(emmc_majmins | tr '\n' ' ') "
+    while read -r src mnt _; do
+        [[ -b "$src" ]] || continue
+        mm=$(dev_majmin "$src")
+        [[ -n "$mm" && "$known" == *" $mm "* ]] && printf '%s\n' "$mnt"
+    done < /proc/mounts
+}
+
 # ── Size helpers ──────────────────────────────────────────────────────────────
 
 part_size_mib() {
@@ -386,6 +423,25 @@ part_size_bytes() {
 }
 
 human_mib() { awk -v m="$1" 'BEGIN{if(m>=1024)printf "%.1f GB",m/1024; else printf "%d MB",m}'; }
+
+# Bytes used by a directory tree, staying on one filesystem. busybox-safe:
+# `du -sk` (KB) rather than GNU's `du -sb`, and -x so mounted network shares
+# under the tree aren't recursed into. Prints nothing if du fails; callers
+# must check, because an unguarded empty value here used to take the whole
+# script down silently under `set -eo pipefail`.
+size_bytes_of() {
+    local kb
+    kb=$(du -sxk "$1" 2>/dev/null | awk 'NR==1{print $1}') || return 0
+    [[ -n "$kb" ]] && echo $(( kb * 1024 ))
+}
+
+# Free bytes on the filesystem holding a path. busybox-safe: `df -k`, since
+# busybox df has no -B. Prints nothing on failure — callers must check.
+free_bytes_of() {
+    local kb
+    kb=$(df -k "$1" 2>/dev/null | awk 'NR==2{print $4}') || return 0
+    [[ -n "$kb" ]] && echo $(( kb * 1024 ))
+}
 
 # ── Backup helper ─────────────────────────────────────────────────────────────
 
@@ -616,48 +672,167 @@ header "Preflight checks"
 
 [[ "$(id -u)" == "0" ]] || die "Must be run as root"
 
-# Board check — the active /flash/dtb.img must md5-match a supported DTB
+# Board check — identify the board from the active /flash/dtb.img.
+#
+# We read the `coreelec-dt-id` property from the FDT root node. That string is
+# CoreELEC's own board identifier and equals the device_trees/ filename stem,
+# so it maps directly onto SUPPORTED_BOARDS.
+#
+# We deliberately do NOT md5-compare dtb.img against device_trees/*.dtb.
+# CoreELEC rewrites the live dtb.img at runtime (/usr/lib/coreelec/dtb-xml)
+# whenever EDID / remote / LED / eMMC-timing settings are touched, so on any
+# box that has ever been configured the active blob diverges from the shipped
+# .dtb by a few bytes and matches none of them. Observed on a stock AM9 Pro:
+# 2792 FDT properties, identical to stock except /amhdmitx/custom_edid
+# (0 bytes live vs 1 byte stock) — a 4-byte file delta that made the old md5
+# gate reject a perfectly valid board. The root identity node is not something
+# dtb-xml touches, so keying on it is stable across all of those rewrites.
 DTB_ACTIVE="${FLASH_DIR}/dtb.img"
 [[ -f "$DTB_ACTIVE" ]] || die "Active dtb.img not found at $DTB_ACTIVE"
-HASH_ACTIVE=$(md5sum "$DTB_ACTIVE" | awk '{print $1}')
+
+# Print a root-node string property from a flattened device tree, or nothing.
+fdt_root_prop() {
+    python3 - "$1" "$2" <<'PYEOF' 2>/dev/null || true
+import struct, sys
+
+path, want = sys.argv[1], sys.argv[2]
+blob = open(path, 'rb').read()
+if len(blob) < 40 or struct.unpack('>I', blob[:4])[0] != 0xd00dfeed:
+    sys.exit(1)                                    # not an FDT
+off_struct, off_strings = struct.unpack('>2I', blob[8:16])
+size_strings = struct.unpack('>I', blob[32:36])[0]
+strings = blob[off_strings:off_strings + size_strings]
+
+p, depth = off_struct, 0
+while p + 4 <= len(blob):
+    (tok,) = struct.unpack('>I', blob[p:p + 4]); p += 4
+    if tok == 1:                                   # FDT_BEGIN_NODE
+        depth += 1
+        p = (blob.index(b'\0', p) + 1 + 3) & ~3
+    elif tok == 2:                                 # FDT_END_NODE
+        depth -= 1
+        if depth <= 0:
+            break                                  # left the root node
+    elif tok == 3:                                 # FDT_PROP
+        ln, name_off = struct.unpack('>2I', blob[p:p + 8]); p += 8
+        val = blob[p:p + ln]
+        p = (p + ln + 3) & ~3
+        if depth == 1:                             # root-node property
+            name = strings[name_off:strings.index(b'\0', name_off)].decode()
+            if name == want:
+                print(val.split(b'\0')[0].decode('utf-8', 'replace'))
+                break
+    elif tok == 4:                                 # FDT_NOP
+        continue
+    elif tok == 9:                                 # FDT_END
+        break
+    else:
+        break
+PYEOF
+}
 
 BOARD_NAME=""
 BOARD_DTB=""
-for entry in "${SUPPORTED_BOARDS[@]}"; do
-    dtb_name="${entry%%|*}"
-    friendly="${entry##*|}"
-    dtb_path="${FLASH_DIR}/device_trees/${dtb_name}"
-    [[ -f "$dtb_path" ]] || continue
-    if [[ "$(md5sum "$dtb_path" | awk '{print $1}')" == "$HASH_ACTIVE" ]]; then
-        BOARD_NAME="$friendly"
-        BOARD_DTB="$dtb_name"
-        break
-    fi
-done
+BOARD_MATCH_METHOD=""
 
-if [[ -z "$BOARD_NAME" ]]; then
-    msg="Active dtb.img doesn't match any supported board. Supported DTBs:"
+DT_ID=""
+command -v python3 >/dev/null 2>&1 && DT_ID=$(fdt_root_prop "$DTB_ACTIVE" coreelec-dt-id)
+
+if [[ -n "$DT_ID" ]]; then
     for entry in "${SUPPORTED_BOARDS[@]}"; do
-        msg+=$'\n  - '"${entry%%|*}  (${entry##*|})"
+        dtb_name="${entry%%|*}"
+        if [[ "$DT_ID" == "${dtb_name%.dtb}" ]]; then
+            BOARD_NAME="${entry##*|}"
+            BOARD_DTB="$dtb_name"
+            BOARD_MATCH_METHOD="coreelec-dt-id"
+            break
+        fi
     done
-    msg+=$'\n''Check your DTB selection in config.ini, or add the board to SUPPORTED_BOARDS.'
-    die "$msg"
+    # A readable but unsupported id is a definitive answer — don't fall through
+    # to the md5 path, which would only produce a more confusing error.
+    [[ -n "$BOARD_NAME" ]] || die "$(
+        echo "This board reports coreelec-dt-id '${DT_ID}', which is not supported."
+        echo "Supported boards:"
+        for entry in "${SUPPORTED_BOARDS[@]}"; do
+            echo "  - ${entry%%|*}  (${entry##*|})"
+        done
+        echo "Check your DTB selection in config.ini, or add the board to SUPPORTED_BOARDS."
+    )"
+else
+    # No python3, or a DTB with no coreelec-dt-id (very old or hand-built).
+    # Fall back to the legacy exact-md5 compare. This is strictly weaker —
+    # it false-negatives on any box dtb-xml has rewritten — so say so.
+    warn "Could not read coreelec-dt-id from dtb.img — falling back to md5 comparison"
+    HASH_ACTIVE=$(md5sum "$DTB_ACTIVE" | awk '{print $1}')
+    for entry in "${SUPPORTED_BOARDS[@]}"; do
+        dtb_name="${entry%%|*}"
+        dtb_path="${FLASH_DIR}/device_trees/${dtb_name}"
+        [[ -f "$dtb_path" ]] || continue
+        if [[ "$(md5sum "$dtb_path" | awk '{print $1}')" == "$HASH_ACTIVE" ]]; then
+            BOARD_NAME="${entry##*|}"
+            BOARD_DTB="$dtb_name"
+            BOARD_MATCH_METHOD="md5"
+            break
+        fi
+    done
+
+    [[ -n "$BOARD_NAME" ]] || die "$(
+        echo "Active dtb.img doesn't match any supported board. Supported DTBs:"
+        for entry in "${SUPPORTED_BOARDS[@]}"; do
+            echo "  - ${entry%%|*}  (${entry##*|})"
+        done
+        echo ""
+        echo "Note: this check fell back to an exact md5 compare because"
+        echo "coreelec-dt-id could not be read from ${DTB_ACTIVE}. CoreELEC"
+        echo "rewrites dtb.img at runtime, so a configured box will not match"
+        echo "any shipped .dtb byte-for-byte even when the board IS supported."
+        echo "Check that python3 is available, then re-run."
+    )"
 fi
 
-log "Board: ${BOARD_NAME} (${BOARD_DTB%.dtb})"
+log "Board: ${BOARD_NAME} (${BOARD_DTB%.dtb}, matched via ${BOARD_MATCH_METHOD})"
 
 # /flash must NOT be on the eMMC we're about to repartition. SD card
 # (mmcblk1) and USB stick (sd*) are both fine — the installer just rsyncs
 # /flash → eMMC CE_FLASH, so any boot source other than the destination works.
+#
+# Match on device numbers, not on the name string. /flash is routinely mounted
+# from a label-named node — /dev/CE_FLASH, which THIS INSTALLER creates — and
+# that is a real block device carrying mmcblk0's major:minor with no "mmcblk0"
+# anywhere in its name. The old `*mmcblk0*` glob silently failed to fire on
+# exactly the box it most needed to stop, leaving this guard defeated on any
+# eMMC-booted install. Resolve to major:minor and check that against every
+# mmcblk0 row in /proc/partitions.
 FLASH_SOURCE=$(awk '$2 == "/flash" {print $1}' /proc/mounts 2>/dev/null || true)
 [[ -n "$FLASH_SOURCE" ]] || die "Could not determine /flash mount source"
-[[ "$FLASH_SOURCE" == *"mmcblk0"* ]] && \
-    die "Cannot install while booted from eMMC — /flash is on '$FLASH_SOURCE'. Boot from SD card or USB and re-run."
 
-case "$FLASH_SOURCE" in
-    *mmcblk1*) BOOT_MEDIA="SD card" ;;
-    /dev/sd*)  BOOT_MEDIA="USB stick" ;;
-    *)         BOOT_MEDIA="removable media" ;;
+FLASH_MAJMIN=""
+FLASH_REALNAME=""
+if [[ -b "$FLASH_SOURCE" ]]; then
+    FLASH_MAJMIN=$(dev_majmin "$FLASH_SOURCE")
+    [[ -n "$FLASH_MAJMIN" ]] && FLASH_REALNAME=$(name_for_majmin "$FLASH_MAJMIN")
+fi
+
+if [[ -n "$FLASH_MAJMIN" ]]; then
+    if [[ " $(emmc_majmins | tr '\n' ' ') " == *" ${FLASH_MAJMIN} "* ]]; then
+        die "Cannot install while booted from eMMC — /flash is ${FLASH_SOURCE} (${FLASH_REALNAME:-$FLASH_MAJMIN}), which is on ${EMMC}. Boot from SD card or USB and re-run."
+    fi
+else
+    # stat unavailable or /flash mounted from something that isn't a block
+    # device — fall back to the old name match rather than skipping the guard.
+    warn "Could not resolve ${FLASH_SOURCE} to a device number — falling back to name matching"
+    [[ "$FLASH_SOURCE" == *"mmcblk0"* ]] && \
+        die "Cannot install while booted from eMMC — /flash is on '$FLASH_SOURCE'. Boot from SD card or USB and re-run."
+fi
+
+# Describe the boot media from the resolved kernel device name where we have
+# one — the mount source may be a label alias that says nothing about the bus.
+# FLASH_REALNAME is a bare kernel name from /proc/partitions ("sda1",
+# "mmcblk1p1"); FLASH_SOURCE is a full path. Match both shapes.
+case "${FLASH_REALNAME:-$FLASH_SOURCE}" in
+    *mmcblk1*)      BOOT_MEDIA="SD card" ;;
+    sd*|/dev/sd*)   BOOT_MEDIA="USB stick" ;;
+    *)              BOOT_MEDIA="removable media" ;;
 esac
 log "Boot source: ${BOOT_MEDIA} (${FLASH_SOURCE})"
 
@@ -848,13 +1023,36 @@ header "Repartitioning eMMC"
 # kernel refuses the update for in-use partitions, and that's what triggers
 # the parted stop-early failure described at run_parted (issue #1). CE's
 # automounter can grab mountable eMMC partitions under /media, so sweep and
-# unmount them. (/flash is guaranteed off-eMMC by preflight.)
-EMMC_MOUNTPOINTS=$(awk -v d="$EMMC" 'index($1, d) == 1 {print $2}' /proc/mounts)
+# unmount them. emmc_mountpoints() matches by device number, so partitions
+# mounted from label-named nodes are caught too. (/flash is guaranteed
+# off-eMMC by preflight.)
+EMMC_MOUNTPOINTS=$(emmc_mountpoints)
 if [[ -n "$EMMC_MOUNTPOINTS" ]]; then
     while IFS= read -r mnt; do
         warn "eMMC partition mounted at ${mnt} — unmounting"
         run umount "$mnt" || die "Could not unmount ${mnt} — close whatever is using it (or reboot) and re-run"
     done <<< "$EMMC_MOUNTPOINTS"
+fi
+
+# Unmounting isn't always enough. Android's `super` (p27) is a logical-partition
+# container: if anything has mapped its sub-partitions, device-mapper holds the
+# underlying eMMC partition open and the kernel still refuses the table update,
+# with the same stop-early symptom as a live mount. dmsetup is present on
+# CoreELEC even though partx et al are not, so sweep for maps backed by this
+# disk and tear them down. Nothing we create uses device-mapper, so any map on
+# mmcblk0 here is Android-side and safe to remove.
+if command -v dmsetup >/dev/null 2>&1; then
+    EMMC_MAJOR=$(emmc_majmins | head -1); EMMC_MAJOR="${EMMC_MAJOR%%:*}"
+    while IFS= read -r dm; do
+        [[ -n "$dm" ]] || continue
+        # deps output looks like: "1 dependencies  : (179, 27)"
+        deps=$(dmsetup deps "$dm" 2>/dev/null | tr -d ' ' || true)
+        if [[ -n "$EMMC_MAJOR" && "$deps" == *"(${EMMC_MAJOR},"* ]]; then
+            warn "device-mapper target '${dm}' is backed by the eMMC — removing"
+            run dmsetup remove "$dm" \
+                || die "Could not remove device-mapper target '${dm}' — reboot and re-run"
+        fi
+    done < <(dmsetup ls 2>/dev/null | awk '$1 != "No" {print $1}')
 fi
 
 # Find where p28 (rsv) starts — CE_FLASH will occupy the same starting position
@@ -1092,9 +1290,9 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
 
     if $DRY_RUN; then
         # In dry-run the partition isn't actually mounted, so the size/free
-        # comparison would be meaningless. Skip the slow `du -sb /storage`
+        # comparison would be meaningless. Skip the slow `du -sxk /storage`
         # walk and just stub the rsync.
-        echo -e "${YELLOW}[DRY-RUN]${NC} would compare \$(du -sb /storage) to free space on CE_STORAGE"
+        echo -e "${YELLOW}[DRY-RUN]${NC} would compare \$(du -sxk /storage) to free space on CE_STORAGE"
         echo -e "${YELLOW}[DRY-RUN]${NC} rsync -ax --info=progress2 /storage/ ${MNT_STORAGE}/"
         echo -e "${YELLOW}[DRY-RUN]${NC} would verify dest size matches source"
         echo -e "${YELLOW}[DRY-RUN]${NC} umount ${MNT_STORAGE}"
@@ -1103,9 +1301,22 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
         # space accounting that drove the migrate/skip decision.
         # Entry counts via -print0 so filenames containing newlines can't
         # skew the tally.
-        STORAGE_USED=$(du -sb /storage 2>/dev/null | awk '{print $1}')
-        STORAGE_FILES=$(find /storage -mindepth 1 -print0 2>/dev/null | tr -dc '\0' | wc -c)
-        CE_FREE=$(df -B1 "$MNT_STORAGE" 2>/dev/null | awk 'NR==2{print $4}')
+        #
+        # Everything here must work under busybox, which is what CoreELEC
+        # ships: `df -B1` is a GNU coreutils flag that busybox rejects
+        # outright ("df: invalid option -- 'B'"), and under `set -eo pipefail`
+        # that killed the whole install with no message at all, because
+        # stderr went to /dev/null. Use `df -k` / `du -sk` and scale by 1024.
+        #
+        # -x / -xdev keep the walk on one filesystem. Without it, network
+        # shares mounted under /storage (NFS/SMB to a NAS) get recursed into:
+        # minutes of wall time, a wildly inflated size, and a non-zero exit
+        # from du on anything unreadable — which again meant a silent abort.
+        STORAGE_USED=$(size_bytes_of /storage)
+        STORAGE_FILES=$(find /storage -xdev -mindepth 1 -print0 2>/dev/null | tr -dc '\0' | wc -c)
+        CE_FREE=$(free_bytes_of "$MNT_STORAGE")
+        [[ -n "$STORAGE_USED" && -n "$CE_FREE" ]] \
+            || die "Could not determine /storage size or CE_STORAGE free space — aborting before migration"
         log "Source /storage:  $(( STORAGE_USED/1024/1024 )) MB across ${STORAGE_FILES} entries"
         log "CE_STORAGE free:  $(( CE_FREE/1024/1024 )) MB"
 
@@ -1118,14 +1329,16 @@ if tui_yesno "Migrate /storage to CE_STORAGE?" "$MIGRATE_MSG"; then
             rsync_rc=0
             rsync -ax --info=progress2 /storage/ "$MNT_STORAGE/" || rsync_rc=$?
 
-            # Verify what actually landed on disk before we unmount. Compare
-            # apparent size (du -sb is content-bytes, not block usage, so a
-            # clean rsync should produce a near-identical dest size) and
-            # entry count. A big shortfall means rsync silently dropped
-            # things — surface it loudly so the user can recover before
-            # rebooting.
-            DEST_USED=$(du -sb "$MNT_STORAGE" 2>/dev/null | awk '{print $1}')
-            DEST_FILES=$(find "$MNT_STORAGE" -mindepth 1 -print0 2>/dev/null | tr -dc '\0' | wc -c)
+            # Verify what actually landed on disk before we unmount. Both
+            # sides are measured with the same `du -sxk` (block usage, one
+            # filesystem), so the comparison stays apples-to-apples; the
+            # shortfall check below is one-directional, so a dest that reads
+            # slightly larger — different block size, ext4 lost+found — is
+            # fine. A big shortfall means rsync silently dropped things:
+            # surface it loudly so the user can recover before rebooting.
+            DEST_USED=$(size_bytes_of "$MNT_STORAGE")
+            DEST_FILES=$(find "$MNT_STORAGE" -xdev -mindepth 1 -print0 2>/dev/null | tr -dc '\0' | wc -c)
+            [[ -n "$DEST_USED" ]] || DEST_USED=0
             log "Migration result:"
             log "  source: $(( STORAGE_USED/1024/1024 )) MB / ${STORAGE_FILES} entries"
             log "  dest:   $(( DEST_USED/1024/1024 )) MB / ${DEST_FILES} entries"
