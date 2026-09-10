@@ -870,7 +870,7 @@ for spec in "27:super" "28:rsv" "29:userdata"; do
         die "Partition ${pnum} (${pname}) not found — unexpected layout. Has this already been modified?
 If a previous install attempt stopped during repartitioning, restore the
 original GPT from that run's backup set (gpt_primary.bin / gpt_secondary.bin
-— see the recovery commands in the README), reboot, and re-run."
+— see the recovery commands in INSTALL.md), reboot, and re-run."
     [[ "$have" == "$pname" ]] || \
         die "Partition ${pnum} is named '${have}', expected '${pname}' — looks like a partial previous install. Restore Android first (ce-emmc-restore.sh or USB Burning Tool)."
 done
