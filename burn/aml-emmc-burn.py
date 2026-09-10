@@ -2,11 +2,20 @@
 """In-device Amlogic .img flasher — writes partition blobs to /dev/mmcblk0pN
 directly, bypassing the USB DNL path used by aml-dnl-burn.py.
 
-Use case: "install a Ugoos OTA from CoreELEC without leaving CE."  Flashes
-the Android-side partitions from an AML_PACK `.img` (bootloader_a, boot_a,
-init_boot_a, vendor_boot_a, dtbo_a, logo, odm_ext_a, super) directly to the
-running eMMC. CE_FLASH/CE_STORAGE are left untouched; the device reboots
-straight back into CoreELEC with the new Android/bootloader underneath.
+Use case: "install a Ugoos firmware update from CoreELEC without leaving
+CE."  Flashes everything a factory `.img` carries for the eMMC, directly
+from the running system:
+
+  1. Android-side GPT partitions (bootloader_a, boot_a, init_boot_a,
+     vendor_boot_a, dtbo_a, logo, odm_ext_a, super) → /dev/mmcblk0pN
+  2. The Android DTB (`_aml_dtb`) → both 256 KB slots in `reserved` (p1),
+     in U-Boot's checksummed `aml_dtb_rsv` format
+  3. The bootloader → eMMC hardware boot partitions boot0 and boot1, which
+     is where the S905X5 BootROM actually loads it from (flashing
+     bootloader_a alone changes nothing at boot)
+
+CE_FLASH/CE_STORAGE are left untouched; the device reboots straight back
+into CoreELEC with the new bootloader/Android underneath.
 
 What this tool deliberately does NOT do:
   * Write the GPT (would shift partition boundaries and immediately corrupt
@@ -15,19 +24,25 @@ What this tool deliberately does NOT do:
   * Run any USB-DNL-only `.img` items (DDR/UBOOT loads, mem-stage writes).
 
 Modes:
-  --list                List partitions in the .img + the local mapping.
-  --verify-only         Compare current eMMC partition SHA1 against .img
-                        VERIFY items (read-only). Use this first.
+  --list                List the plan (partitions, DTB slots, boot area).
+  --verify-only         Compare current eMMC contents against the .img
+                        VERIFY hashes (read-only). Use this first.
   --dry-run             Print the flash plan; no writes.
-  --ota                 Flash the full Android-side plan + reboot. Equivalent
-                        to `--yes-i-mean-it --reboot` with the default plan.
-                        Single-flag convenience for the common case of
-                        "install a Ugoos OTA from CE".
+  --ota                 Flash the full plan + reboot. Equivalent to
+                        `--yes-i-mean-it --reboot` with the default plan.
+                        Single-flag convenience for "install a Ugoos
+                        firmware from CE".
   --yes-i-mean-it       Commit. Required for any writes.
   --reboot              `reboot` after a successful flash.
-  --only NAME           Restrict plan to the given partition (repeatable).
-  --skip NAME           Exclude the given partition (repeatable).
+  --only NAME           Restrict the partition plan to NAME (repeatable).
+  --skip NAME           Exclude partition NAME (repeatable).
+  --no-dtb              Leave the `reserved` DTB slots alone.
+  --no-boot-area        Leave boot0/boot1 alone (bootloader_a still written).
+  --skip-boot1          Write boot0 only, keeping boot1 as the previous
+                        bootloader for a manual two-phase update.
 
+Order of writes: partitions, DTB slots, boot0, boot1 — the boot area goes
+last so an interrupted run leaves the old, working bootloader in place.
 Refuses to write to any partition that is currently mounted.
 """
 from __future__ import annotations
@@ -37,10 +52,14 @@ import hashlib
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'lib'))
+# Import aml_img from ../lib (repo layout) or from the script's own directory
+# (flat layout on a device, where ugoos-fw-update.sh drops both files).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.join(os.path.dirname(_HERE), "lib"), _HERE]
 from aml_img import (
     AmlogicImage, ImgItem,
     is_sparse, unpack_sparse_size, iter_sparse_chunks,
@@ -115,9 +134,35 @@ def parse_partition_map(emmc: str) -> dict[str, str]:
     return m
 
 
-def mounted_block_devices() -> set[str]:
+def mounted_block_devices() -> set[int]:
+    """st_rdev of every mounted block device.
+
+    Compared by device number rather than path: CoreELEC mounts its
+    partitions as /dev/CE_FLASH and /dev/CE_STORAGE (symlinks), so a
+    string compare against /dev/mmcblk0pN would miss them.
+    """
+    devs: set[int] = set()
     with open("/proc/mounts") as f:
-        return {line.split()[0] for line in f if line.startswith("/dev/")}
+        for line in f:
+            src = line.split()[0]
+            if not src.startswith("/dev/"):
+                continue
+            try:
+                st = os.stat(src)
+            except OSError:
+                continue
+            if stat.S_ISBLK(st.st_mode):
+                devs.add(st.st_rdev)
+    return devs
+
+
+def _drop_caches() -> None:
+    """Force the read-back verifies below to come from the media."""
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3")
+    except OSError:
+        pass
 
 
 _SHA1_RE = re.compile(rb"(?:verify\s+)?sha1sum\s+([0-9a-fA-F]{40})")
@@ -246,6 +291,218 @@ def sha1_of_sparse_unpacked(img: AmlogicImage, item: ImgItem) -> tuple[str, int]
     return h.hexdigest(), total
 
 
+# ── boot area (eMMC boot0 / boot1) ───────────────────────────────────────────
+#
+# On the S905X5 family the BootROM loads the bootloader from the eMMC
+# hardware boot partitions (boot0, then boot1 as fallback) — NOT from the
+# user-area `bootloader_a` GPT partition. Each boot partition holds:
+#
+#   0x000  struct storage_emmc_boot_info (512 B): U-Boot's "info sector"
+#          (version=1, reserved-partition base sector, ddr-parameter
+#          location). Derived from the partition layout, identical across
+#          firmware versions on the same board — so we re-use the one that
+#          is already on the device instead of synthesising it.
+#   0x200  the .img `bootloader` blob, verbatim
+#   …      zero padding to the end of the boot partition
+#
+# Verified on AM9 Pro: info sector + AM9PRO_2.1.0 blob reproduces the
+# factory boot0 byte-for-byte, and info sector + 2.2.0 blob booted first
+# time (androidboot.bootloader went 260518 → 260903).
+#
+# The kernel exposes boot0/boot1 read-only by default (`force_ro=1`). That is
+# a software default, not eMMC write protection: BOOT_WP / BOOT_WP_STATUS
+# read 0x00 on the AM9 Pro. Root can clear force_ro and write.
+
+BOOT_INFO_SIZE = 512
+BOOT_INFO_VERSION = 1
+
+
+def _sysfs_block_dir(dev: str) -> str:
+    return "/sys/block/" + os.path.basename(dev)
+
+
+def boot_area_devices(emmc: str) -> list[str]:
+    """['/dev/mmcblk0boot0', '/dev/mmcblk0boot1'] — mknod'd if missing."""
+    devs = []
+    for i in (0, 1):
+        node = f"{emmc}boot{i}"
+        sysd = _sysfs_block_dir(node)
+        if not os.path.isdir(sysd):
+            continue
+        if not os.path.exists(node):
+            with open(os.path.join(sysd, "dev")) as f:
+                maj, min_ = f.read().strip().split(":")
+            os.mknod(node, stat.S_IFBLK | 0o600,
+                     os.makedev(int(maj), int(min_)))
+        devs.append(node)
+    return devs
+
+
+def boot_area_size(dev: str) -> int:
+    with open(os.path.join(_sysfs_block_dir(dev), "size")) as f:
+        return int(f.read().strip()) * 512
+
+
+def read_boot_info(dev: str) -> bytes:
+    """The 512-byte info sector at the start of a boot partition."""
+    with open(dev, "rb") as f:
+        hdr = f.read(BOOT_INFO_SIZE)
+    if len(hdr) != BOOT_INFO_SIZE:
+        raise SystemExit(f"{dev}: short read of info sector")
+    version, rsv_base = struct.unpack_from("<II", hdr, 0)
+    if version != BOOT_INFO_VERSION or rsv_base == 0:
+        raise SystemExit(
+            f"{dev}: unexpected info sector (version={version}, "
+            f"rsv_base_addr={rsv_base:#x}) — refusing to guess the boot "
+            f"area layout")
+    return hdr
+
+
+def build_boot_area_image(info: bytes, blob: bytes, size: int) -> bytes:
+    if BOOT_INFO_SIZE + len(blob) > size:
+        raise SystemExit(f"bootloader blob ({len(blob)} B) does not fit in "
+                         f"the {size} B boot partition")
+    return info + blob + b"\x00" * (size - BOOT_INFO_SIZE - len(blob))
+
+
+def _set_force_ro(dev: str, value: int) -> None:
+    with open(os.path.join(_sysfs_block_dir(dev), "force_ro"), "w") as f:
+        f.write(str(value))
+
+
+def sha1_of_boot_blob(dev: str, blob_size: int) -> str:
+    """SHA1 of the bootloader blob as stored (info sector skipped)."""
+    h = hashlib.sha1()
+    with open(dev, "rb") as f:
+        f.seek(BOOT_INFO_SIZE)
+        remaining = blob_size
+        while remaining > 0:
+            buf = f.read(min(IO_CHUNK, remaining))
+            if not buf:
+                break
+            h.update(buf)
+            remaining -= len(buf)
+    return h.hexdigest()
+
+
+def write_boot_area(dev: str, image: bytes) -> None:
+    _set_force_ro(dev, 0)
+    try:
+        with open(dev, "r+b") as f:
+            f.write(image)
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        _set_force_ro(dev, 1)
+    _drop_caches()
+    with open(dev, "rb") as f:
+        got = f.read(len(image))
+    if got != image:
+        raise SystemExit(f"{dev}: read-back after write does not match — "
+                         f"do NOT reboot; the other boot copy is still the "
+                         f"previous bootloader")
+
+
+# ── Android DTB slots in `reserved` ──────────────────────────────────────────
+#
+# U-Boot keeps the Android DTB (the .img's `_aml_dtb` item) in two 256 KB
+# slots at reserved + 4 MiB and + 4.25 MiB, each in `struct aml_dtb_rsv`
+# form (same definition in U-Boot's cmd/amlogic/aml_mmc.c and the kernel's
+# drivers/mmc/host/mmc_dtb.c):
+#
+#   u8  data[256K - 16]   the FDT at offset 0, zero fill after it
+#   u32 magic             0x00447e41  ("A~D\0")
+#   u32 version           1
+#   u32 timestamp         monotonic; readers pick the newest valid slot
+#   u32 checksum          u32 sum over the first 256K-4 bytes
+#
+# Readers validate magic + checksum per slot. Writers bump the timestamp
+# above the newest valid one and rewrite both slots — which is exactly what
+# we do. (A factory-burned slot also carries a stray word after the FDT:
+# the DNL download handler's transfer checksum, left in the buffer that
+# U-Boot then wrote out. It is not part of the format and we don't add it.)
+
+DTB_RESERVE_OFFSET = 4 * 1024 * 1024
+DTB_SLOT_SIZE = 256 * 1024
+DTB_COPIES = 2
+DTB_MAGIC = 0x00447E41
+DTB_VERSION = 1
+FDT_MAGIC = 0xD00DFEED
+
+
+def _sum32(b: bytes) -> int:
+    if len(b) % 4:
+        b = b + b"\x00" * (4 - len(b) % 4)
+    return sum(struct.unpack(f"<{len(b) // 4}I", b)) & 0xFFFFFFFF
+
+
+def dtb_slot_offsets() -> list[int]:
+    return [DTB_RESERVE_OFFSET + i * DTB_SLOT_SIZE for i in range(DTB_COPIES)]
+
+
+def parse_dtb_slot(region: bytes) -> tuple[bool, int]:
+    """(valid, timestamp) for a raw 256 KB slot."""
+    magic, _version, stamp, csum = struct.unpack_from(
+        "<IIII", region, DTB_SLOT_SIZE - 16)
+    valid = magic == DTB_MAGIC and csum == _sum32(region[:DTB_SLOT_SIZE - 4])
+    return valid, stamp
+
+
+def build_dtb_slot(fdt: bytes, timestamp: int) -> bytes:
+    if len(fdt) > DTB_SLOT_SIZE - 16:
+        raise SystemExit("DTB does not fit in a 256 KB slot")
+    region = bytearray(DTB_SLOT_SIZE)
+    region[:len(fdt)] = fdt
+    struct.pack_into("<III", region, DTB_SLOT_SIZE - 16,
+                     DTB_MAGIC, DTB_VERSION, timestamp)
+    struct.pack_into("<I", region, DTB_SLOT_SIZE - 4,
+                     _sum32(bytes(region[:DTB_SLOT_SIZE - 4])))
+    return bytes(region)
+
+
+def read_dtb_slots(reserved: str) -> list[bytes]:
+    out = []
+    with open(reserved, "rb") as f:
+        for off in dtb_slot_offsets():
+            f.seek(off)
+            out.append(f.read(DTB_SLOT_SIZE))
+    return out
+
+
+def img_fdt(img: AmlogicImage) -> bytes | None:
+    """The `_aml_dtb` PARTITION item as a sanity-checked flat FDT."""
+    try:
+        it = img.find("_aml_dtb", "PARTITION")
+    except KeyError:
+        return None
+    fdt = bytes(img.read_at(it, 0, it.size))
+    magic, total = struct.unpack_from(">II", fdt, 0)
+    if magic != FDT_MAGIC or total != len(fdt):
+        raise SystemExit(f"_aml_dtb item is not a flat FDT (magic={magic:#x}, "
+                         f"totalsize={total}, item={len(fdt)})")
+    return fdt
+
+
+def write_dtb_slots(reserved: str, fdt: bytes) -> int:
+    """Rewrite both slots with `fdt`; returns the timestamp used."""
+    stamps = [stamp for valid, stamp in map(parse_dtb_slot,
+                                            read_dtb_slots(reserved)) if valid]
+    stamp = (max(stamps) + 1) & 0xFFFFFFFF if stamps else 0
+    region = build_dtb_slot(fdt, stamp)
+    with open(reserved, "r+b") as f:
+        for off in dtb_slot_offsets():
+            f.seek(off)
+            f.write(region)
+        f.flush()
+        os.fsync(f.fileno())
+    _drop_caches()
+    for i, got in enumerate(read_dtb_slots(reserved)):
+        if got != region:
+            raise SystemExit(f"DTB slot {i}: read-back after write does not "
+                             f"match")
+    return stamp
+
+
 # ── plan ─────────────────────────────────────────────────────────────────────
 
 class PlanStep:
@@ -316,7 +573,58 @@ def safety_check(plan: list[PlanStep]) -> None:
 
 # ── modes ────────────────────────────────────────────────────────────────────
 
-def print_plan(plan: list[PlanStep]) -> None:
+class Extras:
+    """The non-GPT parts of a firmware update: DTB slots + boot area."""
+    __slots__ = ("reserved", "fdt", "fdt_sha1", "boot_devs", "boot_blob",
+                 "boot_sha1")
+
+    def __init__(self) -> None:
+        self.reserved: str | None = None      # /dev/mmcblk0p1
+        self.fdt: bytes | None = None         # _aml_dtb from the .img
+        self.fdt_sha1: str | None = None
+        self.boot_devs: list[str] = []        # /dev/mmcblk0boot0, boot1
+        self.boot_blob: bytes | None = None   # `bootloader` item bytes
+        self.boot_sha1: str | None = None
+
+
+def build_extras(img: AmlogicImage, partmap: dict[str, str], emmc: str,
+                 want_dtb: bool, want_boot: bool, skip_boot1: bool) -> Extras:
+    x = Extras()
+    if want_dtb:
+        x.fdt = img_fdt(img)
+        if x.fdt is None:
+            print("  (skip dtb: .img has no _aml_dtb item)", file=sys.stderr)
+        elif "reserved" not in partmap:
+            print("  (skip dtb: no `reserved` partition in GPT)", file=sys.stderr)
+            x.fdt = None
+        else:
+            x.reserved = partmap["reserved"]
+            x.fdt_sha1 = lookup_verify_sha1(img, "_aml_dtb")
+    if want_boot:
+        item = None
+        for name in ("bootloader", "bootloader_a"):
+            try:
+                item = img.find(name, "PARTITION")
+                break
+            except KeyError:
+                continue
+        if item is None:
+            print("  (skip boot area: .img has no bootloader item)", file=sys.stderr)
+        else:
+            devs = boot_area_devices(emmc)
+            if skip_boot1:
+                devs = devs[:1]
+            if not devs:
+                print("  (skip boot area: no eMMC boot partitions found)",
+                      file=sys.stderr)
+            else:
+                x.boot_devs = devs
+                x.boot_blob = bytes(img.read_at(item, 0, item.size))
+                x.boot_sha1 = lookup_verify_sha1(img, item.name)
+    return x
+
+
+def print_plan(plan: list[PlanStep], extras: Extras) -> None:
     print(f"  {'NAME':<20}  {'TARGET':<20}  {'ON-DISK':>14}  {'FMT':<8}  {'SHA1':<40}")
     print("  " + "-" * 110)
     total = 0
@@ -325,6 +633,18 @@ def print_plan(plan: list[PlanStep]) -> None:
         sha = s.expected_sha1 or "(no verify item)"
         print(f"  {s.name:<20}  {s.target:<20}  {s.on_disk_size:>14,}  {fmt:<8}  {sha}")
         total += s.on_disk_size
+    if extras.fdt is not None:
+        for i, off in enumerate(dtb_slot_offsets()):
+            tgt = f"{extras.reserved}+{off:#x}"
+            print(f"  {'dtb slot ' + str(i):<20}  {tgt:<20}  {DTB_SLOT_SIZE:>14,}  "
+                  f"{'dtbslot':<8}  {extras.fdt_sha1 or '(no verify item)'}")
+            total += DTB_SLOT_SIZE
+    if extras.boot_blob is not None:
+        for dev in extras.boot_devs:
+            print(f"  {os.path.basename(dev):<20}  {dev:<20}  "
+                  f"{BOOT_INFO_SIZE + len(extras.boot_blob):>14,}  {'bootarea':<8}  "
+                  f"{extras.boot_sha1 or '(no verify item)'}")
+            total += BOOT_INFO_SIZE + len(extras.boot_blob)
     print()
     print(f"  total to write: {total:,} bytes ({total / 1024 / 1024:.1f} MiB)")
 
@@ -349,7 +669,43 @@ def _sparse_blob_sha1(img: AmlogicImage, item: ImgItem) -> str:
     return h.hexdigest()
 
 
-def verify_only(img: AmlogicImage, plan: list[PlanStep]) -> int:
+def verify_extras(extras: Extras) -> tuple[int, int, int]:
+    """(match, differ, unknown) for the DTB slots and boot area."""
+    n_match = n_diff = n_unknown = 0
+    if extras.fdt is not None:
+        for i, region in enumerate(read_dtb_slots(extras.reserved)):
+            name = f"dtb slot {i}"
+            valid, stamp = parse_dtb_slot(region)
+            got = hashlib.sha1(region[:len(extras.fdt)]).hexdigest()
+            state = f"valid, stamp {stamp}" if valid else "INVALID checksum"
+            if not extras.fdt_sha1:
+                print(f"  {name:<20}  ?  ({state}; .img has no SHA1 for _aml_dtb)")
+                n_unknown += 1
+            elif got == extras.fdt_sha1 and valid:
+                print(f"  {name:<20}  ✓  fdt sha1 matches .img ({got}); {state}")
+                n_match += 1
+            else:
+                print(f"  {name:<20}  ✗  fdt sha1 {got}; {state}")
+                print(f"  {'':<20}     .img     {extras.fdt_sha1}")
+                n_diff += 1
+    if extras.boot_blob is not None:
+        for dev in extras.boot_devs:
+            name = os.path.basename(dev)
+            got = sha1_of_boot_blob(dev, len(extras.boot_blob))
+            if not extras.boot_sha1:
+                print(f"  {name:<20}  ?  (.img has no SHA1 for bootloader)")
+                n_unknown += 1
+            elif got == extras.boot_sha1:
+                print(f"  {name:<20}  ✓  blob sha1 matches .img ({got})")
+                n_match += 1
+            else:
+                print(f"  {name:<20}  ✗  blob sha1 {got}")
+                print(f"  {'':<20}     .img      {extras.boot_sha1}")
+                n_diff += 1
+    return n_match, n_diff, n_unknown
+
+
+def verify_only(img: AmlogicImage, plan: list[PlanStep], extras: Extras) -> int:
     """Verify each step against the .img VERIFY hash.
 
     For raw partitions: SHA1 of on-disk bytes vs .img hash. End-to-end
@@ -381,6 +737,10 @@ def verify_only(img: AmlogicImage, plan: list[PlanStep]) -> int:
             print(f"  {s.name:<20}  ✗  {label} {got}")
             print(f"  {'':<20}     .img        {s.expected_sha1}")
             n_diff += 1
+    m, d, u = verify_extras(extras)
+    n_match += m
+    n_diff += d
+    n_unknown += u
     print()
     print(f"  match: {n_match}   differ: {n_diff}   unknown: {n_unknown}")
     if n_diff:
@@ -426,9 +786,55 @@ def execute(img: AmlogicImage, plan: list[PlanStep]) -> None:
             print(f"  (no SHA1 in .img — wrote bytes, no verify)")
 
 
+def execute_extras(extras: Extras) -> None:
+    """DTB slots first, then boot0, then boot1 — bootloader last, so an
+    interrupted run leaves the previous, working bootloader in place."""
+    if extras.fdt is not None:
+        if extras.fdt_sha1:
+            got = hashlib.sha1(extras.fdt).hexdigest()
+            if got != extras.fdt_sha1:
+                print(f"  ✗ _aml_dtb in .img fails its own integrity check "
+                      f"({got} != {extras.fdt_sha1})", file=sys.stderr)
+                sys.exit(3)
+        print(f"  → dtb ({len(extras.fdt):,} bytes) → {extras.reserved} "
+              f"slots {[hex(o) for o in dtb_slot_offsets()]}")
+        stamp = write_dtb_slots(extras.reserved, extras.fdt)
+        print(f"  ✓ dtb: both slots written and read back (timestamp {stamp})")
+    if extras.boot_blob is not None:
+        if extras.boot_sha1:
+            got = hashlib.sha1(extras.boot_blob).hexdigest()
+            if got != extras.boot_sha1:
+                print(f"  ✗ bootloader in .img fails its own integrity check "
+                      f"({got} != {extras.boot_sha1})", file=sys.stderr)
+                sys.exit(3)
+        # Re-use the info sector already on boot0 (layout-derived, not
+        # firmware-derived); insist that boot0 and boot1 agree on it.
+        infos = {dev: read_boot_info(dev) for dev in boot_area_devices(
+            extras.boot_devs[0][:-len("boot0")])}
+        if len(set(infos.values())) != 1:
+            print("  ✗ boot0 and boot1 carry different info sectors — "
+                  "refusing to pick one", file=sys.stderr)
+            sys.exit(3)
+        info = next(iter(infos.values()))
+        for dev in extras.boot_devs:
+            image = build_boot_area_image(info, extras.boot_blob,
+                                          boot_area_size(dev))
+            print(f"  → bootloader ({len(extras.boot_blob):,} bytes) → {dev}")
+            write_boot_area(dev, image)
+            print(f"  ✓ {os.path.basename(dev)}: written and read back")
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
+    # Line-buffer stdout so progress survives `nohup … > log` and the
+    # os.execvp("reboot") at the end (exec replaces the process image
+    # without flushing Python's userspace buffer — without this, a
+    # non-interactive --ota run logs nothing but stderr).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     p = argparse.ArgumentParser(
         description="In-device Amlogic .img flasher",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -454,6 +860,14 @@ def main() -> int:
                    help="Required to actually write to eMMC")
     p.add_argument("--reboot", action="store_true",
                    help="Reboot after successful flash")
+    p.add_argument("--no-dtb", action="store_true",
+                   help="Do not touch the Android DTB slots in `reserved`")
+    p.add_argument("--no-boot-area", action="store_true",
+                   help="Do not touch eMMC boot0/boot1 (the running bootloader "
+                        "then stays at the previous version)")
+    p.add_argument("--skip-boot1", action="store_true",
+                   help="Write boot0 only; keep boot1 as the previous "
+                        "bootloader (manual two-phase update)")
     args = p.parse_args()
 
     # --ota is a convenience: implies --yes-i-mean-it + --reboot. It also
@@ -476,13 +890,21 @@ def main() -> int:
     make_emmc_nodes(args.emmc)
     partmap = parse_partition_map(args.emmc)
     plan = build_plan(img, partmap, args.only or None, set(args.skip))
+    # --only/--skip are about GPT partitions; a restricted plan means the
+    # user is being surgical, so leave the DTB/boot area out unless the
+    # plan is the full default one.
+    restricted = bool(args.only or args.skip)
+    extras = build_extras(img, partmap, args.emmc,
+                          want_dtb=not args.no_dtb and not restricted,
+                          want_boot=not args.no_boot_area and not restricted,
+                          skip_boot1=args.skip_boot1)
 
-    if not plan:
+    if not plan and extras.fdt is None and extras.boot_blob is None:
         print("Plan is empty — nothing to do.", file=sys.stderr)
         return 0
 
     print(f"Plan for {args.img} → {args.emmc}:\n")
-    print_plan(plan)
+    print_plan(plan, extras)
     print()
 
     if args.list:
@@ -490,7 +912,7 @@ def main() -> int:
 
     if args.verify_only:
         print("Verifying on-disk SHA1 against .img …\n")
-        return verify_only(img, plan)
+        return verify_only(img, plan, extras)
 
     if args.dry_run:
         print("(--dry-run: no writes)")
@@ -505,11 +927,14 @@ def main() -> int:
 
     print("Flashing …\n")
     execute(img, plan)
+    execute_extras(extras)
     print("\n✓ all writes completed")
 
     if args.reboot:
         subprocess.run(["sync"])
         print("rebooting …")
+        sys.stdout.flush()
+        sys.stderr.flush()
         os.execvp("reboot", ["reboot"])
     return 0
 

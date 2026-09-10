@@ -19,7 +19,7 @@ The installer gates on the active DTB, so it accepts exactly the boards listed a
 
 **This installation method is not supported by CoreELEC. Any support request, bug report, or forum post related to a CoreELEC install performed this way will be rejected, closed, or removed by the CoreELEC team. Do not ask for help on the CoreELEC forums if something goes wrong.**
 
-**Tested on physical Ugoos AM9 Pro, SK4, and SK4 Pro hardware (see [Scope of testing](#scope-of-testing) for exactly what was verified where). A different hardware revision or a future firmware build may behave differently — the installer could fail or produce a non-booting eMMC, particularly if CoreELEC changes the cfgload script format the rebuild step depends on or restructures the `mount_storage` init function in a way that bypasses `/flash/mount-storage.sh`. The device cannot be permanently bricked from a software install: `boot0`/`boot1` are hardware write-protected, and the Amlogic USB Burning Tool can always restore stock Android over the USB-C OTG port. Per-device identity is preserved across the install too — the installer does not touch the `reserved` partition (p1) where the ETH MAC and serial are stored, and the WLAN/BT MAC lives in the Wi-Fi chip's OTP entirely independent of the eMMC. A bad install means an SD-card recovery cycle, not a dead device. See [`factory-investigation.md`](research/factory-investigation.md) and the [Per-Device Identity Provenance](research/emmc-research.md#per-device-identity-provenance) section in the research notes for the verified analysis.**
+**Tested on physical Ugoos AM9 Pro, SK4, and SK4 Pro hardware (see [Scope of testing](#scope-of-testing) for exactly what was verified where). A different hardware revision or a future firmware build may behave differently — the installer could fail or produce a non-booting eMMC, particularly if CoreELEC changes the cfgload script format the rebuild step depends on or restructures the `mount_storage` init function in a way that bypasses `/flash/mount-storage.sh`. The device cannot be permanently bricked from a software install: the installer never touches `boot0`/`boot1`, and the SoC's USB burn mode lives in mask ROM, so the Amlogic USB Burning Tool can always restore stock Android over the USB-C OTG port. Per-device identity is preserved across the install too — the installer does not touch the `reserved` partition (p1) where the ETH MAC and serial are stored, and the WLAN/BT MAC lives in the Wi-Fi chip's OTP entirely independent of the eMMC. A bad install means an SD-card recovery cycle, not a dead device. See [`factory-investigation.md`](research/factory-investigation.md) and the [Per-Device Identity Provenance](research/emmc-research.md#per-device-identity-provenance) section in the research notes for the verified analysis.**
 
 **This process removes Android userdata and the rsv partition. Android can be restored — see [Restoring Android](#restoring-android) below.**
 
@@ -56,6 +56,7 @@ Not every part of this repo has been exercised on every device. What was verifie
 | `ce-emmc-restore.sh` — restore Android layout | ✅ | ✅ | ✅ |
 | Survival across CoreELEC nightly auto-updates | ✅ | ✅ | ✅ |
 | `burn/` — USB DNL burner + in-device eMMC flasher | ✅ | ❌ untested | ❌ untested |
+| `ugoos-fw-update.sh` / `burn/aml-emmc-burn.py --ota` — in-place Ugoos firmware update (2.1.0 → 2.2.0) | ✅ | ❌ untested | ❌ untested |
 | `img-tools/` — keystore / bootloader / logo / img parsing | ✅ | partial¹ | partial¹ |
 | `research/` — protocol captures, factory image analysis | ✅ | ❌ not repeated | ❌ not repeated |
 
@@ -107,7 +108,7 @@ The `burn/` and `research/` work is AM9 Pro-specific because it was built from a
 
 The installer also supports **`--info`** — a read-only diagnostic mode that prints the partition layout, eMMC chip details, U-Boot env summary, AMLNORMAL keystore contents, bootloader build version, current install state (with warnings if legacy workarounds are present), and the cmdline-vs-keystore identity check result. No backups, no writes, safe to run any time. Useful before committing to an install.
 
-Partitions p1–p26 (except p10 if `--restore-logo` is used), `super` (p27), `boot0`, and `boot1` are not touched. `boot0`/`boot1` are hardware write-protected and cannot be modified by anything running in Linux. The installer is a self-contained bash script; it picks up `aml-keystore-tool.py` / `aml-bootloader-tool.py` / `aml-logo-tool.py` from the same directory if they're there (for verification / `--info` / `--restore-logo` respectively).
+Partitions p1–p26 (except p10 if `--restore-logo` is used), `super` (p27), `boot0`, and `boot1` are not touched. (`boot0`/`boot1` are exposed read-only by the kernel by default, but — correcting earlier versions of this README — they are *not* hardware write-protected; the in-place firmware updater relies on that. See [FIRMWARE-UPDATE.md](FIRMWARE-UPDATE.md).) The installer is a self-contained bash script; it picks up `aml-keystore-tool.py` / `aml-bootloader-tool.py` / `aml-logo-tool.py` from the same directory if they're there (for verification / `--info` / `--restore-logo` respectively).
 
 ---
 
@@ -194,7 +195,7 @@ Recovery options, in order of preference:
 
 ### Option 2 — Amlogic USB Burning Tool (backup files not available)
 
-Any of these boxes can be fully restored to stock Android using the Amlogic USB Burning Tool. This works because `boot0` (the BL2 first-stage bootloader) is hardware write-protected and cannot be touched by anything running in Linux — the device can always enter USB burn mode.
+Any of these boxes can be fully restored to stock Android using the Amlogic USB Burning Tool. This works because USB burn mode is implemented in the SoC's mask-ROM BootROM, which nothing on the eMMC can affect — the device can always enter it with the reset button.
 
 **What you need:**
 
@@ -214,6 +215,22 @@ Any of these boxes can be fully restored to stock Android using the Amlogic USB 
 The AM9 Pro factory image (`AM9PRO_2.0.9.img`) was fully parsed and confirmed to contain all required partitions: `super` (1507 MB, LP metadata + Android system images), `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`, `odm_ext_a`, and the SoC DTB. The image also includes the GPT table itself, so a full flash restores the original 29-partition Android layout exactly. The SK4 / SK4 Pro images were not parsed as part of this work, but they use the same `AML_PACK_v2` container — `img-tools/aml-img-tool.py` will inspect them.
 
 **Important:** The factory image restores Android to the state Ugoos shipped it — which for the AM9 Pro includes **Magisk pre-installed** (root access). That unit ships with an unlocked bootloader and Magisk patched into `init_boot_a`, and is certified at Widevine L3 only (no L1 attestation path with an unlocked bootloader). Whether the SK4 / SK4 Pro stock images ship the same way was not checked. Per-device identity is preserved across the burn because the factory image does not include the `reserved` partition (p1) where the ETH MAC and serial are stored — USB Burning Tool leaves p1 alone. The WLAN/BT MAC lives in the Wi-Fi chip's OTP and is entirely independent of the eMMC. See [`factory-investigation.md`](research/factory-investigation.md) for the underlying analysis.
+
+---
+
+## Updating the Ugoos firmware from CoreELEC
+
+CoreELEC nightlies can require a newer Ugoos firmware (from nightly 20260910 the AM9 Pro needs firmware 2.2.0). With CoreELEC on the eMMC you can't run the Ugoos OTA and a USB Burning Tool restore wipes CoreELEC, so this repo has an in-place updater: it writes the Android partitions, the Android DTB in `reserved`, and the bootloader in the eMMC hardware boot partitions (`boot0`/`boot1` — which is what the SoC actually boots from) straight from the running CoreELEC, and leaves `CE_FLASH`/`CE_STORAGE`/GPT alone.
+
+```bash
+# on the box, with the factory .img already in /storage (Ugoos ships them on mega.nz)
+curl -fsSL https://raw.githubusercontent.com/dangerouslaser/ugoos-am9-pro-coreelec-emmc/main/ugoos-fw-update.sh \
+    | bash -s -- --check /storage/AM9PRO_2.2.0.img      # what differs, no writes
+curl -fsSL https://raw.githubusercontent.com/dangerouslaser/ugoos-am9-pro-coreelec-emmc/main/ugoos-fw-update.sh \
+    | bash -s -- /storage/AM9PRO_2.2.0.img              # update + reboot
+```
+
+Guide, options, rollback and recovery: [FIRMWARE-UPDATE.md](FIRMWARE-UPDATE.md). How the boot area and DTB slot formats were established: [`research/firmware-update-in-place.md`](research/firmware-update-in-place.md). Tested on AM9 Pro only.
 
 ---
 
@@ -308,7 +325,7 @@ Two consequences worth knowing if you're modifying these scripts:
 
 ### Brick risk
 
-Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's first-stage bootloader cannot be overwritten from Linux. U-Boot tries the SD card first, so a working SD card always provides a recovery path. Worst case (corrupted GPT): Amlogic devices can be recovered via USB Burning Tool from a PC. However, broken media playback or boot failures on future firmware are a real possibility with no known fix.
+Low but non-zero. The installer never writes `boot0`/`boot1` (they are not hardware write-protected — see [FIRMWARE-UPDATE.md](FIRMWARE-UPDATE.md) — but nothing here touches them), and the SoC's USB burn mode is in mask ROM. U-Boot tries the SD card first, so a working SD card always provides a recovery path. Worst case (corrupted GPT): Amlogic devices can be recovered via USB Burning Tool from a PC. However, broken media playback or boot failures on future firmware are a real possibility with no known fix.
 
 ---
 
@@ -320,6 +337,7 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 |------|-------------|
 | `ce-emmc-install.sh` | CoreELEC eMMC installer. Board-gated on `SUPPORTED_BOARDS` — AM9 Pro, SK4, SK4 Pro. |
 | `ce-emmc-restore.sh` | Android partition restore script. Board-agnostic — it reconstructs the layout from the installer's backup set, so it works on any board the installer ran on. |
+| `ugoos-fw-update.sh` | In-place Ugoos firmware updater, run from CoreELEC (curl-able). Fetches `burn/aml-emmc-burn.py` + `lib/aml_img.py`, checks board/image/hash, then writes Android partitions, DTB slots and the eMMC boot area. Guide: [FIRMWARE-UPDATE.md](FIRMWARE-UPDATE.md). |
 
 ### Root files
 
@@ -331,10 +349,10 @@ Low but non-zero. `boot0`/`boot1` are hardware write-protected — the SoC's fir
 
 | Path | What's in it |
 |------|--------------|
-| [`burn/`](burn/README.md) | The active flashers — `aml-dnl-burn.py` (USB DNL from a host), `aml-dnl-status.py` (read-only USB probe), and `aml-emmc-burn.py` (direct eMMC writes from inside CE). |
+| [`burn/`](burn/README.md) | The active flashers — `aml-dnl-burn.py` (USB DNL from a host), `aml-dnl-status.py` (read-only USB probe), and `aml-emmc-burn.py` (in-device firmware flasher: partitions, DTB slots, eMMC boot0/boot1 — the engine behind `ugoos-fw-update.sh`). |
 | [`img-tools/`](img-tools/README.md) | Standalone file-format CLIs that operate on local files only: `aml-img-tool.py`, `aml-bootloader-tool.py`, `aml-keystore-tool.py`, `aml-logo-tool.py`. Used by `ce-emmc-install.sh` for identity / logo / bootloader inspection. |
 | [`lib/`](lib/) | Shared Python libraries imported by the burners and probes: `aml_dnl_proto.py` (Layer 1 USB transport + ADNL/DNL wire protocol), `aml_dnl_ops.py` (Layer 2 partition flash + addsum + DDR load + CBW uboot upload), `aml_dnl_flows.py` (Layer 3 composable plans), `aml_img.py` (USB-free AML_PACK_v2 parser + Android sparse decoder, mmap-backed). |
 | [`probes/`](probes/README.md) | One-off diagnostic & RE bring-up scripts used to map the ADNL protocol. Not user-facing; kept as reference. |
 | [`scripts/`](scripts/README.md) | Small standalone utilities. Currently: `make-cfgload.py` (pure-Python `mkimage -T script` equivalent). |
-| [`research/`](research/README.md) | Technical research notes and frozen evidence snapshots — `emmc-research.md`, `factory-investigation.md`, `dnl-protocol-from-capture.md`, and the AM9PRO_2.1.0 factory snapshot data. |
+| [`research/`](research/README.md) | Technical research notes and frozen evidence snapshots — `emmc-research.md`, `factory-investigation.md`, `dnl-protocol-from-capture.md`, `firmware-update-in-place.md` (eMMC boot area + DTB slot formats), and the AM9PRO_2.1.0 factory snapshot data. |
 | [`aml-analysis/`](aml-analysis/README.md) | Reverse-engineering artifacts for the Windows `Aml_Burn_Tool.exe` + decryption of the embedded `usb_flow.aml` Lua scripts. |

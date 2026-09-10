@@ -164,6 +164,8 @@ RPMB is provisioned (a key has been burned in). RPMB is used by Android's Keymas
 
 `mmcblk0boot0` and `mmcblk0boot1` both report `force_ro=1` — they are hardware write-protected. This is the first-stage bootloader (BL2). Nothing running in Linux can overwrite it. The U-Boot environment also has `bootloader_wp=1` and `write_boot=0` confirming this is intentional.
 
+> **Correction (2026-09-10):** this was wrong. `force_ro=1` is the kernel's default for eMMC boot partitions; the eMMC's own `BOOT_WP` / `BOOT_WP_STATUS` registers read 0x00 (mmc-utils `extcsd read`), so root can clear `force_ro` and write them — which is what the in-place firmware updater does. The boot partitions hold a 512-byte U-Boot info sector followed by the `.img` bootloader blob, and they, not `bootloader_a`, are what the BootROM loads. See [`firmware-update-in-place.md`](firmware-update-in-place.md). The "always recoverable over USB" conclusion still holds, because USB burn mode is in the SoC's mask ROM.
+
 ---
 
 ## Per-Device Identity Provenance
