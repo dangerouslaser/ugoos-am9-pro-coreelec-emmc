@@ -65,8 +65,9 @@ Details in [`research/firmware-update-in-place.md`](research/firmware-update-in-
 ## Prerequisites
 
 - A Ugoos AM9 Pro running CoreELEC (from eMMC or from SD/USB) with SSH.
-  SK4 / SK4 Pro share the layout but have **not** been tested — the script
-  refuses unless you pass `--allow-untested-board`.
+  AM9 (non-Pro), SK4 and SK4 Pro share the layout but have **not** been
+  tested with this tool — the script refuses unless you pass
+  `--allow-untested-board`.
 - The factory `.img` for **your** box. Ugoos publishes them on mega.nz
   (links in their support channels); the archive is ~1.5 GB, the `.img`
   inside ~1.7 GB. `curl` can't fetch from mega.nz, so download and extract
@@ -137,7 +138,7 @@ the exact same command.
 | `--no-dtb`, `--no-boot-area` | Leave the DTB slots / the boot area alone. With `--no-boot-area` the running bootloader does not change — only useful for experiments. |
 | `--sha1 HEX` | Insist on this image hash. |
 | `--allow-unknown-image` | Accept an image whose hash isn't in the script's list. Add the hash to `KNOWN_IMAGES` in the script if you've verified it. |
-| `--allow-untested-board` | Run on SK4 / SK4 Pro. |
+| `--allow-untested-board` | Run on AM9 (non-Pro), SK4 or SK4 Pro. |
 | `--force` | Rewrite everything even if the eMMC already matches. |
 | `--ref REF` | Fetch the tools from another branch/tag of this repo. |
 

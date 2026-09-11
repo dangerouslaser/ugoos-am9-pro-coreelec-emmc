@@ -12,8 +12,10 @@ the board check, the eMMC-mount check) are in
 
 ## Requirements
 
-- A Ugoos AM9 Pro, SK4, or SK4 Pro booted into CoreELEC from removable media
-  (SD card or USB stick — anywhere except the eMMC being repartitioned)
+- A Ugoos AM9 Pro, AM9, SK4, or SK4 Pro booted into CoreELEC from removable
+  media (SD card or USB stick — anywhere except the eMMC being repartitioned).
+  The AM9 (non-Pro) was verified by [@Wildpig954](https://github.com/Wildpig954)
+  ([discussion #2](https://github.com/dangerouslaser/ugoos-am9-pro-coreelec-emmc/discussions/2)); the restore script has not been run on one yet.
 - A CoreELEC nightly build (AM9 Pro tested on `22.0-Piers_nightly_20260514`
   through `20260527`; SK4 / SK4 Pro on the nightlies current at their installs)
 - SSH access or a terminal on the device

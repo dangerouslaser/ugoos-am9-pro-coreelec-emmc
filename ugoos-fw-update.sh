@@ -43,7 +43,7 @@
 #                      list (you verified it yourself).
 #   --allow-untested-board
 #                      Proceed on a board this tool hasn't been exercised on
-#                      (SK4 / SK4 Pro: same partition layout, not yet tested).
+#                      (AM9 non-Pro, SK4, SK4 Pro: same layout, not yet tested).
 #   --force            Flash even if the eMMC already matches the image.
 #   --ref REF          Git ref to fetch the tools from (default: main).
 #   --tools-dir DIR    Where to keep the tools (default: /storage/.ugoos-fw-update).
@@ -79,6 +79,7 @@ DOWNLOAD_DIR="/storage"
 # coreelec-dt-id | board name | tested?
 SUPPORTED_BOARDS=(
     "s6_s905x5_ugoos_am9_pro|Ugoos AM9 Pro|tested"
+    "s6_s905x5_ugoos_am9|Ugoos AM9|untested"
     "s7d_s905x5m_ugoos_sk4|Ugoos SK4 / SK4 Pro|untested"
 )
 
