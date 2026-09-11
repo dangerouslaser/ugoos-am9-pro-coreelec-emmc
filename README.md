@@ -5,10 +5,11 @@ Tooling and research for the Ugoos boxes built on the Amlogic S905X5 family:
 | Device | SoC | CoreELEC board ID |
 |--------|-----|-------------------|
 | Ugoos AM9 Pro | S905X5-J (S6) | `s6_s905x5_ugoos_am9_pro` |
+| Ugoos AM9 | S905X5 (S6) | `s6_s905x5_ugoos_am9` |
 | Ugoos SK4 | S905X5M-J (S7D) | `s7d_s905x5m_ugoos_sk4` |
 | Ugoos SK4 Pro | S905X5M-J (S7D) | `s7d_s905x5m_ugoos_sk4` (same DTB as the SK4) |
 
-CoreELEC supports all three, but its `ceemmc` install tool does not, and a
+CoreELEC supports all four, but its `ceemmc` install tool does not, and a
 CoreELEC-on-eMMC box cannot run the Ugoos OTA. This repo fills those gaps.
 Everything here documents what was done to specific units; it is published as
 a technical reference, not a recommendation.
@@ -17,7 +18,7 @@ a technical reference, not a recommendation.
 
 | Task | Tool | Guide | Tested on |
 |------|------|-------|-----------|
-| Install CoreELEC to the internal eMMC | `ce-emmc-install.sh` | [INSTALL.md](INSTALL.md) | AM9 Pro, SK4, SK4 Pro |
+| Install CoreELEC to the internal eMMC | `ce-emmc-install.sh` | [INSTALL.md](INSTALL.md) | AM9 Pro, SK4, SK4 Pro; AM9 (community) |
 | Restore the stock Android layout | `ce-emmc-restore.sh` | [INSTALL.md → Restoring Android](INSTALL.md#restoring-android) | AM9 Pro, SK4, SK4 Pro |
 | Update the Ugoos firmware in place, from CoreELEC | `ugoos-fw-update.sh` | [FIRMWARE-UPDATE.md](FIRMWARE-UPDATE.md) | AM9 Pro |
 | Flash a factory image over USB without Windows | `burn/aml-dnl-burn.py` | [burn/README.md](burn/README.md) | AM9 Pro |
@@ -74,7 +75,7 @@ Each guide covers options, what exactly gets written, rollback and recovery.
 
 ## How it works, briefly
 
-- **eMMC install.** All three boxes share the Amlogic 29-partition Android
+- **eMMC install.** All four boxes share the Amlogic 29-partition Android
   layout (`super` p27, `rsv` p28, `userdata` p29, keystore in `reserved` p1,
   U-Boot env p2). The installer backs up the small unit-specific partitions,
   replaces `rsv` + `userdata` with `CE_FLASH` + `CE_STORAGE`, copies the boot
@@ -94,17 +95,23 @@ Each guide covers options, what exactly gets written, rollback and recovery.
 
 ## Scope of testing
 
-| Component | AM9 Pro | SK4 | SK4 Pro |
-|-----------|---------|-----|---------|
-| `ce-emmc-install.sh` — install to eMMC | ✅ | ✅ | ✅ |
-| `ce-emmc-restore.sh` — restore Android layout | ✅ | ✅ | ✅ |
-| Survival across CoreELEC nightly auto-updates | ✅ | ✅ | ✅ |
-| `ugoos-fw-update.sh` / `aml-emmc-burn.py` — in-place firmware update (2.1.0 → 2.2.0) | ✅ | ❌ untested | ❌ untested |
-| `burn/` — USB DNL burner | ✅ | ❌ untested | ❌ untested |
-| `img-tools/` — keystore / bootloader / logo / img parsing | ✅ | partial¹ | partial¹ |
-| `research/` — protocol captures, factory image analysis | ✅ | ❌ not repeated | ❌ not repeated |
+| Component | AM9 Pro | AM9 | SK4 | SK4 Pro |
+|-----------|---------|-----|-----|---------|
+| `ce-emmc-install.sh` — install to eMMC | ✅ | ✅ community¹ | ✅ | ✅ |
+| `ce-emmc-restore.sh` — restore Android layout | ✅ | ❌ untested | ✅ | ✅ |
+| Survival across CoreELEC nightly auto-updates | ✅ | not yet reported | ✅ | ✅ |
+| `ugoos-fw-update.sh` / `aml-emmc-burn.py` — in-place firmware update (2.1.0 → 2.2.0) | ✅ | ❌ untested | ❌ untested | ❌ untested |
+| `burn/` — USB DNL burner | ✅ | ❌ untested | ❌ untested | ❌ untested |
+| `img-tools/` — keystore / bootloader / logo / img parsing | ✅ | partial² | partial² | partial² |
+| `research/` — protocol captures, factory image analysis | ✅ | ❌ not repeated | ❌ not repeated | ❌ not repeated |
 
-¹ `aml-keystore-tool.py` runs on every board as part of the installer's
+¹ Ugoos AM9 (non-Pro) support was verified by
+[@Wildpig954](https://github.com/Wildpig954) on 2026-09-11
+([discussion #2](https://github.com/dangerouslaser/ugoos-am9-pro-coreelec-emmc/discussions/2)): same 29-partition layout, install and first boot
+from eMMC fine, booted from SD, without `aml-keystore-tool.py` alongside
+(identity check skipped). Thanks!
+
+² `aml-keystore-tool.py` runs on every board as part of the installer's
 identity check. The logo, bootloader and `AML_PACK_v2` tooling was only
 pointed at AM9 Pro artifacts.
 

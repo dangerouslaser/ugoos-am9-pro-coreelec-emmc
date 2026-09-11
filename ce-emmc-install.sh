@@ -4,7 +4,9 @@
 # Workaround until ceemmc adds support for Ugoos S905X5 boards.
 # Tested on Ugoos AM9 Pro (s6_s905x5_ugoos_am9_pro) and on the Ugoos SK4
 # and SK4 Pro, which both boot s7d_s905x5m_ugoos_sk4 and ship the same
-# Amlogic partition layout. Add new boards to SUPPORTED_BOARDS below.
+# Amlogic partition layout. The Ugoos AM9 (s6_s905x5_ugoos_am9, same layout)
+# was verified by @Wildpig954 — see GitHub discussion #2. Add new boards to
+# SUPPORTED_BOARDS below.
 #
 # Must be run from CoreELEC booted off removable media (SD card or USB
 # stick) — anywhere except the eMMC itself, which we're about to repartition.
@@ -114,6 +116,7 @@ FLASH_DIR="/flash"
 # partition layout, drop another line here.
 SUPPORTED_BOARDS=(
     "s6_s905x5_ugoos_am9_pro.dtb|Ugoos AM9 Pro"
+    "s6_s905x5_ugoos_am9.dtb|Ugoos AM9"
     "s7d_s905x5m_ugoos_sk4.dtb|Ugoos SK4 / SK4 Pro"
 )
 MNT_FLASH="/var/ce_flash"
@@ -934,10 +937,10 @@ CoreELEC eMMC Installer — ${BOARD_NAME}
   CREATE  p29  CE_STORAGE  ${CE_STORAGE_HUMAN}  ext4   (CoreELEC storage)${LOGO_LINE}
 
 ${UNTOUCHED_NOTE}
-boot0/boot1 are hardware write-protected and safe.
+boot0/boot1 (the eMMC hardware boot partitions) are not touched.
 
-Android restore requires Amlogic USB Burning Tool on Windows via the
-USB-C OTG port using the official Ugoos factory image."
+Android can be restored with ce-emmc-restore.sh from this backup set,
+or with the Amlogic USB Burning Tool over the USB-C OTG port."
 
 tui_confirm_destructive "CoreELEC eMMC Installer — ${BOARD_NAME}" "$CONFIRM_MSG" \
     || { echo "Aborted."; exit 0; }
