@@ -1,7 +1,7 @@
 # Updating the Ugoos firmware in place, from CoreELEC
 
 This guide covers `ugoos-fw-update.sh`: it takes a Ugoos factory image
-(`AM9PRO_X.Y.Z.img`) and writes everything the Amlogic USB Burning Tool would
+(`AM9PRO_X.Y.Z.img`, `SK4_X.Y.Z.img`) and writes everything the Amlogic USB Burning Tool would
 write to the eMMC, from inside the running CoreELEC, in about 30 seconds plus
 a reboot. No USB-C cable, no Windows, no leaving CoreELEC, and CoreELEC's own
 partitions (`CE_FLASH`, `CE_STORAGE`) and the GPT are never touched.
@@ -31,6 +31,9 @@ Check what you're running:
 tr ' ' '\n' </proc/cmdline | grep androidboot.bootloader
 # androidboot.bootloader=01.01.260518.144819   ← firmware 2.1.0 (build date 2026-05-18)
 # androidboot.bootloader=01.01.260903.151400   ← firmware 2.2.0 (build date 2026-09-03)
+#
+# SK4 / SK4 Pro:
+# androidboot.bootloader=01.01.260903.162043   ← firmware 2.2.0 (SK4_2.2.0.img)
 ```
 
 The stamp is the build timestamp of the bootloader that actually booted the
@@ -64,8 +67,8 @@ Details in [`research/firmware-update-in-place.md`](research/firmware-update-in-
 
 ## Prerequisites
 
-- A Ugoos AM9 Pro running CoreELEC (from eMMC or from SD/USB) with SSH.
-  AM9 (non-Pro), SK4 and SK4 Pro share the layout but have **not** been
+- A Ugoos AM9 Pro, SK4 or SK4 Pro running CoreELEC (from eMMC or from
+  SD/USB) with SSH. The AM9 (non-Pro) shares the layout but has **not** been
   tested with this tool — the script refuses unless you pass
   `--allow-untested-board`.
 - The factory `.img` for **your** box. Ugoos publishes them on mega.nz
@@ -138,7 +141,7 @@ the exact same command.
 | `--no-dtb`, `--no-boot-area` | Leave the DTB slots / the boot area alone. With `--no-boot-area` the running bootloader does not change — only useful for experiments. |
 | `--sha1 HEX` | Insist on this image hash. |
 | `--allow-unknown-image` | Accept an image whose hash isn't in the script's list. Add the hash to `KNOWN_IMAGES` in the script if you've verified it. |
-| `--allow-untested-board` | Run on AM9 (non-Pro), SK4 or SK4 Pro. |
+| `--allow-untested-board` | Run on the AM9 (non-Pro). |
 | `--force` | Rewrite everything even if the eMMC already matches. |
 | `--ref REF` | Fetch the tools from another branch/tag of this repo. |
 
@@ -149,6 +152,7 @@ Known images (SHA1 of the `.img`):
 | `AM9PRO_2.2.0.img` | `a0b9adc543788205de03b1a04cfba88be1dc2300` | `01.01.260903.151400` |
 | `AM9PRO_2.1.0.img` | `5c0920b3f9081e084e3370525d056411a7284847` | `01.01.260518.144819` |
 | `AM9PRO_2.0.9.img` | `8b5734fe70bd7168914ae1e7880ae6ab25a026b9` | — |
+| `SK4_2.2.0.img` (SK4 / SK4 Pro) | `73413b624e1412f6b0c2d69ba420f932d2b18943` | `01.01.260903.162043` |
 
 ### Running from a checkout instead of curl
 
@@ -191,6 +195,7 @@ python3 /storage/.ugoos-fw-update/aml-emmc-burn.py /storage/AM9PRO_2.2.0.img --o
 | Board | Path | Firmware | CoreELEC | Date |
 |-------|------|----------|----------|------|
 | AM9 Pro | CoreELEC on eMMC (`ce-emmc-install.sh`) | 2.1.0 → 2.2.0, then 2.2.0 → 2.2.0 (`--force`) | 22.0-Piers nightly 20260910 | 2026-09-10 |
+| SK4 Pro | CoreELEC on eMMC (`ce-emmc-install.sh`) | → 2.2.0 (`SK4_2.2.0.img`), all 12 items verified on disk afterwards | 22.0-Piers nightly 20260914 | 2026-09-14 |
 
 Full write-up of how the boot area and DTB formats were established, and
 the test log, in [`research/firmware-update-in-place.md`](research/firmware-update-in-place.md).
