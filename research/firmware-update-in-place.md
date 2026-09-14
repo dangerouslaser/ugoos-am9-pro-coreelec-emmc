@@ -181,9 +181,12 @@ Rollback = the same tool with `AM9PRO_2.1.0.img`.
 
 ## Open items
 
-- SK4 / SK4 Pro: same partition layout and the same U-Boot code paths, but
-  the info sector, boot-partition size and DTB slot offsets have not been
-  read on one. `ugoos-fw-update.sh` gates on `--allow-untested-board`.
+- ~~SK4 / SK4 Pro~~: done 2026-09-14 on an SK4 Pro with `SK4_2.2.0.img`. Same
+  item set as the AM9 Pro image (`bootloader_a` at p7, `super` at p27, DTB
+  slots at `reserved` + 4 MiB / 4.25 MiB, boot0/boot1 4,097,536 bytes behind
+  the info sector); every item verified on disk after the reboot, running
+  bootloader `01.01.260903.162043`. `ugoos-fw-update.sh` no longer gates
+  the SK4 DTB id. The AM9 (non-Pro) is still behind `--allow-untested-board`.
 - Whether U-Boot 2.2.0 *needs* the 2.2.0 `_aml_dtb` for anything beyond
   Android boot: unknown (it booted CoreELEC fine between the boot-area
   update and the DTB update). Writing it costs nothing and matches the

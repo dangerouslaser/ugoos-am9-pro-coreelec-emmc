@@ -100,7 +100,7 @@ Each guide covers options, what exactly gets written, rollback and recovery.
 | `ce-emmc-install.sh` — install to eMMC | ✅ | ✅ community¹ | ✅ | ✅ |
 | `ce-emmc-restore.sh` — restore Android layout | ✅ | ❌ untested | ✅ | ✅ |
 | Survival across CoreELEC nightly auto-updates | ✅ | not yet reported | ✅ | ✅ |
-| `ugoos-fw-update.sh` / `aml-emmc-burn.py` — in-place firmware update (2.1.0 → 2.2.0) | ✅ | ❌ untested | ❌ untested | ❌ untested |
+| `ugoos-fw-update.sh` / `aml-emmc-burn.py` — in-place firmware update (→ 2.2.0) | ✅ | ❌ untested | same DTB as SK4 Pro³ | ✅ |
 | `burn/` — USB DNL burner | ✅ | ❌ untested | ❌ untested | ❌ untested |
 | `img-tools/` — keystore / bootloader / logo / img parsing | ✅ | partial² | partial² | partial² |
 | `research/` — protocol captures, factory image analysis | ✅ | ❌ not repeated | ❌ not repeated | ❌ not repeated |
@@ -115,12 +115,18 @@ from eMMC fine, booted from SD, without `aml-keystore-tool.py` alongside
 identity check. The logo, bootloader and `AML_PACK_v2` tooling was only
 pointed at AM9 Pro artifacts.
 
+³ The SK4 and SK4 Pro share the CoreELEC DTB (`s7d_s905x5m_ugoos_sk4`), so
+the script cannot tell them apart and accepts both. The firmware update was
+run on an SK4 Pro with `SK4_2.2.0.img` on 2026-09-14; the non-Pro SK4 has not
+been tried directly.
+
 AM9 Pro installs were verified on CoreELEC nightlies `22.0-Piers_nightly_20260514`
 through `20260527` including the auto-update path; the firmware update on
-`20260910`. SK4 and SK4 Pro were verified on the nightlies current at their
-installs. Everything in `burn/` and `research/` was built from an AM9 Pro and
-`AM9PRO_2.1.0.img`; the DNL protocol is SoC-generic, but nothing there has been
-pointed at an SK4 — start with `dry-run`.
+`20260910` (AM9 Pro) and `20260914` (SK4 Pro). SK4 and SK4 Pro installs were
+verified on the nightlies current at their installs. Everything in `burn/` and
+`research/` was built from an AM9 Pro and `AM9PRO_2.1.0.img`; the DNL protocol
+is SoC-generic, but nothing there has been pointed at an SK4 — start with
+`dry-run`.
 
 ## Repository layout
 

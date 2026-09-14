@@ -2,10 +2,11 @@
 # ugoos-fw-update.sh — update the Ugoos Android firmware in place, from CoreELEC
 #
 # For Ugoos S905X5 boxes running CoreELEC (from eMMC via ce-emmc-install.sh,
-# or from SD/USB). Takes a factory `AM9PRO_X.Y.Z.img` and writes everything
-# the Amlogic USB Burning Tool would write to the eMMC — Android partitions,
-# the Android DTB in `reserved`, and the bootloader in the eMMC hardware boot
-# partitions boot0/boot1 — without USB, Windows, or leaving CoreELEC.
+# or from SD/USB). Takes a factory `AM9PRO_X.Y.Z.img` / `SK4_X.Y.Z.img` and
+# writes everything the Amlogic USB Burning Tool would write to the eMMC —
+# Android partitions, the Android DTB in `reserved`, and the bootloader in
+# the eMMC hardware boot partitions boot0/boot1 — without USB, Windows, or
+# leaving CoreELEC.
 # CE_FLASH / CE_STORAGE and the GPT are never touched.
 #
 # Why you'd want this: CoreELEC nightlies can require a newer Ugoos firmware
@@ -43,7 +44,7 @@
 #                      list (you verified it yourself).
 #   --allow-untested-board
 #                      Proceed on a board this tool hasn't been exercised on
-#                      (AM9 non-Pro, SK4, SK4 Pro: same layout, not yet tested).
+#                      (AM9 non-Pro: same layout, not yet tested).
 #   --force            Flash even if the eMMC already matches the image.
 #   --ref REF          Git ref to fetch the tools from (default: main).
 #   --tools-dir DIR    Where to keep the tools (default: /storage/.ugoos-fw-update).
@@ -66,7 +67,7 @@
 # ROM, so the USB Burning Tool (or burn/aml-dnl-burn.py) always works.
 #
 # Not supported by CoreELEC or Ugoos. Tested on: AM9 Pro, CoreELEC on eMMC,
-# firmware 2.1.0 → 2.2.0 (2026-09-10).
+# firmware 2.1.0 → 2.2.0 (2026-09-10); SK4 Pro, SK4_2.2.0.img (2026-09-14).
 
 set -euo pipefail
 
@@ -80,12 +81,13 @@ DOWNLOAD_DIR="/storage"
 SUPPORTED_BOARDS=(
     "s6_s905x5_ugoos_am9_pro|Ugoos AM9 Pro|tested"
     "s6_s905x5_ugoos_am9|Ugoos AM9|untested"
-    "s7d_s905x5m_ugoos_sk4|Ugoos SK4 / SK4 Pro|untested"
+    "s7d_s905x5m_ugoos_sk4|Ugoos SK4 / SK4 Pro|tested"
 )
 
 # SHA1 of factory images we have run this on (or parsed). Add yours here.
 KNOWN_IMAGES=(
     "a0b9adc543788205de03b1a04cfba88be1dc2300|AM9PRO_2.2.0.img|s6"
+    "73413b624e1412f6b0c2d69ba420f932d2b18943|SK4_2.2.0.img|s7d"
     "5c0920b3f9081e084e3370525d056411a7284847|AM9PRO_2.1.0.img|s6"
     "8b5734fe70bd7168914ae1e7880ae6ab25a026b9|AM9PRO_2.0.9.img|s6"
 )

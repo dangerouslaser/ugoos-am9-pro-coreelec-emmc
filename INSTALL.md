@@ -191,9 +191,10 @@ interchangeable), and a USB-C to USB-A cable.
 
 The AM9 Pro factory image was fully parsed and contains `super`,
 `bootloader_a`, `boot_a`, `vendor_boot_a`, `dtbo_a`, `init_boot_a`, `logo`,
-`odm_ext_a`, the SoC DTB and the GPT. The SK4 / SK4 Pro images were not
-parsed but use the same `AML_PACK_v2` container — `img-tools/aml-img-tool.py`
-will inspect them.
+`odm_ext_a`, the SoC DTB and the GPT. `SK4_2.2.0.img` uses the same
+`AML_PACK_v2` container with the same item set (parsed and flashed by
+`ugoos-fw-update.sh`, see [FIRMWARE-UPDATE.md](FIRMWARE-UPDATE.md));
+`img-tools/aml-img-tool.py` will inspect it.
 
 **What you get back:** Android as Ugoos shipped it. For the AM9 Pro that means
 **Magisk pre-installed** (root), an unlocked bootloader, and Widevine L3 only.
