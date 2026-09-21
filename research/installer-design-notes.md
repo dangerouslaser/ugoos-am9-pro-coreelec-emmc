@@ -32,6 +32,38 @@ The result: even if (when) a future CE nightly reverts cfgload back to its stock
 
 This is the same outcome `ceemmc` would produce natively if it supported this board — `LABEL=`-based mounting through the standard `mount_part` path with no hook scripts needed. We can't get there without upstream support, so we ship the hook + nofsck as a stable workaround.
 
+## Why the installer clears the Amlogic MPT
+
+[Issue #8](https://github.com/dangerouslaser/ugoos-am9-pro-coreelec-emmc/issues/8): an AM9 Pro on FW 2.2.0 finished the install cleanly, booted fine from the USB stick, and hung at the logo from the eMMC. U-Boot env, `cfgload` CRCs and the CE_FLASH contents were all identical to a working box. The difference was in what the kernel saw. Booted from USB on that box:
+
+```
+parted (on-disk GPT)            lsblk (kernel)
+28  CE_FLASH    512 MiB         rsv        64M
+29  CE_STORAGE  55299 MiB       userdata   54.4G
+```
+
+Amlogic keeps its own partition table, the "MPT", at eMMC byte `0x2400000` — offset 0 of `reserved` (p1). CoreELEC's kernel checks for it right after the normal GPT scan (`drivers/mmc/core/block.c`, `mmc_validate_mpt_partition`): if the first sector starts with `MPT\0`, `aml_emmc_partition_ops` (`common_drivers/drivers/mmc/host/mmc_partitions.c`) re-registers every eMMC partition from that table — names, offsets, sizes — and creates `/proc/inand`. With no MPT the GPT partitions stand. The installer only ever edited the GPT, so on a box with an MPT the kernel kept the Android `rsv`/`userdata` geometry. `boot=LABEL=CE_FLASH` found the FAT label on a 64 MiB device whose `SYSTEM` file lies beyond its end, and nothing covered CE_STORAGE. The USB boot hid all of it, because nothing on the eMMC is mounted there, and during the install `parted`'s table re-read had switched the kernel to the GPT view until the next reboot.
+
+The two boxes differed only in the MPT. On the working AM9 Pro (and in its factory 2.1.0 dump) `reserved` is zero up to the AMLNORMAL keystore at `0x4000`, and there is no `/proc/inand`. The failing box had:
+
+```
+00000000: 4d50 5400 3031 2e30 302e 3030 0000 0000  MPT.01.00.00....
+00000010: 1d00 0000 d4e8 d092 7265 7365 7276 6564  ........reserved
+```
+
+Where it came from isn't known. That box's bootloader build (`01.01.260903.162043`) differs from the one in the mega.nz 2.2.0 image (`…151400`). A USB Burning Tool flash, which partitions the eMMC through Amlogic's U-Boot, is the likeliest source, but that hasn't been checked.
+
+Layout, from the kernel source, confirmed against that header: `char magic[4] = "MPT"`, `version[12]`, `int part_num`, `u32 checksum`, then `part_num` × `{char name[16]; u64 size; u64 offset; u32 mask_flags}` (40 bytes with padding). At most 24 + 32×40 = 1304 bytes. The checksum loop in `mmc_partition_tbl_checksum_calc` never advances its pointer, so it is `part_num` × the u32 word-sum of entry 0. For 29 entries with entry 0 = `reserved` (size `0x4000000`, offset `0x2400000`) that is `0x92d0e8d4`, exactly the value on the box.
+
+**Clearing rather than rewriting.** A rewritten MPT with CE_FLASH/CE_STORAGE entries would also work, but clearing it returns `reserved` to the state of every working box we have, and the GPT is already correct. The failing box confirmed it: after zeroing the first 3 sectors of `reserved`, a reboot on the same bootloader showed CE_FLASH/CE_STORAGE in `lsblk` and no `/proc/inand` (U-Boot does not regenerate the table), and the eMMC install booted.
+
+What the scripts do:
+
+- **Install:** detects the MPT in preflight and lists it on the confirm screen. It refuses if anything but zeros follows the table inside the 3 sectors it would clear. It clears the MPT right after the repartition is verified (the GPT is final by then) and checks the magic is gone. `reserved_backup.bin`, taken before, holds the original. Only 1536 bytes are written; the keystore at `0x4000` and the Android DTB copies at 4 MiB are untouched.
+- **`--clear-mpt`:** the same clear for boxes installed before this, after saving the 3 sectors to `mpt_backup.bin`. It refuses unless the GPT's p28 is CE_FLASH.
+- **`--info`:** compares the kernel's p28 with the GPT, reports the MPT, and checks the hooks on the eMMC's CE_FLASH. It used to read `/flash`, which from USB is the stick, so it always warned about a missing `mount-storage.sh` and `nofsck`.
+- **Restore:** puts the MPT back from the backup when its p28/p29 names and offsets match `partition_layout.txt`, so a restored box ends up exactly as it was.
+
 ## Why the board check reads `coreelec-dt-id` instead of hashing the DTB
 
 The installer used to md5-compare the live `/flash/dtb.img` against every file in `/flash/device_trees/` and require an exact match. **That check false-negatives on essentially every box that has ever been configured.**

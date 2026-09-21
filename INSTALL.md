@@ -7,7 +7,7 @@ box, from a CoreELEC booted off an SD card or USB stick.
 
 Read the [warning in the README](README.md#read-this-first) before you start.
 The design decisions behind these scripts (cfgload rebuild, `mount-storage.sh`,
-the board check, the eMMC-mount check) are in
+the board check, the eMMC-mount check, the Amlogic MPT) are in
 [`research/installer-design-notes.md`](research/installer-design-notes.md).
 
 ## Requirements
@@ -46,7 +46,8 @@ CoreELEC from the eMMC.
 |------|--------|
 | `--info` | Read-only diagnostic: partition layout, eMMC chip details, U-Boot env summary, keystore contents, bootloader version, current install state, identity check. Safe any time. |
 | `--dry-run` | Show every step without executing the destructive ones. |
-| `--no-cfgload-rebuild` | Skip the cfgload rebuild (step 10 below) if a future cfgload format breaks the rebuilder. `mount-storage.sh` + `nofsck` are still installed and keep the device booting. |
+| `--clear-mpt` | Repair an existing install that hangs at the boot logo because of a stale Amlogic partition table — see [below](#if-the-emmc-boot-hangs-at-the-logo). Saves a copy, clears it, exits. |
+| `--no-cfgload-rebuild` | Skip the cfgload rebuild (step 11 below) if a future cfgload format breaks the rebuilder. `mount-storage.sh` + `nofsck` are still installed and keep the device booting. |
 | `--restore-logo PATH` | Write a custom boot logo to p10 during the install. PATH is a packed `AML_RES` `.bin` or a directory of `NN_name.bmp` files from `aml-logo-tool.py unpack`. |
 
 ### After the first eMMC boot
@@ -57,6 +58,40 @@ entry before reconnecting:
 ```bash
 ssh-keygen -R <device-ip>
 ```
+
+### If the eMMC boot hangs at the logo
+
+Symptom: the install finishes cleanly, the SD card / USB stick still boots,
+but without it the box sits on the Amlogic/Ugoos logo. Seen on an AM9 Pro in
+[issue #8](https://github.com/dangerouslaser/ugoos-am9-pro-coreelec-emmc/issues/8).
+
+Cause: some boxes carry Amlogic's own partition table (the "MPT") at the start
+of `reserved` (p1), next to the GPT. When it is there, the CoreELEC kernel
+takes the eMMC partitions from the MPT instead of the GPT. The installer
+rewrites the GPT, so the kernel still sees the old `rsv` (64 MB) and
+`userdata` where `CE_FLASH` and `CE_STORAGE` now are, and boot stops before
+Kodi. Factory units we have dumped have no MPT; where the one on the issue #8
+box came from isn't known (a USB Burning Tool flash is the likeliest source).
+
+The installer now clears a stale MPT itself. For an install made with an
+older version, boot the SD card / USB stick and check:
+
+```bash
+lsblk | grep -E 'CE_|rsv|userdata'   # rsv/userdata here = the kernel is using the MPT
+bash /storage/ce-emmc-install.sh --info
+```
+
+and fix it with:
+
+```bash
+bash /storage/ce-emmc-install.sh --clear-mpt
+```
+
+That zeroes only the table (the first 3 sectors of `reserved`; the keystore
+with the MAC and serial starts at 16 KB and is not touched) after saving it to
+`/storage/emmc-backup/mpt_backup.bin`. Reboot with the stick still in, confirm
+`lsblk` now shows `CE_FLASH` and `CE_STORAGE`, then remove it and reboot. The
+restore script puts the MPT back when it restores the Android layout.
 
 ## What the installer does
 
@@ -83,7 +118,7 @@ ssh-keygen -R <device-ip>
    | `rsv_backup.bin` | `rsv` (p28, 64 MB) |
    | `env_backup.bin` | U-Boot environment (p2) |
    | `bootloader_a_backup.bin` (+ `_b` if present) | Bootloader partition (p7, 8 MB) |
-   | `reserved_backup.bin` | `reserved` (p1, 64 MB) — the keystore with the ETH MAC and serial. Never written by the installer, but the factory image does not contain p1 either, so a USB Burning Tool restore would not bring it back. **Verified after backup**: if `aml-keystore-tool.py info` does not see a valid AMLNORMAL header with populated slots, the install aborts. |
+   | `reserved_backup.bin` | `reserved` (p1, 64 MB) — the keystore with the ETH MAC and serial, and the Amlogic MPT if the box has one. The installer writes nothing here except clearing that MPT (step 9), but the factory image does not contain p1 either, so a USB Burning Tool restore would not bring it back. **Verified after backup**: if `aml-keystore-tool.py info` does not see a valid AMLNORMAL header with populated slots, the install aborts. |
    | `frp_backup.bin` | `frp` (p3, 2 MB) — 36 bytes of unit-unique anti-rollback / FRP material |
    | `param_backup.bin` | `param` (p15, 16 MB) — ext4 with the TV picture-quality DB, likely factory-tuned per device |
 
@@ -92,24 +127,30 @@ ssh-keygen -R <device-ip>
    encrypted with hardware-bound keys and therefore unrecoverable).
 8. Creates `CE_FLASH` (p28, 512 MB, FAT32) and `CE_STORAGE` (p29, the rest,
    ext4) in their place.
-9. Copies all boot files from the boot media's `/flash` to `CE_FLASH`.
-10. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot
+9. **Clears a stale Amlogic MPT** from the first 3 sectors of `reserved` (p1),
+   if the box has one. The kernel prefers it over the GPT and it still
+   describes `rsv`/`userdata`, which would leave the eMMC boot hanging at the
+   logo ([details](#if-the-emmc-boot-hangs-at-the-logo)). Nothing else in p1
+   is written; the original is in `reserved_backup.bin`.
+10. Copies all boot files from the boot media's `/flash` to `CE_FLASH`.
+11. Rebuilds `cfgload` to use `disk=LABEL=CE_STORAGE` instead of the dual-boot
     `disk=FOLDER=/dev/CE_STORAGE`, with correct mkimage CRCs.
-11. **Always installs `/flash/mount-storage.sh` and adds `nofsck` to
+12. **Always installs `/flash/mount-storage.sh` and adds `nofsck` to
     `config.ini`.** CoreELEC's nightly updater overwrites `cfgload` on every
-    update, reverting step 10. These two user files are never touched by the
+    update, reverting step 11. These two user files are never touched by the
     updater: `mount-storage.sh` is a first-class CE init hook that mounts
     `CE_STORAGE` by label, bypassing the broken `FOLDER=` path, and `nofsck`
     suppresses the retry loop the missing `/dev/CE_STORAGE` node would cause.
     They are what keeps the box booting through every nightly.
-12. With `--restore-logo`, writes the custom logo to p10.
-13. Optionally migrates your existing `/storage` (settings, addons, media) to
+13. With `--restore-logo`, writes the custom logo to p10.
+14. Optionally migrates your existing `/storage` (settings, addons, media) to
     `CE_STORAGE`: free-space check first, Kodi stopped during the copy so its
     SQLite databases are not copied hot, size and entry-count verification
     after (a failed verification prints manual recovery steps).
 
-Not touched: p1–p26 (except p10 with `--restore-logo`), `super` (p27), and
-the eMMC hardware boot partitions `boot0`/`boot1`. The installer is a
+Not touched: p1–p26 (except the MPT sectors in p1 when present, and p10 with
+`--restore-logo`), `super` (p27), and the eMMC hardware boot partitions
+`boot0`/`boot1`. The installer is a
 self-contained bash script; it picks up `aml-keystore-tool.py`,
 `aml-bootloader-tool.py` and `aml-logo-tool.py` from the same directory if
 they are there (identity check, `--info`, `--restore-logo`).
@@ -137,7 +178,9 @@ The restore script:
 3. Recreates `rsv` and `userdata` at their original positions
 4. Restores `rsv` from `rsv_backup.bin`
 5. Restores `env` and `bootloader_a` (plus `frp`, `param`, `bootloader_b` if those backups exist)
-6. Leaves `super` (p27) alone — it was never modified
+6. Puts back the Amlogic MPT if the install cleared one, after checking that
+   its p28/p29 entries match the layout being restored
+7. Leaves `super` (p27) alone — it was never modified
 
 `userdata` comes back empty; Android reinitialises it on first boot from the
 system images in `super`, so the box boots as if factory-reset with the OS

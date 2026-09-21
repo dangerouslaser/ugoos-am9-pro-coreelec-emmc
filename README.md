@@ -80,7 +80,10 @@ Each guide covers options, what exactly gets written, rollback and recovery.
   U-Boot env p2). The installer backs up the small unit-specific partitions,
   replaces `rsv` + `userdata` with `CE_FLASH` + `CE_STORAGE`, copies the boot
   files, and installs a `mount-storage.sh` hook that survives CoreELEC's
-  nightly updater rewriting `cfgload`. Design notes:
+  nightly updater rewriting `cfgload`. If the box carries Amlogic's own
+  partition table (the MPT), which the kernel prefers over the GPT, the
+  installer clears it; an older install that hangs at the logo is fixed with
+  `--clear-mpt` ([INSTALL.md](INSTALL.md#if-the-emmc-boot-hangs-at-the-logo)). Design notes:
   [`research/installer-design-notes.md`](research/installer-design-notes.md).
 - **Firmware update.** The S905X5 boots its bootloader from the eMMC hardware
   boot partitions (`boot0`/`boot1`), which are not write-protected. The updater

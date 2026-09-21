@@ -27,6 +27,12 @@
 #   4. Keeps super (p27) — Android system images intact for potential restore
 #   5. Deletes rsv (p28) and userdata (p29)
 #   6. Creates CE_FLASH (512 MB FAT32) at p28 and CE_STORAGE (remaining space ext4) at p29
+#   6b. Clears the Amlogic MPT partition table from the start of `reserved`
+#      (p1) if one is there. The CoreELEC kernel uses the MPT instead of the
+#      GPT when it exists, and the MPT still describes rsv/userdata, so the
+#      eMMC boot would hang at the logo (issue #8). Only the table's 3
+#      sectors are zeroed; the keystore at 0x4000 is untouched and the
+#      original table is in reserved_backup.bin.
 #   7. Copies all boot files from /flash (the running CE media) to CE_FLASH
 #   8. Rebuilds cfgload to use disk=LABEL=CE_STORAGE (replaces the dual-boot
 #      ceemmc disk=FOLDER=/dev/CE_STORAGE path with standalone label resolution).
@@ -47,6 +53,8 @@
 #                       about the device (partition state, keystore, bootloader
 #                       version, install state) and exit. Safe to run any time.
 #   --dry-run           Show all commands without executing destructive ops.
+#   --clear-mpt         Repair an existing install that hangs at the logo:
+#                       clear a stale Amlogic MPT from `reserved` and exit.
 #   --no-cfgload-rebuild  Skip cfgload rebuild, install legacy workarounds.
 #   --restore-logo PATH Write a custom boot logo to p10 during the install.
 #                       PATH may be either a packed AML_RES .bin file, or a
@@ -63,12 +71,14 @@ set -euo pipefail
 DRY_RUN=false
 REBUILD_CFGLOAD=true
 INFO_MODE=false
+CLEAR_MPT_MODE=false
 LOGO_PATH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --info)                INFO_MODE=true; shift ;;
         --dry-run)             DRY_RUN=true; shift ;;
+        --clear-mpt)           CLEAR_MPT_MODE=true; shift ;;
         --no-cfgload-rebuild)  REBUILD_CFGLOAD=false; shift ;;
         --restore-logo)
             [[ $# -ge 2 ]] || { echo "--restore-logo requires a PATH argument (try --help)" >&2; exit 1; }
@@ -84,6 +94,10 @@ Options:
   --dry-run                  Show all commands without executing destructive ops.
                              Non-destructive reads (parted print, blkid, dd reads)
                              still run.
+  --clear-mpt                Repair mode for an existing install that hangs at
+                             the boot logo: clear the stale Amlogic partition
+                             table (MPT) from the start of reserved (p1) and
+                             exit. Run it from the SD card / USB stick.
   --no-cfgload-rebuild       Skip the cfgload rebuild (mount-storage.sh +
                              nofsck are always installed regardless — those
                              are the durable rescue layer that survives CE
@@ -413,6 +427,89 @@ emmc_mountpoints() {
     done < /proc/mounts
 }
 
+# True if /flash is mounted from the eMMC, i.e. we're running from the eMMC
+# install rather than from the SD card / USB stick.
+flash_on_emmc() {
+    local src mm
+    src=$(awk '$2 == "/flash" {print $1}' /proc/mounts 2>/dev/null)
+    [[ -b "$src" ]] || return 1
+    mm=$(dev_majmin "$src")
+    [[ -n "$mm" && " $(emmc_majmins | tr '\n' ' ') " == *" $mm "* ]]
+}
+
+# ── Amlogic MPT helpers ───────────────────────────────────────────────────────
+
+# Amlogic keeps its own partition table, the "MPT", at eMMC byte 0x2400000 —
+# offset 0 of `reserved` (p1). The CoreELEC kernel looks for it at boot
+# (drivers/mmc/core/block.c, mmc_validate_mpt_partition) and, when the "MPT"
+# magic is there, re-registers every eMMC partition from that table instead of
+# the GPT: names, offsets and sizes (common_drivers mmc_partitions.c). Factory
+# units we have dumped carry no MPT (reserved is zero up to the keystore at
+# 0x4000), but some boxes have one — possibly left by a USB Burning Tool flash.
+#
+# This installer rewrites the GPT only. On a box with an MPT the kernel keeps
+# seeing rsv (64 MiB) and userdata after the install: CE_FLASH is truncated to
+# 64 MiB, CE_STORAGE does not exist, and the eMMC boot hangs at the logo while
+# the SD/USB boot works fine (issue #8). Clearing the MPT makes the kernel fall
+# back to the GPT.
+#
+# Layout: magic "MPT\0", version[12], int part_num, u32 checksum, then
+# part_num × {name[16], u64 size, u64 offset, u32 mask_flags} padded to 40
+# bytes — at most 24 + 32×40 = 1304 bytes. We clear 3 sectors (1536 bytes).
+MPT_CLEAR_SECTORS=3
+MPT_MAX_BYTES=1304
+
+# True if the file or device $1 starts with the MPT magic.
+mpt_present() {
+    [[ "$(dd if="$1" bs=4 count=1 2>/dev/null | tr -d '\0')" == "MPT" ]]
+}
+
+# One-line summary of the MPT in $1: entry count, whether the kernel would
+# accept it, and what it calls p28/p29.
+mpt_describe() {
+    command -v python3 >/dev/null 2>&1 || { echo "(python3 not available to parse it)"; return 0; }
+    python3 - "$1" <<'PYEOF' 2>/dev/null || echo "(unparseable)"
+import struct, sys
+
+d = open(sys.argv[1], 'rb').read(1304)
+n, csum = struct.unpack('<iI', d[16:24])
+if not 0 < n <= 32:
+    print(f'entry count {n} is out of range (the kernel ignores it)')
+    sys.exit(0)
+names = {i + 1: d[24 + 40 * i:40 + 40 * i].split(b'\0')[0].decode('ascii', 'replace')
+         for i in range(n)}
+# Amlogic's checksum loop never advances past entry 0: part_num × sum(entry 0).
+ok = (sum(struct.unpack('<10I', d[24:64])) * n) & 0xffffffff == csum
+tail = ''.join(f', p{p}={names[p]}' for p in (28, 29) if p in names)
+print(f"{n} entries, {'valid' if ok else 'bad checksum (the kernel ignores it)'}{tail}")
+PYEOF
+}
+
+# Everything we'd clear past the end of the largest possible table must be
+# zero, so the clear only ever erases the table and its padding.
+mpt_clear_region_clean() {
+    local extra
+    extra=$(dd if="$1" bs=8 skip=$((MPT_MAX_BYTES / 8)) \
+        count=$(( (MPT_CLEAR_SECTORS * 512 - MPT_MAX_BYTES) / 8 )) 2>/dev/null \
+        | tr -d '\0' | wc -c)
+    [[ "$extra" -eq 0 ]]
+}
+
+mpt_unexpected_data_msg() {
+    echo "reserved (p1) starts with an Amlogic MPT followed by unexpected data in its
+first ${MPT_CLEAR_SECTORS} sectors — not clearing it blind. Please open an issue with the output of:
+  dd if=${EMMC}p1 bs=512 count=${MPT_CLEAR_SECTORS} | xxd"
+}
+
+# Zero the MPT at the start of reserved (p1) and check it's gone. The keystore
+# at 0x4000 and the DTB copies at 4 MiB are well clear of these 3 sectors.
+clear_mpt() {
+    run dd if=/dev/zero of="${EMMC}p1" bs=512 count="$MPT_CLEAR_SECTORS" conv=notrunc,fsync status=none
+    $DRY_RUN && return 0
+    mpt_present "${EMMC}p1" && die "MPT still present in ${EMMC}p1 after clearing — the write did not take effect"
+    log "Amlogic MPT cleared (first ${MPT_CLEAR_SECTORS} sectors of reserved; keystore untouched)"
+}
+
 # ── Size helpers ──────────────────────────────────────────────────────────────
 
 part_size_mib() {
@@ -597,25 +694,64 @@ do_info() {
         else
             warn "CoreELEC IS installed (CE_FLASH at p${ce_flash_p} — old-style install, super was deleted)"
         fi
-        if [[ -f /flash/mount-storage.sh ]]; then
-            log "  mount-storage.sh hook present (auto-update rescue)"
+
+        # What the kernel uses can differ from the GPT: an Amlogic MPT in
+        # reserved overrides it (see the MPT helpers). Compare the two.
+        local kdir kname ksize gsize
+        kdir=$(find_part_sysfs "$ce_flash_p") || kdir=""
+        kname=$(basename "${kdir:-none}")
+        ksize=$(cat "${kdir}size" 2>/dev/null || echo 0)
+        gsize=$(parted -sm "$EMMC" unit s print 2>/dev/null \
+            | awk -F: -v p="$ce_flash_p" '$1==p{gsub(/s/,"",$4); print $4}')
+        if [[ "$ksize" == "$gsize" ]]; then
+            log "  kernel sees p${ce_flash_p} as ${kname}, same size as the GPT"
         else
-            warn "  mount-storage.sh hook missing — eMMC boot will break after next CE update"
+            warn "  kernel sees p${ce_flash_p} as '${kname}' ($((ksize / 2048)) MiB); the GPT has CE_FLASH ($((gsize / 2048)) MiB)"
         fi
-        # Match nofsck only inside the actual coreelec='...' setting, not
-        # within documentation comments that list it as a valid option.
-        if grep -qE "^coreelec=['\"][^'\"]*nofsck" /flash/config.ini 2>/dev/null; then
-            log "  nofsck present in coreelec= setting"
+        if mpt_present "${EMMC}p1"; then
+            warn "  Amlogic MPT in reserved (p1): $(mpt_describe "${EMMC}p1")"
+            warn "  the kernel uses it instead of the GPT, so the eMMC boot hangs at the logo"
+            warn "  fix: bash $0 --clear-mpt"
         else
-            warn "  nofsck missing from coreelec= setting — fsck retry loop may occur"
+            log "  no Amlogic MPT in reserved (the kernel uses the GPT)"
         fi
-        if [[ -f /flash/cfgload ]]; then
-            local cfg_size
-            cfg_size=$(stat -c %s /flash/cfgload 2>/dev/null || stat -f %z /flash/cfgload)
-            log "  cfgload present: $cfg_size bytes"
+
+        # Check the eMMC's CE_FLASH, not whatever /flash is: run from the SD
+        # card / USB stick, /flash is the boot media, which never has the hooks.
+        local flash_dir=""
+        if flash_on_emmc; then
+            flash_dir=/flash
+        elif [[ "$ksize" == "$gsize" ]]; then
+            mkdir -p "$MNT_FLASH"
+            mount -o ro "${EMMC}p${ce_flash_p}" "$MNT_FLASH" 2>/dev/null && flash_dir="$MNT_FLASH"
+        fi
+        if [[ -z "$flash_dir" ]]; then
+            warn "  CE_FLASH contents not checked (the kernel's p${ce_flash_p} is not CE_FLASH, or it would not mount)"
+        else
+            if [[ -f "${flash_dir}/mount-storage.sh" ]]; then
+                log "  mount-storage.sh hook present (auto-update rescue)"
+            else
+                warn "  mount-storage.sh hook missing — eMMC boot will break after next CE update"
+            fi
+            # Match nofsck only inside the actual coreelec='...' setting, not
+            # within documentation comments that list it as a valid option.
+            if grep -qE "^coreelec=['\"][^'\"]*nofsck" "${flash_dir}/config.ini" 2>/dev/null; then
+                log "  nofsck present in coreelec= setting"
+            else
+                warn "  nofsck missing from coreelec= setting — fsck retry loop may occur"
+            fi
+            if [[ -f "${flash_dir}/cfgload" ]]; then
+                local cfg_size
+                cfg_size=$(stat -c %s "${flash_dir}/cfgload" 2>/dev/null || stat -f %z "${flash_dir}/cfgload")
+                log "  cfgload present: $cfg_size bytes"
+            fi
+            [[ "$flash_dir" == "$MNT_FLASH" ]] && umount "$MNT_FLASH"
         fi
     else
         log "CoreELEC NOT installed (Android partition layout intact)"
+        if mpt_present "${EMMC}p1"; then
+            log "  Amlogic MPT in reserved (p1): $(mpt_describe "${EMMC}p1") — the installer will clear it"
+        fi
     fi
 
     header "U-Boot env summary (p2)"
@@ -654,11 +790,72 @@ do_info() {
     exit 0
 }
 
+# ── --clear-mpt mode ─────────────────────────────────────────────────────────
+
+# Repair for installs made before the installer handled the MPT: the eMMC boot
+# hangs at the logo because the kernel still reads the Android layout from the
+# MPT. Saves a copy of the table, clears it, and exits.
+do_clear_mpt() {
+    [[ "$(id -u)" == "0" ]] || die "Must be run as root"
+    [[ -b "$EMMC" ]] || die "eMMC not found at $EMMC"
+    make_emmc_nodes
+
+    header "Amlogic partition table (MPT)"
+    local p28
+    p28=$(ondisk_part_name 28)
+    [[ "$p28" == "CE_FLASH" ]] || die "p28 in the on-disk GPT is '${p28:-absent}', not CE_FLASH — CoreELEC is not
+installed on the eMMC, so there is nothing to repair. A normal install clears
+the MPT itself."
+    if ! mpt_present "${EMMC}p1"; then
+        log "No MPT in reserved (p1) — the kernel already uses the GPT. Nothing to do."
+        exit 0
+    fi
+    log "MPT found: $(mpt_describe "${EMMC}p1")"
+    mpt_clear_region_clean "${EMMC}p1" || die "$(mpt_unexpected_data_msg)"
+
+    # Keep a copy of exactly what gets erased. The install's reserved_backup.bin
+    # holds it too, but that may not be on this boot media.
+    local copy="${BACKUP_DIR}/mpt_backup.bin"
+    if [[ -e "$copy" ]]; then
+        log "Keeping the existing copy at $copy"
+    else
+        run mkdir -p "$BACKUP_DIR"
+        run dd if="${EMMC}p1" of="$copy" bs=512 count="$MPT_CLEAR_SECTORS" status=none
+        $DRY_RUN || log "MPT sectors saved → $copy"
+    fi
+
+    tui_confirm_destructive "Clear Amlogic MPT" "\
+Clear the stale Amlogic partition table (MPT) from ${EMMC}p1 (reserved)?
+
+  The CoreELEC kernel takes the eMMC partitions from this table when it
+  exists, and it still describes the Android layout (rsv/userdata) —
+  which is why the eMMC install hangs at the boot logo.
+
+  Only the first ${MPT_CLEAR_SECTORS} sectors (1.5 KB) are zeroed. The keystore
+  (MAC/serial) at 0x4000 is untouched.
+
+  Undo: dd if=${copy} of=${EMMC}p1 bs=512 count=${MPT_CLEAR_SECTORS} conv=notrunc,fsync" \
+        || { echo "Aborted."; exit 0; }
+
+    clear_mpt
+    run sync
+    echo ""
+    log "Reboot with the SD card / USB stick still in and check that lsblk now shows"
+    log "CE_FLASH and CE_STORAGE. Then remove it and reboot to boot from the eMMC."
+    $DRY_RUN && warn "DRY-RUN complete — no changes were made"
+    exit 0
+}
+
 # ── Early flag handling (now that helper functions are defined) ──────────────
 
 # --info mode: read-only diagnostic. Exits without entering preflight.
 if $INFO_MODE; then
     do_info
+fi
+
+# --clear-mpt: repair an existing install. Exits without entering preflight.
+if $CLEAR_MPT_MODE; then
+    do_clear_mpt
 fi
 
 # --restore-logo: validate / pack the logo path NOW (before destructive ops),
@@ -880,6 +1077,16 @@ done
 
 log "Partition layout: 29-partition Android layout confirmed (super/rsv/userdata names verified)"
 
+# Amlogic MPT (see the MPT helpers). Detected here so the confirm screen can
+# list it; it is cleared right after the repartition, once the GPT is final.
+MPT_FOUND=false
+if mpt_present "${EMMC}p1"; then
+    MPT_FOUND=true
+    mpt_clear_region_clean "${EMMC}p1" || die "$(mpt_unexpected_data_msg)"
+    warn "Amlogic MPT partition table in reserved (p1): $(mpt_describe "${EMMC}p1")"
+    warn "  the kernel uses it instead of the GPT — it will be cleared after repartitioning"
+fi
+
 # Refuse to clobber an existing backup set — rsv_backup.bin is the only path
 # back to Android, so a rerun must never overwrite it.
 if [[ -d "$BACKUP_DIR" && -n "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
@@ -918,12 +1125,19 @@ if [[ "$RSV_HAS_DATA" -gt 0 ]]; then
     RSV_NOTE="  [contains data — will be backed up]"
 fi
 
+MPT_LINE=""
 LOGO_LINE=""
-UNTOUCHED_NOTE="Partitions p1–p26 and super (p27) are NOT touched."
+UNTOUCHED_EXCEPT=""
+if $MPT_FOUND; then
+    MPT_LINE=$'\n\n'"  CLEAR   p1   reserved    stale Amlogic partition table (first 1.5 KB;"
+    MPT_LINE+=$'\n'"                           keystore untouched, original kept in the backup)"
+    UNTOUCHED_EXCEPT="the p1 MPT clear"
+fi
 if [[ -n "$LOGO_BIN" ]]; then
     LOGO_LINE=$'\n'"  WRITE   p10  logo        custom boot logo (--restore-logo)"
-    UNTOUCHED_NOTE="Partitions p1–p26 (except the p10 logo write above) and super (p27) are NOT touched."
+    UNTOUCHED_EXCEPT="${UNTOUCHED_EXCEPT:+$UNTOUCHED_EXCEPT and }the p10 logo write"
 fi
+UNTOUCHED_NOTE="Partitions p1–p26 ${UNTOUCHED_EXCEPT:+(except ${UNTOUCHED_EXCEPT} above) }and super (p27) are NOT touched."
 
 CONFIRM_MSG="\
 CoreELEC eMMC Installer — ${BOARD_NAME}
@@ -934,7 +1148,7 @@ CoreELEC eMMC Installer — ${BOARD_NAME}
   DELETE  p29  userdata    ${USERDATA_HUMAN}  (encrypted — unrecoverable)
 
   CREATE  p28  CE_FLASH    512 MB  FAT32  (CoreELEC boot)
-  CREATE  p29  CE_STORAGE  ${CE_STORAGE_HUMAN}  ext4   (CoreELEC storage)${LOGO_LINE}
+  CREATE  p29  CE_STORAGE  ${CE_STORAGE_HUMAN}  ext4   (CoreELEC storage)${MPT_LINE}${LOGO_LINE}
 
 ${UNTOUCHED_NOTE}
 boot0/boot1 (the eMMC hardware boot partitions) are not touched.
@@ -988,9 +1202,11 @@ fi
 # Back up p1 reserved — it holds the Amlogic UKS keystore (AMLNORMAL magic at
 # offset 0x4000, with a redundant copy at 0x44000). On this SoC family the
 # device's ETH MAC and serial are stored there as plaintext slots. The install
-# does not touch p1, but a wipe of this partition would lose eMMC-stored
-# identity and the factory image does not include it, so USB Burning Tool
-# restore would not recover the values. Cheap insurance.
+# only ever clears the Amlogic MPT in p1's first 3 sectors (when present), but
+# a wipe of this partition would lose eMMC-stored identity and the factory
+# image does not include it, so USB Burning Tool restore would not recover the
+# values. Cheap insurance — and the copy of the MPT that the restore script
+# puts back.
 backup_part 1 "${BACKUP_DIR}/reserved_backup.bin" "reserved"
 
 # Verify the p1 backup actually contains a valid AMLNORMAL keystore. If the
@@ -1087,6 +1303,15 @@ verify_part_present 29 CE_STORAGE
 # using sysfs-reported major:minor numbers (not assumed sequential values)
 if ! $DRY_RUN; then
     reread_and_make_nodes 28 29
+fi
+
+# The GPT is final now, so drop the stale MPT that still describes rsv and
+# userdata — otherwise the kernel keeps using it on the next boot and the eMMC
+# install hangs at the logo (see the MPT helpers). reserved_backup.bin, taken
+# above, holds the original table.
+if $MPT_FOUND; then
+    header "Clearing the stale Amlogic partition table"
+    clear_mpt
 fi
 
 # ── Format ────────────────────────────────────────────────────────────────────
@@ -1239,10 +1464,17 @@ log "Adding nofsck to ${MNT_FLASH}/config.ini coreelec= line..."
 if $DRY_RUN; then
     echo -e "${YELLOW}[DRY-RUN]${NC} update ${MNT_FLASH}/config.ini — add nofsck"
 else
-    if grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
-        if ! grep -q "nofsck" "${MNT_FLASH}/config.ini"; then
-            sed -i "s/coreelec='\(.*\)'/coreelec='\1 nofsck'/" "${MNT_FLASH}/config.ini"
-        fi
+    # Only the live coreelec= line counts. Stock config.ini lists nofsck in a
+    # comment ("Valid options are: ... nofsck ..."), so a bare grep for
+    # nofsck always matched and the option was never added to an existing
+    # coreelec= line.
+    if grep -qE "^coreelec=['\"][^'\"]*nofsck" "${MNT_FLASH}/config.ini" 2>/dev/null; then
+        log "nofsck already set"
+    elif grep -q "^coreelec=" "${MNT_FLASH}/config.ini" 2>/dev/null; then
+        sed -i -e "s/^coreelec='\([^']*\)'/coreelec='\1 nofsck'/" \
+               -e "s/^coreelec=\"\([^\"]*\)\"/coreelec=\"\1 nofsck\"/" "${MNT_FLASH}/config.ini"
+        grep -qE "^coreelec=['\"][^'\"]*nofsck" "${MNT_FLASH}/config.ini" \
+            || warn "Could not add nofsck to the coreelec= line in config.ini — add it by hand"
     else
         echo "coreelec='quiet nofsck'" >> "${MNT_FLASH}/config.ini"
     fi
@@ -1424,6 +1656,7 @@ echo "    rsv_backup.bin"
 echo "    env_backup.bin"
 echo "    bootloader_a_backup.bin (+ bootloader_b_backup.bin if present)"
 echo "    reserved_backup.bin    (Amlogic UKS keystore — MAC/serial)"
+$MPT_FOUND && echo "                           (also holds the Amlogic MPT cleared from p1)"
 echo "    frp_backup.bin         (anti-rollback / FRP nonce)"
 echo "    param_backup.bin       (Amlogic TV picture-quality DB)"
 echo ""
