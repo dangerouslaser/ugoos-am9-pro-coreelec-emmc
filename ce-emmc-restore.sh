@@ -261,6 +261,48 @@ emmc_mountpoints() {
     done < /proc/mounts
 }
 
+# ── Amlogic MPT helpers ───────────────────────────────────────────────────────
+
+# Amlogic's own partition table ("MPT") sits in the first 3 sectors of
+# `reserved` (p1). When it exists the kernel takes the eMMC partitions from it
+# instead of the GPT (see ce-emmc-install.sh, MPT helpers). The installer
+# clears a stale one, because it still describes rsv/userdata; this script
+# puts rsv/userdata back exactly, so the original table matches again and is
+# restored from the backup along with them.
+MPT_SECTORS=3
+
+mpt_present() {
+    [[ "$(dd if="$1" bs=4 count=1 2>/dev/null | tr -d '\0')" == "MPT" ]]
+}
+
+# True if the MPT in $1 is one the kernel accepts and its p28/p29 entries have
+# the names and offsets in $2 (partition_layout.txt, parted -sm unit B).
+mpt_matches_layout() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$1" "$2" <<'PYEOF' 2>/dev/null
+import struct, sys
+
+d = open(sys.argv[1], 'rb').read(1304)
+n, csum = struct.unpack('<iI', d[16:24])
+if d[:4] != b'MPT\0' or not 29 <= n <= 32:
+    sys.exit(1)
+# Amlogic's checksum loop never advances past entry 0: part_num × sum(entry 0).
+if (sum(struct.unpack('<10I', d[24:64])) * n) & 0xffffffff != csum:
+    sys.exit(1)
+layout = {}
+for line in open(sys.argv[2]):
+    f = line.strip().rstrip(';').split(':')
+    if len(f) >= 6 and f[0].isdigit():
+        layout[int(f[0])] = (f[5], int(f[1].rstrip('B')))
+for p in (28, 29):
+    e = d[24 + 40 * (p - 1):64 + 40 * (p - 1)]
+    name = e[:16].split(b'\0')[0].decode('ascii', 'replace')
+    offset = struct.unpack('<Q', e[24:32])[0]
+    if layout.get(p) != (name, offset):
+        sys.exit(1)
+PYEOF
+}
+
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
 header "Preflight checks"
@@ -355,7 +397,34 @@ P29_NAME=$(awk    -F: '/^29:/{print $6}'                   "${BACKUP_DIR}/partit
 log "p28 original: ${P28_NAME} (${P28_START_B}B – ${P28_END_B}B)"
 log "p29 original: ${P29_NAME} (${P29_START_B}B – ${P29_END_B}B)"
 
+# Amlogic MPT: put back the one the installer cleared, if the backup set has
+# it — reserved_backup.bin from the install, or mpt_backup.bin from
+# ce-emmc-install.sh --clear-mpt.
+RESTORE_MPT=false
+MPT_SRC=""
+for f in reserved_backup.bin mpt_backup.bin; do
+    if [[ -f "${BACKUP_DIR}/${f}" ]] && mpt_present "${BACKUP_DIR}/${f}"; then
+        MPT_SRC="${BACKUP_DIR}/${f}"
+        break
+    fi
+done
+if [[ -n "$MPT_SRC" ]]; then
+    if mpt_present "${EMMC}p1"; then
+        log "Amlogic MPT already present in reserved (p1) — leaving it as is"
+    elif mpt_matches_layout "$MPT_SRC" "${BACKUP_DIR}/partition_layout.txt"; then
+        RESTORE_MPT=true
+        log "Amlogic MPT in $(basename "$MPT_SRC") matches the original layout — will be restored"
+    else
+        warn "$(basename "$MPT_SRC") holds an Amlogic MPT that could not be checked against"
+        warn "  partition_layout.txt (or python3 is missing) — not restoring it. Harmless:"
+        warn "  without an MPT the kernel uses the GPT, which this script restores."
+    fi
+fi
+
 # ── Confirm ───────────────────────────────────────────────────────────────────
+
+MPT_LINE=""
+$RESTORE_MPT && MPT_LINE=$'\n'"  RESTORE p1   MPT            (Amlogic partition table, first 1.5 KB of $(basename "$MPT_SRC"))"
 
 CONFIRM_MSG="\
 This will restore the original Android partition layout on ${EMMC}:
@@ -366,10 +435,10 @@ This will restore the original Android partition layout on ${EMMC}:
   RESTORE p28  ${P28_NAME}   (from rsv_backup.bin)
   RESTORE p29  ${P29_NAME}   (empty — Android will reinitialize on first boot)
   RESTORE      env            (from env_backup.bin)
-  RESTORE      bootloader_a   (from bootloader_a_backup.bin)
+  RESTORE      bootloader_a   (from bootloader_a_backup.bin)${MPT_LINE}
 
   super (p27) is untouched — Android system images are intact.
-  Partitions p1–p26 are NOT touched.
+  Apart from the restores listed above, partitions p1–p26 are NOT touched.
 
 After restore, boot Android via USB Burning Tool or by removing the ${BOOT_MEDIA}.
 WARNING: All CoreELEC data on CE_STORAGE will be permanently lost."
@@ -491,6 +560,14 @@ if [[ -f "${BACKUP_DIR}/bootloader_b_backup.bin" ]]; then
     else
         warn "bootloader_b_backup.bin present but no bootloader_b partition found — skipping"
     fi
+fi
+
+if $RESTORE_MPT; then
+    run dd if="$MPT_SRC" of="${EMMC}p1" bs=512 count="$MPT_SECTORS" conv=notrunc,fsync status=none
+    if ! $DRY_RUN; then
+        mpt_present "${EMMC}p1" || die "Amlogic MPT write to ${EMMC}p1 did not take effect"
+    fi
+    log "Amlogic MPT restored to reserved (p1) from $(basename "$MPT_SRC")"
 fi
 
 # ── Post-restore partition layout ─────────────────────────────────────────────
